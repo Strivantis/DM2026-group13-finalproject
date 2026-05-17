@@ -1,26 +1,27 @@
 """
-train.py – Drought Score Forecasting Pipeline (v2)
-===================================================
+train.py -- Drought Score Forecasting Pipeline (v3)
+====================================================
 Usage:
     python src/train.py
 
 Outputs:
-    submission.csv               – Kaggle submission (133 rows + header)
-    models/best_model.pt         – Best checkpoint (lowest Average Val MAE)
-    models/scaler.pkl            – Fitted StandardScaler
-    models/training_history.csv  – Per-epoch metrics for final training run
-    _training_log.txt            – Full console log
+    submission.csv               -- Kaggle submission (133 rows + header)
+    models/final_model_v3.pt     -- Blind full-retrained model (37 epochs, 100% data)
+    models/scaler.pkl            -- Fitted StandardScaler
+    models/training_history.csv  -- Per-epoch metrics for final training run
+    _training_log.txt            -- Full console log
 
-Key improvements (v2)
+Key improvements (v3)
 ---------------------
-  1. Proxy Feature Engineering  – PET-based Drought Index (5 new features).
-  2. Walk-Forward Validation    – 3 non-overlapping 5-week folds; reports
-                                   Average_Val_MAE across all folds.
-  3. Blended Loss               – α*MAE + (1-α)*Weighted_MAE (α=0.5).
-  4. MAE-only Early Stopping    – Best checkpoint based on pure MAE,
-                                   avoiding weighted-loss inflation.
-  5. Architecture Constraints   – hidden 64, dropout 0.4, weight_decay 1e-3,
-                                   Sigmoid×5 output (no post-clip).
+  1. Bias Initialisation   -- fc.bias = -0.98 so epoch-1 predictions start at
+                               the dataset mean (~1.36) instead of 2.5, saving
+                               several epochs of baseline adjustment.
+  2. Blind Full Retraining -- 37-epoch blind train on 100% of training data.
+                               No validation split, no early stopping in final phase.
+  3. CosineAnnealingLR     -- Replaces ReduceLROnPlateau (which required a val
+                               set) for the final training phase.
+  4. TARGET_EPOCHS = 37    -- Derived from v2 fold best-epochs mean (~35) + 5%
+                               uplift for the larger full-data dataset.
 """
 
 import os
@@ -34,7 +35,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from sklearn.preprocessing import StandardScaler
 
-# ── project root on sys.path ──────────────────────────────────────────────
+# -- project root on sys.path -------------------------------------------------
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
@@ -54,20 +55,23 @@ from src.model import DroughtLSTM
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-PROCESSED_DIR = os.path.join(ROOT, "data", "processed")
-MODELS_DIR    = os.path.join(ROOT, "models")
+PROCESSED_DIR  = os.path.join(ROOT, "data", "processed")
+MODELS_DIR     = os.path.join(ROOT, "models")
 os.makedirs(MODELS_DIR, exist_ok=True)
 
-HIDDEN_SIZE   = 64
-NUM_LAYERS    = 2
-DROPOUT       = 0.4
-LEARNING_RATE = 1e-3
-WEIGHT_DECAY  = 1e-3        # increased from 1e-4
-BATCH_SIZE    = 256
-NUM_EPOCHS    = 150         # extended; early stopping governs
-PATIENCE      = 25          # patience on pure val MAE
+HIDDEN_SIZE    = 64
+NUM_LAYERS     = 2
+DROPOUT        = 0.4
+LEARNING_RATE  = 1e-3
+WEIGHT_DECAY   = 1e-3        # increased from 1e-4
+BATCH_SIZE     = 256
+NUM_EPOCHS     = 150         # extended; early stopping governs CV folds
+PATIENCE       = 25          # patience on pure val MAE (CV only)
 
-BLEND_ALPHA   = 0.5         # α for blended loss: α*MAE + (1-α)*WeightedMAE
+BLEND_ALPHA    = 0.5         # alpha for blended loss: alpha*MAE + (1-alpha)*WeightedMAE
+
+# v3: blind full-retraining target
+TARGET_EPOCHS  = 37          # mean(v2 fold best epochs 29,46,30) ~= 35; +5% -> 37
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Device: {DEVICE}")
@@ -90,7 +94,7 @@ def blended_loss(
     target: torch.Tensor,
     alpha: float = BLEND_ALPHA,
 ) -> torch.Tensor:
-    """α·MAE + (1-α)·WeightedMAE"""
+    """alpha*MAE + (1-alpha)*WeightedMAE"""
     mae  = nn.L1Loss()(pred, target)
     wmae = weighted_mae(pred, target)
     return alpha * mae + (1.0 - alpha) * wmae
@@ -120,7 +124,7 @@ def train_epoch(model, loader, optimizer, device):
 
 @torch.no_grad()
 def eval_mae(model, loader, device) -> float:
-    """Evaluate PURE MAE (no weighting) – used for early stopping & fold scoring."""
+    """Evaluate PURE MAE (no weighting) -- used for early stopping & fold scoring."""
     model.eval()
     total_mae, n = 0.0, 0
     for X, y in loader:
@@ -154,7 +158,7 @@ def make_scheduler(optimiser):
 
 
 # ---------------------------------------------------------------------------
-# Single training run (used for CV folds and for the final model)
+# Single training run with early stopping (used for CV folds only)
 # ---------------------------------------------------------------------------
 def train_model(
     model,
@@ -204,7 +208,7 @@ def train_model(
         else:
             no_improve += 1
 
-        marker = " ✓" if improved else ""
+        marker = " checkmark" if improved else ""
         row = (
             f"{epoch:>6}  {train_loss:>10.4f}  {train_mae:>10.4f}"
             f"  {val_mae:>10.4f}  {curr_lr:>10.2e}{marker}"
@@ -224,6 +228,57 @@ def train_model(
 
 
 # ---------------------------------------------------------------------------
+# Blind full retraining (v3) -- no validation, no early stopping
+# ---------------------------------------------------------------------------
+def train_model_blind(
+    model,
+    train_loader,
+    num_epochs: int,
+    ckpt_path: str,
+    log,
+):
+    """
+    Blind full retraining on 100% of training data for exactly ``num_epochs``.
+
+    Uses CosineAnnealingLR (no validation metric required).
+    No early stopping -- the model trains for all ``num_epochs`` unconditionally.
+    Saves the final-epoch weights to ``ckpt_path``.
+
+    Returns
+    -------
+    history : list of (epoch, train_loss, train_mae)
+    """
+    optimiser = make_optimiser(model)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimiser, T_max=num_epochs
+    )
+
+    log("=" * 55)
+    log(f"{'Epoch':>6} {'BlendLoss':>10} {'TrainMAE':>10} {'LR':>10}")
+    log("=" * 55)
+
+    history = []
+
+    for epoch in range(1, num_epochs + 1):
+        train_loss, train_mae = train_epoch(model, train_loader, optimiser, DEVICE)
+        scheduler.step()
+        curr_lr = optimiser.param_groups[0]["lr"]
+
+        history.append((epoch, train_loss, train_mae))
+
+        row = (
+            f"{epoch:>6}  {train_loss:>10.4f}  {train_mae:>10.4f}"
+            f"  {curr_lr:>10.2e}"
+        )
+        log(row)
+
+    log("=" * 55)
+    torch.save(model.state_dict(), ckpt_path)
+    log(f"  Final model saved -> {ckpt_path}")
+    return history
+
+
+# ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
 def main():
@@ -234,14 +289,14 @@ def main():
         print(msg)
         log_lines.append(msg)
 
-    # ── 1. Load data ────────────────────────────────────────────────────────
-    log("Loading processed data …")
+    # -- 1. Load data ----------------------------------------------------------
+    log("Loading processed data ...")
     train_raw = pd.read_csv(os.path.join(PROCESSED_DIR, "train_processed.csv"))
     test_raw  = pd.read_csv(os.path.join(PROCESSED_DIR, "test_processed.csv"))
     log(f"  train raw: {train_raw.shape}  |  test raw: {test_raw.shape}")
 
-    # ── 2. Feature refinement (incl. Drought Index) ─────────────────────────
-    log("Refining features (+ drought proxy index) …")
+    # -- 2. Feature refinement (incl. Drought Index) ---------------------------
+    log("Refining features (+ drought proxy index) ...")
     train_df = refine_features(train_raw, is_train=True)
     test_df  = refine_features(test_raw,  is_train=False)
 
@@ -250,8 +305,8 @@ def main():
     log(f"  Input features ({input_size}): {feat_cols}")
     log(f"  train after refinement: {train_df.shape}  |  test: {test_df.shape}")
 
-    # ── 3. Fit scaler on training features ──────────────────────────────────
-    log("Fitting StandardScaler on training feature matrix …")
+    # -- 3. Fit scaler on training features ------------------------------------
+    log("Fitting StandardScaler on training feature matrix ...")
     scaler = StandardScaler()
     train_feat_matrix = train_df[feat_cols].values.astype(np.float32)
     scaler.fit(train_feat_matrix)
@@ -259,16 +314,16 @@ def main():
     with open(os.path.join(MODELS_DIR, "scaler.pkl"), "wb") as f:
         pickle.dump(scaler, f)
 
-    # ── 4. Walk-Forward Cross-Validation ────────────────────────────────────
+    # -- 4. Walk-Forward Cross-Validation --------------------------------------
     log(f"\n{'='*65}")
-    log(f"Walk-Forward Cross-Validation  ({WF_NUM_FOLDS} folds × {WF_FOLD_WEEKS} weeks)")
+    log(f"Walk-Forward Cross-Validation  ({WF_NUM_FOLDS} folds x {WF_FOLD_WEEKS} weeks)")
     log(f"{'='*65}")
 
     folds = build_walk_forward_folds(train_df)
     fold_maes = []
 
     for fold_k, (fold_train_groups, fold_val_groups) in enumerate(folds):
-        log(f"\n── Fold {fold_k + 1}/{WF_NUM_FOLDS} ──")
+        log(f"\n-- Fold {fold_k + 1}/{WF_NUM_FOLDS} --")
         fold_train_ds = DroughtDataset(fold_train_groups, scaler=scaler)
         fold_val_ds   = DroughtDataset(fold_val_groups,   scaler=scaler)
         log(f"  Train seqs: {len(fold_train_ds):,}  |  Val seqs: {len(fold_val_ds):,}")
@@ -304,66 +359,57 @@ def main():
     log(f"Average_Val_MAE : {avg_val_mae:.4f}")
     log(f"{'='*65}")
 
-    # ── 5. Final model training on ALL training data ─────────────────────────
+    # -- 5. Blind full retraining on 100% training data (v3) -------------------
     log(f"\n{'='*65}")
-    log("Final model training (all training data) …")
+    log(f"Blind Full Retraining  (TARGET_EPOCHS={TARGET_EPOCHS}, 100% data)")
+    log(f"Scheduler : CosineAnnealingLR(T_max={TARGET_EPOCHS})")
+    log(f"No validation split. No early stopping.")
     log(f"{'='*65}")
 
     full_train_groups = build_full_train_groups(train_df)
-    full_train_ds = DroughtDataset(full_train_groups, scaler=scaler)
+    full_train_ds     = DroughtDataset(full_train_groups, scaler=scaler)
     log(f"  Full train sequences: {len(full_train_ds):,}")
-
-    # Use Fold 0 val set (most recent 5 weeks) as a monitoring val set.
-    _, fold0_val_groups = folds[0]
-    fold0_val_ds = DroughtDataset(fold0_val_groups, scaler=scaler)
 
     full_train_loader = DataLoader(
         full_train_ds, batch_size=BATCH_SIZE, shuffle=True,
-        num_workers=2, pin_memory=True,
-    )
-    fold0_val_loader = DataLoader(
-        fold0_val_ds, batch_size=BATCH_SIZE, shuffle=False,
         num_workers=2, pin_memory=True,
     )
 
     final_model = make_model(input_size)
     log("\n" + final_model.architecture_summary(input_size))
 
-    best_ckpt = os.path.join(MODELS_DIR, "best_model.pt")
+    v3_ckpt = os.path.join(MODELS_DIR, "final_model_v3.pt")
 
-    best_final_mae, final_history = train_model(
+    final_history = train_model_blind(
         final_model,
         full_train_loader,
-        fold0_val_loader,
-        num_epochs=NUM_EPOCHS,
-        patience=PATIENCE,
-        ckpt_path=best_ckpt,
+        num_epochs=TARGET_EPOCHS,
+        ckpt_path=v3_ckpt,
         log=log,
-        show_header=True,
     )
 
-    log(f"Final Model Best Val MAE : {best_final_mae:.4f}")
-    log(f"Training time            : {(time.time() - t0):.1f}s")
+    log(f"Blind training complete. Epochs trained : {TARGET_EPOCHS}")
+    log(f"Training time : {(time.time() - t0):.1f}s")
 
     # Save training log
     log_path = os.path.join(ROOT, "_training_log.txt")
     with open(log_path, "w") as f:
         f.write("\n".join(log_lines))
-    print(f"\nTraining log saved → {log_path}")
+    print(f"\nTraining log saved -> {log_path}")
 
-    # Save history CSV
+    # Save history CSV (blind: no val_mae column)
     hist_df = pd.DataFrame(
         final_history,
-        columns=["epoch", "train_blend_loss", "train_mae", "val_mae"],
+        columns=["epoch", "train_blend_loss", "train_mae"],
     )
     hist_df.to_csv(os.path.join(MODELS_DIR, "training_history.csv"), index=False)
 
-    # ── 6. Inference on test set ─────────────────────────────────────────────
-    log("\nRunning inference on test set …")
-    final_model.load_state_dict(torch.load(best_ckpt, map_location=DEVICE))
+    # -- 6. Inference on test set ----------------------------------------------
+    log("\nRunning inference on test set ...")
+    final_model.load_state_dict(torch.load(v3_ckpt, map_location=DEVICE))
     final_model.eval()
 
-    predictions = {}   # region_id → np.array of shape (5,)
+    predictions = {}   # region_id -> np.array of shape (5,)
 
     for region_id, group in test_df.groupby("region_id"):
         group = group.reset_index(drop=True)
@@ -386,11 +432,11 @@ def main():
         with torch.no_grad():
             pred = final_model(X_tensor).squeeze(0).cpu().numpy()  # (5,) in (0,5)
 
-        # No manual clip needed – Sigmoid×5 guarantees (0, 5)
+        # No manual clip needed -- Sigmoid x 5 guarantees (0, 5)
         predictions[region_id] = pred
 
-    # ── 7. Format & save submission.csv ──────────────────────────────────────
-    log("Formatting submission.csv …")
+    # -- 7. Format & save submission.csv ---------------------------------------
+    log("Formatting submission.csv ...")
     rows = []
     for region_id, preds in sorted(predictions.items()):
         rows.append(
@@ -408,7 +454,7 @@ def main():
     sub_path   = os.path.join(ROOT, "submission.csv")
     submission.to_csv(sub_path, index=False)
 
-    # ── 8. Sanity checks ──────────────────────────────────────────────────────
+    # -- 8. Sanity checks ------------------------------------------------------
     assert len(submission) == 133, (
         f"Expected 133 rows, got {len(submission)}"
     )
@@ -417,25 +463,21 @@ def main():
         "pred_week3", "pred_week4", "pred_week5",
     ], f"Unexpected columns: {list(submission.columns)}"
 
-    # No data leakage across region_id: verify test regions ∩ train regions = ∅
-    # (test set is future weeks of the SAME regions, so this check ensures
-    #  the scaler was fitted on train only and no row cross-contamination occurred)
     test_regions  = set(test_df["region_id"].unique())
     train_regions = set(train_df["region_id"].unique())
     assert test_regions == train_regions, (
-        "Region mismatch between train and test – check data integrity."
+        "Region mismatch between train and test -- check data integrity."
     )
-    log("  No cross-region leakage detected (scaler fitted on train only) ✓")
+    log("  No cross-region leakage detected (scaler fitted on train only) checkmark")
 
-    log(f"  submission.csv saved → {sub_path}")
-    log(f"  Rows (excluding header): {len(submission)}  ✓")
+    log(f"  submission.csv saved -> {sub_path}")
+    log(f"  Rows (excluding header): {len(submission)}  checkmark")
     log(f"  Columns: {list(submission.columns)}")
     log(f"\n  Preview:\n{submission.head(5).to_string(index=False)}")
 
     return {
         "fold_maes": fold_maes,
         "avg_val_mae": avg_val_mae,
-        "final_best_val_mae": best_final_mae,
         "input_size": input_size,
         "submission": submission,
         "final_history": final_history,
