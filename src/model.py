@@ -3,25 +3,26 @@ DroughtLSTM
 ===========
 Multi-output LSTM for direct 5-step drought score forecasting.
 
-Architecture (v3)
------------------
+Architecture (v4 / v5)
+-----------------------
   Input  -> LSTM (hidden_size=64, num_layers=2, dropout=0.4)
          -> last hidden state
          -> Dropout(0.4)
-         -> Linear(64, horizon=5)  <- bias initialised to -0.98
+         -> Linear(64, horizon=5)  <- bias initialised to -1.61  [v5 updated]
          -> Sigmoid() x 5.0          <- natural [0, 5] bound; replaces clip()
 
-Changes from v2
----------------
-  - Bias init     : fc.bias set to -0.98 so Sigmoid(-0.98)*5 ~= 1.36, matching
-                    the dataset's mean target value and avoiding wasted early
-                    epochs spent adjusting the output baseline.
+Changes from v3 (v5 recalibration)
+------------------------------------
+  - Bias init : fc.bias updated from -0.98 to -1.61 to match the TRUE
+                dataset mean score of 0.8357 (restored from all 2248 regions
+                after fixing the Region Extinction Event).
 
-Bias derivation
----------------
-  Dataset mean target ~= 1.36 on a [0, 5] scale.
-  Output = Sigmoid(b) * 5.0  ->  Sigmoid(b) = 1.36 / 5.0 = 0.272
-  b = ln(0.272 / (1 - 0.272)) = ln(0.272 / 0.728) ~= ln(0.3736) ~= -0.9847 -> -0.98
+Bias derivation  [v5 Updated]
+------------------------------
+  True dataset mean target = 0.8357 on a [0, 5] scale  (1,757,936 weekly rows).
+  Output = Sigmoid(b) * 5.0  ->  Sigmoid(b) = 0.8357 / 5.0 = 0.16714
+  b = ln(0.16714 / (1 - 0.16714)) = ln(0.16714 / 0.83286)
+    = ln(0.20067)  ~=  -1.6057  ->  -1.61
 """
 
 import torch
@@ -66,9 +67,9 @@ class DroughtLSTM(nn.Module):
         # Direct multi-step head: output all H forecasts at once
         self.fc = nn.Linear(hidden_size, horizon)
 
-        # Bias init: Sigmoid(-0.98) * 5.0 ~= 1.36 == dataset mean target.
-        # Eliminates wasted epochs driving the output baseline down from 2.5.
-        nn.init.constant_(self.fc.bias, -0.98)
+        # Bias init [v5]: Sigmoid(-1.61) * 5.0 ~= 0.84 == TRUE dataset mean (0.8357).
+        # Eliminates wasted early epochs driving the output baseline from 2.5 → 0.84.
+        nn.init.constant_(self.fc.bias, -1.61)
 
         # Natural output bound: Sigmoid maps to (0, 1), scaled to (0, 5).
         # Replaces post-processing clip(0, 5).
@@ -99,14 +100,14 @@ class DroughtLSTM(nn.Module):
 
     def architecture_summary(self, input_size: int) -> str:
         lines = [
-            "DroughtLSTM Architecture (v3)",
+            "DroughtLSTM Architecture (v5)",
             "=" * 40,
             f"  Input size   : {input_size}  (features per week)",
             f"  LSTM layers  : {self.num_layers}",
             f"  Hidden size  : {self.hidden_size}",
             f"  Dropout      : {self.dropout.p}",
             f"  Output (FC)  : {self.horizon}  (direct 5-step forecast)",
-            f"  FC bias init : -0.98  (Sigmoid(-0.98)*5 ~= 1.36 == dataset mean)",
+            f"  FC bias init : -1.61  [v5] (Sigmoid(-1.61)*5 ~= 0.84 == true mean)",
             f"  Activation   : Sigmoid x {self._output_scale}  -> (0, {self._output_scale})",
             "-" * 40,
             f"  Total params : {self.count_parameters():,}",

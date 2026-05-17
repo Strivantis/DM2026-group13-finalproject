@@ -1,0 +1,29 @@
+=================================================================
+Preprocessing Pipeline v5  (Region Extinction Fix)
+Custom 366-day calendar: Feb 29 every year, years > 9999 OK
+=================================================================
+
+Loading raw data …
+  train: (12319040, 17)  |  test: (204568, 16)
+  train regions: 2248
+  test  regions: 2248
+
+Weekly aggregation (custom 366-day calendar) …
+  train_w: (1789408, 22)  regions: 2248
+  test_w : (30199, 21)   regions: 2248
+Imputing met features (ffill/bfill per region) …
+Outlier clipping (Z=3.5) …
+Adding rolling & lag features …
+  train_w: (1789408, 41)  |  test_w: (30199, 38)
+  Score NaN before/after region ffill: 31472 → 0
+
+✓ VALIDATION PASSED: 2248 train regions, 2248 test regions.
+  Score mean (weekly): 0.8360
+  Bias init (Sigmoid*5 head): -1.6055
+
+Exporting processed data …
+  Exported train → /home/sean/文件/NYCU/114-2/Data Mining/FinalProject/data/processed/train_processed.csv  (1789408, 41)
+  Exported test  → /home/sean/文件/NYCU/114-2/Data Mining/FinalProject/data/processed/test_processed.csv   (30199, 38)
+
+Total preprocessing time: 79.5s
+=================================================================

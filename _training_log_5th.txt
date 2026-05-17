@@ -1,0 +1,197 @@
+Loading processed data ...
+  train raw: (1789408, 41)  |  test raw: (30199, 38)
+  train regions: 2248  |  test regions: 2248
+Refining features (+ drought proxy index) ...
+  Input features (35): ['prec', 'surf_pre', 'humidity', 'tmp', 'tmp_max', 'tmp_min', 'tmp_range', 'wind', 'wind_max', 'wind_min', 'wind_range', 'month', 'week_of_year', 'prec_roll_sum_4w', 'tmp_roll_mean_4w', 'humidity_roll_mean_4w', 'prec_roll_sum_8w', 'tmp_roll_mean_8w', 'humidity_roll_mean_8w', 'prec_roll_sum_13w', 'tmp_roll_mean_13w', 'humidity_roll_mean_13w', 'tmp_lag1w', 'humidity_lag1w', 'prec_lag1w', 'wind_lag1w', 'tmp_lag2w', 'humidity_lag2w', 'prec_lag2w', 'wind_lag2w', 'pet', 'deficit', 'deficit_roll_cum_4w', 'deficit_roll_cum_8w', 'deficit_roll_cum_13w']
+  train after refinement: (1784912, 43)  |  test: (30199, 40)
+Fitting StandardScaler on training feature matrix ...
+
+=================================================================
+Walk-Forward Cross-Validation  (3 folds × 5 weeks)
+Loss: pure MAE (torch.nn.L1Loss)
+AMP : True  |  batch_size=1024  |  num_workers=8
+=================================================================
+
+-- Fold 1/3 --
+  Train seqs: 1,735,456  |  Val seqs: 2,248
+============================================================
+ Epoch   TrainMAE     ValMAE         LR
+============================================================
+     1      0.5406      0.2514    1.00e-03 *
+     2      0.4632      0.2450    1.00e-03 *
+     3      0.4333      0.2553    1.00e-03
+     4      0.4133      0.2408    1.00e-03 *
+     5      0.3978      0.2528    1.00e-03
+     6      0.3856      0.2647    1.00e-03
+     7      0.3758      0.2537    1.00e-03
+     8      0.3668      0.2614    1.00e-03
+     9      0.3594      0.2569    1.00e-03
+    10      0.3536      0.2613    1.00e-03
+    11      0.3481      0.2828    1.00e-03
+    12      0.3437      0.2747    1.00e-03
+    13      0.3394      0.2888    1.00e-03
+    14      0.3351      0.2844    1.00e-03
+    15      0.3313      0.2993    5.00e-04
+    16      0.3210      0.2928    5.00e-04
+    17      0.3188      0.2890    5.00e-04
+    18      0.3169      0.2966    5.00e-04
+    19      0.3152      0.2842    5.00e-04
+    20      0.3137      0.2859    5.00e-04
+    21      0.3124      0.2910    5.00e-04
+    22      0.3106      0.2834    5.00e-04
+    23      0.3097      0.2992    5.00e-04
+    24      0.3084      0.2865    5.00e-04
+    25      0.3073      0.2923    5.00e-04
+    26      0.3059      0.2949    2.50e-04
+    27      0.3008      0.2889    2.50e-04
+    28      0.3002      0.2857    2.50e-04
+    29      0.2994      0.2824    2.50e-04
+
+  Early stopping at epoch 29 (no MAE improvement for 25 epochs).
+============================================================
+  Best Val MAE: 0.2408  (epoch 4)
+  Fold 1 Best Val MAE: 0.2408  |  Best Epoch: 4
+
+-- Fold 2/3 --
+  Train seqs: 1,724,216  |  Val seqs: 2,248
+============================================================
+ Epoch   TrainMAE     ValMAE         LR
+============================================================
+     1      0.5406      0.2633    1.00e-03 *
+     2      0.4617      0.2811    1.00e-03
+     3      0.4321      0.2815    1.00e-03
+     4      0.4125      0.2877    1.00e-03
+     5      0.3978      0.2891    1.00e-03
+     6      0.3847      0.2835    1.00e-03
+     7      0.3747      0.3112    1.00e-03
+     8      0.3664      0.2587    1.00e-03 *
+     9      0.3592      0.2869    1.00e-03
+    10      0.3527      0.2902    1.00e-03
+    11      0.3469      0.2855    1.00e-03
+    12      0.3422      0.2920    1.00e-03
+    13      0.3378      0.2772    1.00e-03
+    14      0.3343      0.2695    1.00e-03
+    15      0.3304      0.2831    1.00e-03
+    16      0.3271      0.2984    1.00e-03
+    17      0.3239      0.2922    1.00e-03
+    18      0.3208      0.2926    1.00e-03
+    19      0.3189      0.2966    5.00e-04
+    20      0.3093      0.2779    5.00e-04
+    21      0.3073      0.2895    5.00e-04
+    22      0.3059      0.2619    5.00e-04
+    23      0.3047      0.2888    5.00e-04
+    24      0.3034      0.2853    5.00e-04
+    25      0.3022      0.2786    5.00e-04
+    26      0.3014      0.2858    5.00e-04
+    27      0.3003      0.2757    5.00e-04
+    28      0.2993      0.2865    5.00e-04
+    29      0.2984      0.2839    5.00e-04
+    30      0.2974      0.2862    2.50e-04
+    31      0.2927      0.2858    2.50e-04
+    32      0.2919      0.2741    2.50e-04
+    33      0.2911      0.2882    2.50e-04
+
+  Early stopping at epoch 33 (no MAE improvement for 25 epochs).
+============================================================
+  Best Val MAE: 0.2587  (epoch 8)
+  Fold 2 Best Val MAE: 0.2587  |  Best Epoch: 8
+
+-- Fold 3/3 --
+  Train seqs: 1,712,976  |  Val seqs: 2,248
+============================================================
+ Epoch   TrainMAE     ValMAE         LR
+============================================================
+     1      0.5401      0.4867    1.00e-03 *
+     2      0.4634      0.4091    1.00e-03 *
+     3      0.4349      0.4088    1.00e-03 *
+     4      0.4148      0.3678    1.00e-03 *
+     5      0.3985      0.4111    1.00e-03
+     6      0.3852      0.4134    1.00e-03
+     7      0.3752      0.4303    1.00e-03
+     8      0.3665      0.3818    1.00e-03
+     9      0.3596      0.3740    1.00e-03
+    10      0.3530      0.4175    1.00e-03
+    11      0.3481      0.4183    1.00e-03
+    12      0.3431      0.3846    1.00e-03
+    13      0.3389      0.3745    1.00e-03
+    14      0.3351      0.4114    1.00e-03
+    15      0.3315      0.3972    5.00e-04
+    16      0.3213      0.3953    5.00e-04
+    17      0.3187      0.4238    5.00e-04
+    18      0.3166      0.3952    5.00e-04
+    19      0.3152      0.4058    5.00e-04
+    20      0.3138      0.3852    5.00e-04
+    21      0.3119      0.4154    5.00e-04
+    22      0.3109      0.4067    5.00e-04
+    23      0.3096      0.4075    5.00e-04
+    24      0.3083      0.4213    5.00e-04
+    25      0.3073      0.4455    5.00e-04
+    26      0.3062      0.3943    2.50e-04
+    27      0.3008      0.3976    2.50e-04
+    28      0.3000      0.4240    2.50e-04
+    29      0.2993      0.4270    2.50e-04
+
+  Early stopping at epoch 29 (no MAE improvement for 25 epochs).
+============================================================
+  Best Val MAE: 0.3678  (epoch 4)
+  Fold 3 Best Val MAE: 0.3678  |  Best Epoch: 4
+
+=================================================================
+Fold MAEs         : ['0.2408', '0.2587', '0.3678']
+Average_Val_MAE   : 0.2891
+Fold Best Epochs  : [4, 8, 4]
+Mean Best Epoch   : 5.3
+TARGET_EPOCHS (v5): 6  (mean * 1.05, rounded)
+=================================================================
+
+=================================================================
+Blind Full Retraining  (TARGET_EPOCHS=6, 100% data, v5)
+Loss      : pure MAE (torch.nn.L1Loss)
+Scheduler : CosineAnnealingLR(T_max=6)
+AMP       : True  |  batch_size=1024
+No validation split. No early stopping.
+=================================================================
+  Full train sequences: 1,746,696
+
+DroughtLSTM Architecture (v5)
+========================================
+  Input size   : 35  (features per week)
+  LSTM layers  : 2
+  Hidden size  : 64
+  Dropout      : 0.4
+  Output (FC)  : 5  (direct 5-step forecast)
+  FC bias init : -1.61  [v5] (Sigmoid(-1.61)*5 ~= 0.84 == true mean)
+  Activation   : Sigmoid x 5.0  -> (0, 5.0)
+----------------------------------------
+  Total params : 59,461
+==================================================
+ Epoch   TrainMAE         LR
+==================================================
+     1      0     1      0.5385    9.33e-04
+     2      0.4613    7.50e-04
+     3      0.4324    5.00e-04
+     4      0.4147    2.50e-04
+     5      0.4024    6.70e-05
+     6      0.3957    0.00e+00
+==================================================
+  Final model saved -> /home/sean/文件/NYCU/114-2/Data Mining/FinalProject/models/final_model_v5.pt
+Blind training complete. Epochs trained : 6
+Training time : 571.8s
+
+Training log saved -> /home/sean/文件/NYCU/114-2/Data Mining/FinalProject/_training_log_5th.txt
+
+Running inference on test set ...
+Formatting submission_5th.csv ...
+  ✓ Submission assertion passed: 2248 rows, 6 columns.
+  ✓ Train/test regions match (2248).
+  submission_5th.csv → /home/sean/文件/NYCU/114-2/Data Mining/FinalProject/submission_5th.csv
+  Rows (excl. header): 2248
+  Columns: ['region_id', 'pred_week1', 'pred_week2', 'pred_week3', 'pred_week4', 'pred_week5']
+
+  Preview:
+region_id  pred_week1  pred_week2  pred_week3  pred_week4  pred_week5
+       R1    0.000308    0.000166    0.000099    0.000065    0.000046
+    R1001    0.031555    0.023132    0.018112    0.014908    0.012749
+    R1002    0.986328    0.985352    0.972656    0.949219    0.917480
+    R1005    1.375000    1.396484    1.398438    1.376953    1.333984
+    R1006    1.602539    1.632812    1.639648    1.616211    1.567383
