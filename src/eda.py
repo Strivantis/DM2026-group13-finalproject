@@ -1,0 +1,333 @@
+"""
+Drought Prediction - Exploratory Data Analysis
+===============================================
+Generates and saves to /plots:
+  1. Pearson & Spearman correlation heatmaps (features vs. score)
+  2. Time-series line plots for 5 randomly sampled region_ids
+  3. Histogram of the target variable `score`
+  4. Boxplots of meteorological features (outlier inspection)
+
+Run after preprocess.py has been executed (or import its helpers directly).
+Date columns are STRING-based (years 3004-3020) so all x-axis plotting
+uses the integer ``day_ordinal`` column instead of pd.Timestamp objects.
+"""
+
+import os
+import random
+import warnings
+
+import matplotlib
+matplotlib.use("Agg")   # non-interactive backend for headless environments
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
+import numpy as np
+import pandas as pd
+import seaborn as sns
+
+# ---------------------------------------------------------------------------
+# Import preprocessing helpers
+# ---------------------------------------------------------------------------
+import sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from preprocess import (
+    load_data,
+    impute_met_features,
+    handle_outliers,
+    align_labels_strategy_a,
+    aggregate_test_weekly,
+    preprocess_data,
+    export_processed,
+    MET_COLS,
+)
+
+warnings.filterwarnings("ignore")
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+BASE_DIR  = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PLOTS_DIR = os.path.join(BASE_DIR, "plots")
+os.makedirs(PLOTS_DIR, exist_ok=True)
+
+# RNG seed for reproducibility
+RANDOM_SEED = 42
+random.seed(RANDOM_SEED)
+np.random.seed(RANDOM_SEED)
+
+# Seaborn theme
+sns.set_theme(style="whitegrid", palette="muted", font_scale=1.1)
+
+
+# ---------------------------------------------------------------------------
+# Helper: save figure
+# ---------------------------------------------------------------------------
+def _save(fig: plt.Figure, name: str) -> None:
+    path = os.path.join(PLOTS_DIR, name)
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved → {path}")
+
+
+# ---------------------------------------------------------------------------
+# 1. Correlation heatmaps (Pearson & Spearman)
+# ---------------------------------------------------------------------------
+def plot_correlation_heatmaps(df: pd.DataFrame) -> None:
+    """
+    Compute Pearson and Spearman correlation matrices between all numeric
+    engineered features and ``score``, then save heatmaps.
+    Rows with NaN score are dropped before computing correlations.
+    Downsamples to 500 k rows for Spearman performance.
+    """
+    df_valid   = df.dropna(subset=["score"]).copy()
+    df_sampled = df_valid.sample(n=min(500_000, len(df_valid)), random_state=RANDOM_SEED)
+
+    # Exclude non-feature columns
+    exclude = {"score", "day_ordinal", "year"}
+    numeric_cols = [
+        c for c in df_sampled.select_dtypes(include=[np.number]).columns
+        if c not in exclude
+    ]
+    corr_data = df_sampled[numeric_cols + ["score"]]
+
+    for method in ("pearson", "spearman"):
+        corr_matrix = corr_data.corr(method=method)
+
+        # --- full lower-triangle heatmap ---
+        n = len(corr_matrix)
+        fig, ax = plt.subplots(figsize=(max(14, n * 0.5), max(12, n * 0.45)))
+        mask = np.zeros_like(corr_matrix, dtype=bool)
+        mask[np.triu_indices_from(mask, k=1)] = True
+        sns.heatmap(
+            corr_matrix,
+            mask=mask,
+            annot=False,
+            cmap="coolwarm",
+            center=0,
+            linewidths=0.3,
+            ax=ax,
+            cbar_kws={"shrink": 0.6},
+        )
+        ax.set_title(f"{method.capitalize()} Correlation Heatmap (Weekly Features)",
+                     fontsize=14, pad=12)
+        _save(fig, f"corr_heatmap_{method}.png")
+
+        # --- score-only bar chart ---
+        score_corr = (
+            corr_matrix["score"]
+            .drop("score")
+            .sort_values(key=abs, ascending=False)
+        )
+        fig2, ax2 = plt.subplots(figsize=(10, max(6, len(score_corr) * 0.35)))
+        colors = ["tomato" if v < 0 else "steelblue" for v in score_corr]
+        score_corr.plot(kind="barh", ax=ax2, color=colors)
+        ax2.axvline(0, color="black", linewidth=0.8)
+        ax2.set_xlabel(f"{method.capitalize()} correlation with score")
+        ax2.set_title(f"Feature vs. Score ({method.capitalize()}) — Weekly", fontsize=13)
+        _save(fig2, f"corr_score_bar_{method}.png")
+
+
+# ---------------------------------------------------------------------------
+# 2. Time-series plots for sampled regions
+# ---------------------------------------------------------------------------
+def plot_region_timeseries(df: pd.DataFrame, n_regions: int = 5) -> None:
+    """
+    For n randomly sampled region_ids, plot weekly trends of:
+      - Temperature (tmp)
+      - Humidity
+      - Precipitation (prec)
+      - Wind speed (wind)
+      - Score (right axis, scatter)
+
+    X-axis uses ``day_ordinal`` (integer weeks since epoch) and is labelled
+    with the ``week_key`` string every ~26 ticks for readability.
+    """
+    all_regions = df["region_id"].unique().tolist()
+    n_regions   = min(n_regions, len(all_regions))
+    sampled     = random.sample(all_regions, n_regions)
+
+    weather_vars = [c for c in ["tmp", "humidity", "prec", "wind"] if c in df.columns]
+    colors       = ["#2196F3", "#4CAF50", "#FF9800", "#9C27B0"]
+    labels       = {
+        "tmp":      "Temp (°C)",
+        "humidity": "Humidity (%)",
+        "prec":     "Precip (mm)",
+        "wind":     "Wind (m/s)",
+    }
+
+    for rid in sampled:
+        sub = df[df["region_id"] == rid].sort_values("day_ordinal").copy()
+
+        fig, axes = plt.subplots(
+            len(weather_vars), 1,
+            figsize=(16, 3 * len(weather_vars)),
+            sharex=True,
+        )
+        if len(weather_vars) == 1:
+            axes = [axes]
+
+        x = sub["day_ordinal"].values
+
+        for idx, (var, ax) in enumerate(zip(weather_vars, axes)):
+            ax.plot(x, sub[var].values, color=colors[idx % len(colors)],
+                    linewidth=0.9, alpha=0.85, label=labels.get(var, var))
+            ax.set_ylabel(labels.get(var, var), fontsize=9)
+            ax.legend(loc="upper right", fontsize=8)
+
+            # Overlay score on secondary axis
+            if "score" in sub.columns:
+                ax2   = ax.twinx()
+                sub_s = sub.dropna(subset=["score"])
+                ax2.scatter(
+                    sub_s["day_ordinal"].values, sub_s["score"].values,
+                    color="red", s=12, alpha=0.65, label="score", zorder=5,
+                )
+                ax2.set_ylabel("Score", color="red", fontsize=8)
+                ax2.tick_params(axis="y", labelcolor="red", labelsize=7)
+                ax2.set_ylim(-0.5, 5.5)
+                ax2.legend(loc="upper left", fontsize=7)
+
+        # Tick labels: sample ~10 week_key strings along x-axis
+        ax_bot = axes[-1]
+        step   = max(1, len(sub) // 10)
+        tick_x = x[::step]
+        if "week_key" in sub.columns:
+            tick_labels = sub["week_key"].values[::step]
+        else:
+            tick_labels = [str(v) for v in tick_x]
+        ax_bot.set_xticks(tick_x)
+        ax_bot.set_xticklabels(tick_labels, rotation=35, ha="right", fontsize=7)
+        ax_bot.set_xlabel("Week", fontsize=9)
+
+        fig.suptitle(f"Weekly Weather & Score — Region {rid}", fontsize=13, y=1.01)
+        fig.tight_layout()
+        _save(fig, f"timeseries_{rid}.png")
+
+
+# ---------------------------------------------------------------------------
+# 3. Score histogram
+# ---------------------------------------------------------------------------
+def plot_score_histogram(df: pd.DataFrame) -> None:
+    """Histogram of the target variable score (0–5 integer scale)."""
+    score_vals = df["score"].dropna()
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    bins = np.arange(-0.25, 5.75, 0.5)
+    ax.hist(score_vals, bins=bins, color="steelblue", edgecolor="white", alpha=0.85)
+    ax.set_xlabel("Score", fontsize=12)
+    ax.set_ylabel("Count", fontsize=12)
+    ax.set_title("Distribution of Target Variable (score) — Weekly Aggregation", fontsize=13)
+    ax.set_xticks(range(6))
+
+    total = len(score_vals)
+    for v in range(6):
+        cnt = ((score_vals >= v - 0.25) & (score_vals < v + 0.25)).sum()
+        if cnt > 0:
+            ax.text(v, cnt + total * 0.005, f"{cnt/total:.1%}",
+                    ha="center", va="bottom", fontsize=8, color="navy")
+
+    _save(fig, "score_histogram.png")
+
+
+# ---------------------------------------------------------------------------
+# 4. Boxplots for outlier inspection
+# ---------------------------------------------------------------------------
+def plot_feature_boxplots(df: pd.DataFrame) -> None:
+    """Boxplots of all meteorological features (post-clip weekly values)."""
+    df = df.sample(n=min(500_000, len(df)), random_state=RANDOM_SEED)
+    cols  = [c for c in MET_COLS if c in df.columns]
+    n     = len(cols)
+    ncols = 4
+    nrows = int(np.ceil(n / ncols))
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 4, nrows * 4))
+    axes = axes.flatten()
+
+    for i, col in enumerate(cols):
+        axes[i].boxplot(
+            df[col].dropna(), vert=True, patch_artist=True,
+            boxprops=dict(facecolor="#90CAF9", color="navy"),
+            medianprops=dict(color="red", linewidth=1.5),
+            flierprops=dict(marker=".", markersize=2, alpha=0.3),
+        )
+        axes[i].set_title(col, fontsize=10)
+        axes[i].set_xticks([])
+
+    for j in range(i + 1, len(axes)):
+        axes[j].set_visible(False)
+
+    fig.suptitle("Meteorological Feature Boxplots — Weekly Aggregated (Post-Clip)",
+                 fontsize=13)
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
+    _save(fig, "feature_boxplots.png")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+def main() -> None:
+    print("=" * 60)
+    print("Drought Prediction — EDA Pipeline (Weekly Aggregation)")
+    print("=" * 60)
+
+    # ------------------------------------------------------------------
+    # Load & preprocess (Strategy A: weekly aggregation, no interpolation)
+    # ------------------------------------------------------------------
+    print("\nLoading raw data …")
+    train_raw = load_data("train.csv")
+    test_raw  = load_data("test.csv")
+    print(f"  Raw train: {train_raw.shape}  |  Raw test: {test_raw.shape}")
+
+    print("Imputing …")
+    train = impute_met_features(train_raw)
+    test  = impute_met_features(test_raw)
+
+    print("Outlier clipping (Z=3.5) …")
+    train = handle_outliers(train, z_thresh=3.5)
+    test  = handle_outliers(test,  z_thresh=3.5)
+
+    print("Weekly aggregation …")
+    train_w = align_labels_strategy_a(train)
+    test_w  = aggregate_test_weekly(test)
+
+    print("Feature engineering …")
+    train_w = preprocess_data(train_w)
+    test_w  = preprocess_data(test_w)
+    print(f"  train_w: {train_w.shape}  |  test_w: {test_w.shape}")
+
+    # ------------------------------------------------------------------
+    # Export processed data for PyTorch
+    # ------------------------------------------------------------------
+    print("\nExporting processed data to data/processed/ …")
+    export_processed(train_w, test_w, fmt="csv")
+
+    # ------------------------------------------------------------------
+    # EDA plots
+    # ------------------------------------------------------------------
+    print("\n[1/4] Correlation heatmaps …")
+    plot_correlation_heatmaps(train_w)
+
+    print("[2/4] Region time-series plots (5 regions) …")
+    plot_region_timeseries(train_w, n_regions=5)
+
+    print("[3/4] Score histogram …")
+    plot_score_histogram(train_w)
+
+    print("[4/4] Feature boxplots …")
+    plot_feature_boxplots(train_w)
+
+    # ------------------------------------------------------------------
+    # Validation
+    # ------------------------------------------------------------------
+    print("\n[Validation] NaN counts per column (train_w):")
+    print(train_w.isna().sum().to_string())
+
+    met_check = [c for c in MET_COLS if c in train_w.columns]
+    nan_met   = train_w[met_check].isna().sum().sum()
+    print(f"\nNaN in meteorological feature columns: {nan_met}")
+    assert nan_met == 0, f"Unexpected NaNs in met features: {nan_met}"
+
+    print("\n✓ EDA pipeline completed. All plots saved to:", PLOTS_DIR)
+
+
+if __name__ == "__main__":
+    main()
