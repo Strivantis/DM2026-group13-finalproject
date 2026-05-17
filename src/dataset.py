@@ -8,7 +8,8 @@ Design
 - Sliding window (step=1) of W=13 weekly rows as input (X).
 - Multi-step target: the next H=5 weekly `score` values (Y).
 - Region boundaries are strictly respected – windows NEVER cross regions.
-- Feature pruning and log1p precipitation transform are applied here.
+- Feature pruning, log1p precipitation transform, and Drought Index
+  (PET-based deficit rolling sums) are applied here.
 """
 
 import numpy as np
@@ -16,12 +17,17 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
+from src.preprocess import add_drought_index, DROUGHT_FEAT_COLS
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 WINDOW_SIZE = 13   # look-back (weeks)
 HORIZON = 5        # forecast horizon (weeks)
-VAL_WEEKS = 10     # hold-out weeks per region for validation
+
+# Walk-Forward Validation parameters
+WF_FOLD_WEEKS  = 5   # weeks per fold
+WF_NUM_FOLDS   = 3   # number of folds  → 15 total hold-out weeks
 
 # Drop collinear temp proxies (keep tmp, tmp_max, tmp_min, tmp_range)
 DROP_COLS = ["wb_tmp", "dp_tmp", "surf_tmp"]
@@ -49,7 +55,10 @@ FEATURE_COLS = [
     "tmp_lag1w", "humidity_lag1w", "prec_lag1w", "wind_lag1w",
     # --- lag-2 (4) ---
     "tmp_lag2w", "humidity_lag2w", "prec_lag2w", "wind_lag2w",
-]   # total = 30 features
+    # --- drought proxy index (5) ---
+    "pet", "deficit",
+    "deficit_roll_cum_4w", "deficit_roll_cum_8w", "deficit_roll_cum_13w",
+]   # total = 35 features
 
 
 # ---------------------------------------------------------------------------
@@ -57,15 +66,19 @@ FEATURE_COLS = [
 # ---------------------------------------------------------------------------
 def refine_features(df: pd.DataFrame, is_train: bool = True) -> pd.DataFrame:
     """
-    1. Drop collinear temperature proxies.
-    2. Apply log1p to all precipitation-related columns.
-    3. Handle NaN rows:
+    1. Compute Drought Index (PET/deficit) BEFORE log1p (uses raw prec).
+    2. Drop collinear temperature proxies.
+    3. Apply log1p to all precipitation-related columns.
+    4. Handle NaN rows:
        - Train: drop rows where any FEATURE_COL is NaN (lag head).
        - Test:  forward-fill then zero-fill lag NaN so we keep all rows.
 
     Returns a clean copy of df.
     """
     df = df.copy()
+
+    # Step 0 – drought index (must be before log1p of prec)
+    df = add_drought_index(df, is_train=is_train)
 
     # Step 1 – drop collinear columns
     df.drop(columns=[c for c in DROP_COLS if c in df.columns], inplace=True)
@@ -163,39 +176,82 @@ class DroughtDataset(Dataset):
 
 
 # ---------------------------------------------------------------------------
-# Helper – build train / val region group lists
+# Helper – Walk-Forward Cross-Validation fold builder
 # ---------------------------------------------------------------------------
-def build_train_val_groups(df: pd.DataFrame):
+def build_walk_forward_folds(df: pd.DataFrame):
     """
-    Split each region's timeline into train and validation index ranges.
+    Implement Walk-Forward (Time-Series) Cross-Validation.
 
-    Validation: the last VAL_WEEKS rows of each region.
-    Train:      everything before val, such that NO target window overlaps
-                with the validation period.
+    The last WF_NUM_FOLDS * WF_FOLD_WEEKS = 15 weeks of each region are
+    reserved for validation and are split into 3 non-overlapping 5-week folds:
 
-    Guarantee:
-      train sequence i → targets at rows [i+W, i+W+H)
-      i + W + H - 1 < val_start_row   ⟹   i ≤ val_start_row - W - H
+        Fold 0 (most recent) : rows [-5:]
+        Fold 1               : rows [-10:-5]
+        Fold 2 (oldest)      : rows [-15:-10]
 
-    Returns (train_groups, val_groups), each a list of (group_df, i_min, i_max).
+    For each fold k, training uses all rows that precede the fold's
+    validation period (no target leakage).
+
+    Returns
+    -------
+    folds : list of 3 tuples (train_groups, val_groups)
+        Each element is ready to be passed to DroughtDataset.
     """
-    train_groups, val_groups = [], []
+    total_hold = WF_NUM_FOLDS * WF_FOLD_WEEKS   # 15 weeks
 
+    folds = []
+    for fold_k in range(WF_NUM_FOLDS):
+        # val_start_from_end: how many rows from the END is the val period start
+        #   fold 0: rows [-5:]       → val_start_from_end = 5
+        #   fold 1: rows [-10:-5]    → val_start_from_end = 10
+        #   fold 2: rows [-15:-10]   → val_start_from_end = 15
+        val_end_from_end   = fold_k * WF_FOLD_WEEKS            # 0,  5, 10
+        val_start_from_end = val_end_from_end + WF_FOLD_WEEKS  # 5, 10, 15
+
+        train_groups, val_groups = [], []
+
+        for _, group in df.groupby("region_id"):
+            group = group.reset_index(drop=True)
+            n = len(group)
+
+            # Absolute indices
+            val_start = n - val_start_from_end  # inclusive
+            val_end   = n - val_end_from_end    # exclusive  (=n for fold 0)
+
+            if val_start < WINDOW_SIZE:
+                # Not enough history – skip region for this fold
+                continue
+
+            # --- train: sequences whose LAST target row < val_start ----------
+            train_i_max = val_start - WINDOW_SIZE - HORIZON
+            if train_i_max >= 0:
+                train_groups.append((group, 0, train_i_max))
+
+            # --- val: sequences whose FIRST target row >= val_start ----------
+            val_i_min = val_start - WINDOW_SIZE
+            # last sequence must not run past val_end
+            val_i_max = val_end - WINDOW_SIZE - HORIZON
+            if val_i_min >= 0 and val_i_min <= val_i_max:
+                val_groups.append((group, val_i_min, val_i_max))
+
+        folds.append((train_groups, val_groups))
+
+    return folds
+
+
+# ---------------------------------------------------------------------------
+# Helper – build full-train group list (train on ALL data for final model)
+# ---------------------------------------------------------------------------
+def build_full_train_groups(df: pd.DataFrame):
+    """
+    Build region groups using ALL rows (no held-out validation period).
+    Used for final model training after walk-forward CV is complete.
+    """
+    train_groups = []
     for _, group in df.groupby("region_id"):
         group = group.reset_index(drop=True)
         n = len(group)
-        val_start = n - VAL_WEEKS
-
-        # --- train ---
-        train_i_max = val_start - WINDOW_SIZE - HORIZON
+        train_i_max = n - WINDOW_SIZE - HORIZON
         if train_i_max >= 0:
             train_groups.append((group, 0, train_i_max))
-
-        # --- val ---
-        # sequences where the FIRST target row >= val_start
-        val_i_min = val_start - WINDOW_SIZE
-        val_i_max = n - WINDOW_SIZE - HORIZON
-        if val_i_min >= 0 and val_i_min <= val_i_max:
-            val_groups.append((group, val_i_min, val_i_max))
-
-    return train_groups, val_groups
+    return train_groups
