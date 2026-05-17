@@ -1,0 +1,72 @@
+nohup: 忽略輸入
+Device: cuda
+Loading processed data …
+  train raw: (103944, 41)  |  test raw: (1840, 38)
+Refining features …
+  Input features (30): ['prec', 'surf_pre', 'humidity', 'tmp', 'tmp_max', 'tmp_min', 'tmp_range', 'wind', 'wind_max', 'wind_min', 'wind_range', 'month', 'week_of_year', 'prec_roll_sum_4w', 'tmp_roll_mean_4w', 'humidity_roll_mean_4w', 'prec_roll_sum_8w', 'tmp_roll_mean_8w', 'humidity_roll_mean_8w', 'prec_roll_sum_13w', 'tmp_roll_mean_13w', 'humidity_roll_mean_13w', 'tmp_lag1w', 'humidity_lag1w', 'prec_lag1w', 'wind_lag1w', 'tmp_lag2w', 'humidity_lag2w', 'prec_lag2w', 'wind_lag2w']
+  train after refinement: (103678, 38)  |  test: (1840, 35)
+Fitting StandardScaler on training feature matrix …
+Building train / val index groups …
+  Train regions: 133  |  Val regions: 133
+  Train sequences: 100,087  |  Val sequences: 798
+
+DroughtLSTM Architecture
+========================================
+  Input size   : 30  (features per week)
+  LSTM layers  : 2
+  Hidden size  : 128
+  Dropout      : 0.3
+  Output (FC)  : 5  (direct 5-step forecast)
+----------------------------------------
+  Total params : 214,661
+
+=================================================================
+ Epoch   Train Loss  Train MAE    Val MAE         LR
+=================================================================
+     1        1.6226      1.0297      0.6559    1.00e-03 ✓
+     2        1.2701      0.8221      0.6320    1.00e-03 ✓
+     3        1.1183      0.7290      0.6009    1.00e-03 ✓
+     4        1.0161      0.6618      0.7399    1.00e-03
+     5        0.9358      0.6104      0.6480    1.00e-03
+     6        0.8708      0.5677      0.5749    1.00e-03 ✓
+     7        0.8179      0.5350      0.7565    1.00e-03
+     8        0.7737      0.5063      0.6759    1.00e-03
+     9        0.7345      0.4799      0.6019    1.00e-03
+    10        0.7110      0.4643      0.6444    1.00e-03
+    11        0.6862      0.4473      0.6291    1.00e-03
+    12        0.6592      0.4292      0.7228    1.00e-03
+    13        0.6365      0.4141      0.7462    1.00e-03
+    14        0.6172      0.4010      0.7594    1.00e-03
+    15        0.5976      0.3883      0.7199    5.00e-04
+    16        0.5550      0.3607      0.7185    5.00e-04
+    17        0.5386      0.3496      0.8001    5.00e-04
+    18        0.5280      0.3422      0.6819    5.00e-04
+    19        0.5208      0.3375      0.7208    5.00e-04
+    20        0.5156      0.3338      0.6701    5.00e-04
+    21        0.5052      0.3275      0.7020    5.00e-04
+    22        0.5015      0.3239      0.6958    5.00e-04
+    23        0.4927      0.3183      0.7940    5.00e-04
+    24        0.4882      0.3150      0.7742    2.50e-04
+    25        0.4680      0.3018      0.6977    2.50e-04
+    26        0.4611      0.2975      0.7278    2.50e-04
+
+Early stopping triggered at epoch 26 (no improvement for 20 epochs).
+=================================================================
+Best Val MAE: 0.5749
+Training time: 26.1s
+
+Training log saved → /home/sean/文件/NYCU/114-2/Data Mining/FinalProject/_training_log.txt
+
+Running inference on test set …
+Formatting submission.csv …
+  submission.csv saved → /home/sean/文件/NYCU/114-2/Data Mining/FinalProject/submission.csv
+  Rows (excluding header): 133  ✓
+  Columns: ['region_id', 'pred_week1', 'pred_week2', 'pred_week3', 'pred_week4', 'pred_week5']
+
+  Preview:
+region_id  pred_week1  pred_week2  pred_week3  pred_week4  pred_week5
+       R1    0.162250    0.104686    0.054644    0.019711    0.000000
+      R11    2.948859    3.017199    3.112375    3.226215    3.298939
+     R111    0.078001    0.099160    0.116218    0.136776    0.154169
+     R119    1.576810    1.442521    1.318415    1.215653    1.117387
+     R123    0.043614    0.055408    0.061929    0.074064    0.082147
