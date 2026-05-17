@@ -1,27 +1,33 @@
 """
-train.py -- Drought Score Forecasting Pipeline (v5)
-====================================================
+train.py -- Drought Score Forecasting Pipeline (v6 – Anti-Collapse Refactor)
+=============================================================================
 Usage:
     python src/train.py
 
 Outputs:
-    submission_5th.csv           -- Kaggle submission (2248 rows + header)
-    models/final_model_v5.pt     -- Blind full-retrained model (TARGET_EPOCHS, 100% data)
+    submission.csv               -- Kaggle submission (2248 rows + header)
+    models/final_model_v6.pt     -- Blind full-retrained model (TARGET_EPOCHS, 100% data)
     models/scaler.pkl            -- Fitted StandardScaler
     models/training_history.csv  -- Per-epoch metrics for final training run
-    _training_log_5th.txt        -- Full console log
+    _training_log_6th.txt        -- Full console log
 
-Key improvements (v5)
----------------------
-  1. Region Extinction Fix   -- train_processed.csv now contains all 2248 regions
-                                 (1.7M+ sequences).
-  2. Statistical Recalibration -- fc.bias corrected to -1.61 (TRUE mean = 0.8357).
-  3. Hardware Scaling         -- batch_size=1024, num_workers=8, pin_memory=True
-                                 for RTX 4070 Laptop (8 GB VRAM) + i9-13980HX.
-  4. AMP                      -- torch.amp.autocast('cuda') + GradScaler halves
-                                 VRAM usage and accelerates training ~2×.
-  5. Strict v4 Architecture   -- Pure L1Loss, hidden_size=64, Sigmoid×5.0.
-  6. Submission assertion     -- 2248 rows (not 133).
+Key improvements (v6 – Anti-Collapse Refactor)
+-----------------------------------------------
+  1. Weighted Smooth L1 Loss  -- Samples with ground-truth score > 3.0 (severe
+                                  drought) receive a 4× loss penalty, forcing
+                                  the model to take risks and predict extremes.
+  2. Deeper Prediction Head   -- Linear(64→32)→GELU→Dropout(0.3)→Linear(32→5)
+                                  replaces the single Linear(64→5).
+  3. Softplus + clamp(0,5)    -- Replaces Sigmoid×5 to eliminate vanishing
+                                  gradients at the output extremes.
+  4. No Forced Bias           -- Removed -1.61 bias init that trapped the model
+                                  at the global mean prediction.
+  5. Diagnostic Logging       -- 95th and 99th prediction percentiles are logged
+                                  after every CV fold to detect collapse.
+  6. Data Leakage Check       -- Verified: FEATURE_COLS contains no score_lag
+                                  or any autoregressive target leakage.
+  7. Log1p Precipitation      -- Already applied in dataset.refine_features()
+                                  for all prec / prec_roll_sum_* / prec_lag* cols.
 
 Hardware note
 -------------
@@ -37,6 +43,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.amp import autocast, GradScaler
 from torch.utils.data import DataLoader
 from sklearn.preprocessing import StandardScaler
@@ -74,23 +81,63 @@ BATCH_SIZE     = 1024        # RTX 4070 8GB + AMP → fits comfortably; fallback
 NUM_EPOCHS     = 150         # extended; early stopping governs CV folds
 PATIENCE       = 25          # patience on pure val MAE (CV only)
 
+# Weighted loss – severe drought penalty
+DROUGHT_THRESHOLD = 3.0      # ground-truth score threshold for "severe" drought
+DROUGHT_PENALTY   = 4.0      # loss multiplier for samples above threshold
+
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Device: {DEVICE}")
 
 # AMP: only enabled for CUDA
 USE_AMP = DEVICE.type == "cuda"
 
-# ---------------------------------------------------------------------------
-# Training / validation helpers  (pure MAE only -- no weighting)
-# ---------------------------------------------------------------------------
-CRITERION = nn.L1Loss()
-
 # GradScaler for AMP (no-op on CPU)
 _scaler = GradScaler(device="cuda", enabled=USE_AMP)
 
 
+# ---------------------------------------------------------------------------
+# Weighted Smooth L1 (Huber) Loss  [v6 – core anti-collapse mechanism]
+# ---------------------------------------------------------------------------
+# Mathematical definition:
+#   For each (pred_i, target_i) pair:
+#     huber_i = SmoothL1(pred_i, target_i)          [element-wise, reduction='none']
+#     weight_i = DROUGHT_PENALTY  if target_i > DROUGHT_THRESHOLD  else 1.0
+#     loss     = mean(weight_i * huber_i)
+#
+# Effect: severe-drought samples (score > 3) contribute 4× to the gradient,
+#         overcoming the data imbalance and forcing the model to predict extremes.
+# ---------------------------------------------------------------------------
+def weighted_smooth_l1_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """
+    Weighted Smooth L1 / Huber loss.
+
+    Parameters
+    ----------
+    pred   : (B, H) model predictions
+    target : (B, H) ground-truth scores
+
+    Returns
+    -------
+    scalar loss
+    """
+    element_loss = F.smooth_l1_loss(pred, target, reduction="none")  # (B, H)
+    # Weight mask: 4× penalty wherever ground-truth exceeds threshold
+    weight = torch.where(target > DROUGHT_THRESHOLD,
+                         torch.full_like(target, DROUGHT_PENALTY),
+                         torch.ones_like(target))
+    return (weight * element_loss).mean()
+
+
+# Plain MAE for evaluation/diagnostics (no weighting – fair metric)
+_l1_criterion = nn.L1Loss()
+
+
+# ---------------------------------------------------------------------------
+# Training / validation helpers
+# ---------------------------------------------------------------------------
+
 def train_epoch(model, loader, optimizer, device):
-    """One training epoch – pure MAE (L1Loss) with AMP."""
+    """One training epoch – Weighted Smooth L1 with AMP."""
     model.train()
     total_loss, n = 0.0, 0
     for X, y in loader:
@@ -99,7 +146,7 @@ def train_epoch(model, loader, optimizer, device):
 
         with autocast(device_type=device.type, enabled=USE_AMP):
             pred = model(X)
-            loss = CRITERION(pred, y)
+            loss = weighted_smooth_l1_loss(pred, y)
 
         _scaler.scale(loss).backward()
         _scaler.unscale_(optimizer)
@@ -115,16 +162,50 @@ def train_epoch(model, loader, optimizer, device):
 
 @torch.no_grad()
 def eval_mae(model, loader, device) -> float:
-    """Evaluate pure MAE -- used for early stopping & fold scoring."""
+    """Evaluate pure (unweighted) MAE – used for early stopping & fold scoring."""
     model.eval()
     total_mae, n = 0.0, 0
     for X, y in loader:
         X, y = X.to(device), y.to(device)
         with autocast(device_type=device.type, enabled=USE_AMP):
             pred = model(X)
-        total_mae += CRITERION(pred, y).item() * X.size(0)
+        total_mae += _l1_criterion(pred, y).item() * X.size(0)
         n += X.size(0)
     return total_mae / n if n > 0 else float("inf")
+
+
+@torch.no_grad()
+def eval_prediction_percentiles(model, loader, device, log) -> dict:
+    """
+    Diagnostic hook: collect all predictions and log percentile statistics.
+    Self-Correction Check: if p99 < 2.0, the model is still evading extremes.
+    """
+    model.eval()
+    all_preds = []
+    for X, y in loader:
+        X = X.to(device)
+        with autocast(device_type=device.type, enabled=USE_AMP):
+            pred = model(X)
+        all_preds.append(pred.cpu().float().numpy())
+
+    if not all_preds:
+        return {}
+
+    preds_flat = np.concatenate(all_preds, axis=0).ravel()
+    p50  = float(np.percentile(preds_flat, 50))
+    p90  = float(np.percentile(preds_flat, 90))
+    p95  = float(np.percentile(preds_flat, 95))
+    p99  = float(np.percentile(preds_flat, 99))
+    pmax = float(np.max(preds_flat))
+
+    log(f"  [Prediction Diagnostics] n={len(preds_flat):,}")
+    log(f"    p50={p50:.4f}  p90={p90:.4f}  p95={p95:.4f}  p99={p99:.4f}  max={pmax:.4f}")
+    if p99 < 2.0:
+        log("    *** WARNING: p99 < 2.0 — model is still evading extremes (collapse not fixed)! ***")
+    else:
+        log("    ✓ p99 >= 2.0 — model is predicting away from the mean.")
+
+    return {"p50": p50, "p90": p90, "p95": p95, "p99": p99, "max": pmax}
 
 
 def make_model(input_size: int) -> DroughtLSTM:
@@ -163,7 +244,7 @@ def _make_loader(dataset, shuffle: bool, batch_size: int = BATCH_SIZE) -> DataLo
 
 
 # ---------------------------------------------------------------------------
-# Single training run with early stopping (used for CV folds only)
+# Single training run with early stopping (used for CV folds)
 # ---------------------------------------------------------------------------
 def train_model(
     model,
@@ -176,7 +257,8 @@ def train_model(
     show_header: bool = True,
 ):
     """
-    Train model with early stopping on pure MAE.
+    Train model with early stopping on pure (unweighted) MAE.
+    Loss during training: Weighted Smooth L1.
 
     Returns best_val_mae, best_epoch, history.
     """
@@ -184,9 +266,9 @@ def train_model(
     scheduler = make_scheduler(optimiser)
 
     if show_header:
-        log("=" * 60)
-        log(f"{'Epoch':>6} {'TrainMAE':>10} {'ValMAE':>10} {'LR':>10}")
-        log("=" * 60)
+        log("=" * 65)
+        log(f"{'Epoch':>6} {'TrainLoss':>11} {'ValMAE':>10} {'LR':>10}")
+        log("=" * 65)
 
     best_val_mae = float("inf")
     best_epoch   = 1
@@ -194,12 +276,12 @@ def train_model(
     history      = []
 
     for epoch in range(1, num_epochs + 1):
-        train_mae = train_epoch(model, train_loader, optimiser, DEVICE)
-        val_mae   = eval_mae(model, val_loader, DEVICE)
+        train_loss = train_epoch(model, train_loader, optimiser, DEVICE)
+        val_mae    = eval_mae(model, val_loader, DEVICE)
         scheduler.step(val_mae)
         curr_lr = optimiser.param_groups[0]["lr"]
 
-        history.append((epoch, train_mae, val_mae))
+        history.append((epoch, train_loss, val_mae))
 
         improved = val_mae < best_val_mae
         if improved:
@@ -212,7 +294,7 @@ def train_model(
 
         marker = " *" if improved else ""
         log(
-            f"{epoch:>6}  {train_mae:>10.4f}"
+            f"{epoch:>6}  {train_loss:>11.4f}"
             f"  {val_mae:>10.4f}  {curr_lr:>10.2e}{marker}"
         )
 
@@ -223,13 +305,13 @@ def train_model(
             )
             break
 
-    log("=" * 60)
+    log("=" * 65)
     log(f"  Best Val MAE: {best_val_mae:.4f}  (epoch {best_epoch})")
     return best_val_mae, best_epoch, history
 
 
 # ---------------------------------------------------------------------------
-# Blind full retraining (v5) -- no validation, no early stopping
+# Blind full retraining (v6) -- no validation, no early stopping
 # ---------------------------------------------------------------------------
 def train_model_blind(
     model,
@@ -240,28 +322,28 @@ def train_model_blind(
 ):
     """
     Blind full retraining on 100% of training data for exactly num_epochs.
-    Uses CosineAnnealingLR.  Pure MAE.  AMP enabled.
+    Uses CosineAnnealingLR.  Weighted Smooth L1 loss.  AMP enabled.
     """
     optimiser = make_optimiser(model)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimiser, T_max=num_epochs
     )
 
-    log("=" * 50)
-    log(f"{'Epoch':>6} {'TrainMAE':>10} {'LR':>10}")
-    log("=" * 50)
+    log("=" * 55)
+    log(f"{'Epoch':>6} {'TrainLoss':>11} {'LR':>10}")
+    log("=" * 55)
 
     history = []
 
     for epoch in range(1, num_epochs + 1):
-        train_mae = train_epoch(model, train_loader, optimiser, DEVICE)
+        train_loss = train_epoch(model, train_loader, optimiser, DEVICE)
         scheduler.step()
         curr_lr = optimiser.param_groups[0]["lr"]
 
-        history.append((epoch, train_mae))
-        log(f"{epoch:>6}  {train_mae:>10.4f}  {curr_lr:>10.2e}")
+        history.append((epoch, train_loss))
+        log(f"{epoch:>6}  {train_loss:>11.4f}  {curr_lr:>10.2e}")
 
-    log("=" * 50)
+    log("=" * 55)
     torch.save(model.state_dict(), ckpt_path)
     log(f"  Final model saved -> {ckpt_path}")
     return history
@@ -278,8 +360,17 @@ def main():
         print(msg)
         log_lines.append(str(msg))
 
+    # -- 0. Architecture & loss description ------------------------------------
+    log("=" * 65)
+    log("Drought Forecasting Pipeline  v6  (Anti-Collapse Refactor)")
+    log("=" * 65)
+    log(f"Loss      : Weighted Smooth L1  (severe drought >{DROUGHT_THRESHOLD:.1f} → {DROUGHT_PENALTY:.0f}× penalty)")
+    log(f"Activation: Softplus → clamp(0, 5)  [replaces Sigmoid×5]")
+    log(f"Head      : Linear(64→32)→GELU→Dropout(0.3)→Linear(32→5)")
+    log(f"Bias init : default (no forced -1.61 mean bias)")
+
     # -- 1. Load data ----------------------------------------------------------
-    log("Loading processed data ...")
+    log("\nLoading processed data ...")
     train_raw = pd.read_csv(os.path.join(PROCESSED_DIR, "train_processed.csv"))
     test_raw  = pd.read_csv(os.path.join(PROCESSED_DIR, "test_processed.csv"))
     log(f"  train raw: {train_raw.shape}  |  test raw: {test_raw.shape}")
@@ -290,8 +381,17 @@ def main():
     assert n_train_regions == 2248, f"Expected 2248 train regions, got {n_train_regions}"
     assert n_test_regions  == 2248, f"Expected 2248 test regions,  got {n_test_regions}"
 
-    # -- 2. Feature refinement (incl. Drought Index) ---------------------------
-    log("Refining features (+ drought proxy index) ...")
+    # -- 1b. Data Leakage Check -------------------------------------------------
+    log("\n[Data Leakage Check]")
+    leaky_cols = [c for c in FEATURE_COLS if "score" in c.lower()]
+    if leaky_cols:
+        log(f"  *** WARNING: Potential leaky features found: {leaky_cols} ***")
+    else:
+        log("  ✓ No score-based autoregressive features in FEATURE_COLS.")
+    log(f"  FEATURE_COLS ({len(FEATURE_COLS)}): {FEATURE_COLS}")
+
+    # -- 2. Feature refinement (incl. Drought Index + log1p precip) ------------
+    log("\nRefining features (drought proxy index + log1p precipitation) ...")
     train_df = refine_features(train_raw, is_train=True)
     test_df  = refine_features(test_raw,  is_train=False)
 
@@ -301,7 +401,7 @@ def main():
     log(f"  train after refinement: {train_df.shape}  |  test: {test_df.shape}")
 
     # -- 3. Fit scaler on training features ------------------------------------
-    log("Fitting StandardScaler on training feature matrix ...")
+    log("\nFitting StandardScaler on training feature matrix ...")
     scaler = StandardScaler()
     train_feat_matrix = train_df[feat_cols].values.astype(np.float32)
     scaler.fit(train_feat_matrix)
@@ -309,16 +409,34 @@ def main():
     with open(os.path.join(MODELS_DIR, "scaler.pkl"), "wb") as f:
         pickle.dump(scaler, f)
 
-    # -- 4. Walk-Forward Cross-Validation --------------------------------------
+    # -- 3b. Drop rows with NaN score (prevents NaN loss) ----------------------
+    before = len(train_df)
+    train_df = train_df.dropna(subset=["score"]).reset_index(drop=True)
+    dropped_nan = before - len(train_df)
+    if dropped_nan:
+        log(f"  [NaN drop] Removed {dropped_nan:,} rows with NaN score from train_df.")
+
+    # -- 4. Target score distribution summary ----------------------------------
+    log("\n[Training Target Distribution]")
+    all_scores = train_df["score"].values
+    log(f"  mean={all_scores.mean():.4f}  std={all_scores.std():.4f}  "
+        f"min={all_scores.min():.2f}  max={all_scores.max():.2f}")
+    for thresh in [1.0, 2.0, 3.0, 4.0]:
+        frac = (all_scores > thresh).mean() * 100
+        log(f"  score > {thresh:.1f}: {frac:.2f}%  [{int((all_scores > thresh).sum()):,} samples]")
+
+    # -- 5. Walk-Forward Cross-Validation --------------------------------------
     log(f"\n{'='*65}")
     log(f"Walk-Forward Cross-Validation  ({WF_NUM_FOLDS} folds × {WF_FOLD_WEEKS} weeks)")
-    log("Loss: pure MAE (torch.nn.L1Loss)")
+    log(f"Train loss  : Weighted Smooth L1  (threshold={DROUGHT_THRESHOLD}, penalty={DROUGHT_PENALTY}×)")
+    log(f"Val metric  : pure MAE  (unweighted, fair comparison)")
     log(f"AMP : {USE_AMP}  |  batch_size={BATCH_SIZE}  |  num_workers=8")
     log(f"{'='*65}")
 
     folds = build_walk_forward_folds(train_df)
-    fold_maes        = []
-    fold_best_epochs = []
+    fold_maes         = []
+    fold_best_epochs  = []
+    fold_percentiles  = []
 
     for fold_k, (fold_train_groups, fold_val_groups) in enumerate(folds):
         log(f"\n-- Fold {fold_k + 1}/{WF_NUM_FOLDS} --")
@@ -330,7 +448,6 @@ def main():
             fold_loader_tr  = _make_loader(fold_train_ds, shuffle=True)
             fold_loader_val = _make_loader(fold_val_ds,   shuffle=False)
         except Exception:
-            # Fallback: fewer workers if multiprocessing fails
             fold_loader_tr  = DataLoader(fold_train_ds, batch_size=BATCH_SIZE,
                                          shuffle=True,  num_workers=0, pin_memory=USE_AMP)
             fold_loader_val = DataLoader(fold_val_ds,   batch_size=BATCH_SIZE,
@@ -369,6 +486,16 @@ def main():
         fold_best_epochs.append(best_fold_epoch)
         log(f"  Fold {fold_k+1} Best Val MAE: {best_fold_mae:.4f}  |  Best Epoch: {best_fold_epoch}")
 
+        # --- Diagnostic Hook: load best checkpoint and check prediction distribution ---
+        log(f"\n  [Fold {fold_k+1} Prediction Percentiles – best checkpoint]")
+        if os.path.exists(fold_ckpt) and best_fold_mae < float("inf"):
+            fold_model.load_state_dict(torch.load(fold_ckpt, map_location=DEVICE))
+            pct = eval_prediction_percentiles(fold_model, fold_loader_val, DEVICE, log)
+        else:
+            log("  [Skip] No valid checkpoint saved for this fold (training produced NaN).")
+            pct = {}
+        fold_percentiles.append(pct)
+
     avg_val_mae     = float(np.mean(fold_maes))
     mean_best_epoch = float(np.mean(fold_best_epochs))
     TARGET_EPOCHS   = max(1, int(round(mean_best_epoch * 1.05)))
@@ -378,38 +505,54 @@ def main():
     log(f"Average_Val_MAE   : {avg_val_mae:.4f}")
     log(f"Fold Best Epochs  : {fold_best_epochs}")
     log(f"Mean Best Epoch   : {mean_best_epoch:.1f}")
-    log(f"TARGET_EPOCHS (v5): {TARGET_EPOCHS}  (mean * 1.05, rounded)")
+    log(f"TARGET_EPOCHS (v6): {TARGET_EPOCHS}  (mean * 1.05, rounded)")
+    log(f"\nFold Prediction Percentiles Summary:")
+    for i, p in enumerate(fold_percentiles):
+        if p:
+            log(f"  Fold {i+1}: p50={p.get('p50',float('nan')):.3f}  "
+                f"p95={p.get('p95',float('nan')):.3f}  "
+                f"p99={p.get('p99',float('nan')):.3f}  "
+                f"max={p.get('max',float('nan')):.3f}")
     log(f"{'='*65}")
 
-    # -- 5. Blind full retraining on 100% training data (v5) -------------------
+    # -- 6. Blind full retraining on 100% training data (v6) -------------------
     log(f"\n{'='*65}")
-    log(f"Blind Full Retraining  (TARGET_EPOCHS={TARGET_EPOCHS}, 100% data, v5)")
-    log("Loss      : pure MAE (torch.nn.L1Loss)")
+    log(f"Blind Full Retraining  (TARGET_EPOCHS={TARGET_EPOCHS}, 100% data, v6)")
+    log(f"Loss      : Weighted Smooth L1  (threshold={DROUGHT_THRESHOLD}, penalty={DROUGHT_PENALTY}×)")
     log(f"Scheduler : CosineAnnealingLR(T_max={TARGET_EPOCHS})")
     log(f"AMP       : {USE_AMP}  |  batch_size={BATCH_SIZE}")
     log("No validation split. No early stopping.")
     log(f"{'='*65}")
+
+    # Free GPU & CPU memory from fold models/datasets before building full dataset
+    torch.cuda.empty_cache()
 
     full_train_groups = build_full_train_groups(train_df)
     full_train_ds     = DroughtDataset(full_train_groups, scaler=scaler)
     log(f"  Full train sequences: {len(full_train_ds):,}")
 
     try:
-        full_train_loader = _make_loader(full_train_ds, shuffle=True)
+        # Use fewer workers/smaller batch for blind retrain to avoid OOM
+        # (fold datasets are freed but full dataset is ~10% larger than fold datasets)
+        full_train_loader = DataLoader(
+            full_train_ds, batch_size=512, shuffle=True,
+            num_workers=4, pin_memory=True,
+            persistent_workers=True, prefetch_factor=2,
+        )
     except Exception:
-        full_train_loader = DataLoader(full_train_ds, batch_size=BATCH_SIZE,
+        full_train_loader = DataLoader(full_train_ds, batch_size=512,
                                        shuffle=True, num_workers=0, pin_memory=USE_AMP)
 
     final_model = make_model(input_size)
     log("\n" + final_model.architecture_summary(input_size))
 
-    v5_ckpt = os.path.join(MODELS_DIR, "final_model_v5.pt")
+    v6_ckpt = os.path.join(MODELS_DIR, "final_model_v6.pt")
 
     try:
         final_history = train_model_blind(
             final_model, full_train_loader,
             num_epochs=TARGET_EPOCHS,
-            ckpt_path=v5_ckpt,
+            ckpt_path=v6_ckpt,
             log=log,
         )
     except torch.cuda.OutOfMemoryError:
@@ -421,26 +564,20 @@ def main():
         final_history = train_model_blind(
             final_model, full_train_loader,
             num_epochs=TARGET_EPOCHS,
-            ckpt_path=v5_ckpt,
+            ckpt_path=v6_ckpt,
             log=log,
         )
 
     log(f"Blind training complete. Epochs trained : {TARGET_EPOCHS}")
-    log(f"Training time : {(time.time() - t0):.1f}s")
+    log(f"Training time so far: {(time.time() - t0):.1f}s")
 
-    # Save training log
-    log_path = os.path.join(ROOT, "_training_log_5th.txt")
-    with open(log_path, "w") as f:
-        f.write("\n".join(log_lines))
-    print(f"\nTraining log saved -> {log_path}")
-
-    # Save history CSV
-    hist_df = pd.DataFrame(final_history, columns=["epoch", "train_mae"])
+    # Save training history CSV
+    hist_df = pd.DataFrame(final_history, columns=["epoch", "train_loss"])
     hist_df.to_csv(os.path.join(MODELS_DIR, "training_history.csv"), index=False)
 
-    # -- 6. Inference on test set ----------------------------------------------
+    # -- 7. Inference on test set ----------------------------------------------
     log("\nRunning inference on test set ...")
-    final_model.load_state_dict(torch.load(v5_ckpt, map_location=DEVICE))
+    final_model.load_state_dict(torch.load(v6_ckpt, map_location=DEVICE))
     final_model.eval()
 
     predictions = {}   # region_id -> np.array of shape (5,)
@@ -466,8 +603,23 @@ def main():
 
         predictions[region_id] = pred
 
-    # -- 7. Format & save submission_5th.csv -----------------------------------
-    log("Formatting submission_5th.csv ...")
+    # -- 8. Submission-level prediction diagnostics ----------------------------
+    log("\n[Submission Prediction Diagnostics]")
+    all_sub_preds = np.array(list(predictions.values())).ravel()
+    p50  = float(np.percentile(all_sub_preds, 50))
+    p90  = float(np.percentile(all_sub_preds, 90))
+    p95  = float(np.percentile(all_sub_preds, 95))
+    p99  = float(np.percentile(all_sub_preds, 99))
+    pmax = float(np.max(all_sub_preds))
+    log(f"  n={len(all_sub_preds):,}  mean={all_sub_preds.mean():.4f}  std={all_sub_preds.std():.4f}")
+    log(f"  p50={p50:.4f}  p90={p90:.4f}  p95={p95:.4f}  p99={p99:.4f}  max={pmax:.4f}")
+    if p99 < 2.0:
+        log("  *** WARNING: Submission p99 < 2.0 — model collapse still present! ***")
+    else:
+        log("  ✓ Submission p99 >= 2.0 — model collapse is BROKEN.")
+
+    # -- 9. Format & save submission.csv ---------------------------------------
+    log("\nFormatting submission.csv ...")
     rows = []
     for region_id, preds in sorted(predictions.items()):
         rows.append({
@@ -480,10 +632,10 @@ def main():
         })
 
     submission = pd.DataFrame(rows)
-    sub_path   = os.path.join(ROOT, "submission_5th.csv")
+    sub_path   = os.path.join(ROOT, "submission.csv")
     submission.to_csv(sub_path, index=False)
 
-    # -- 8. Sanity checks ------------------------------------------------------
+    # -- 10. Sanity checks ------------------------------------------------------
     assert len(submission) == 2248, (
         f"Expected 2248 rows, got {len(submission)}"
     )
@@ -500,19 +652,28 @@ def main():
     )
     log("  ✓ Train/test regions match (2248).")
 
-    log(f"  submission_5th.csv → {sub_path}")
+    log(f"  submission.csv → {sub_path}")
     log(f"  Rows (excl. header): {len(submission)}")
     log(f"  Columns: {list(submission.columns)}")
     log(f"\n  Preview:\n{submission.head(5).to_string(index=False)}")
 
+    # Save full training log
+    log(f"\nTotal elapsed: {(time.time() - t0):.1f}s")
+    log_path = os.path.join(ROOT, "_training_log_6th.txt")
+    with open(log_path, "w") as f:
+        f.write("\n".join(log_lines))
+    print(f"\nTraining log saved -> {log_path}")
+
     return {
-        "fold_maes":        fold_maes,
-        "fold_best_epochs": fold_best_epochs,
-        "avg_val_mae":      avg_val_mae,
-        "target_epochs":    TARGET_EPOCHS,
-        "input_size":       input_size,
-        "submission":       submission,
-        "final_history":    final_history,
+        "fold_maes":         fold_maes,
+        "fold_best_epochs":  fold_best_epochs,
+        "avg_val_mae":       avg_val_mae,
+        "target_epochs":     TARGET_EPOCHS,
+        "input_size":        input_size,
+        "submission":        submission,
+        "final_history":     final_history,
+        "fold_percentiles":  fold_percentiles,
+        "sub_p99":           p99,
     }
 
 
