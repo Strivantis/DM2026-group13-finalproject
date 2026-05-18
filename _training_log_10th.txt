@@ -1,0 +1,387 @@
+====================================================================
+Drought Forecasting Pipeline  v10
+Horizon Encoding + Dynamic Loss Burn-in + Manual LR Warm-up
+====================================================================
+Architecture : Two-Stage LSTM MTL + Horizon Encoding  [v10]
+  context_vector (B,64) -> expand (B,5,64) + horizon_idx (B,5,1)
+  encoded_state  (B,5,65)  [v10: horizon-aware representation]
+  Branch A   : Linear(65->32) -> GELU -> Linear(32->1) -> squeeze -> (B,5)
+               P(drought) logits -- sigmoid() inline in forward()
+  Branch B   : Linear(65->32) -> GELU -> Linear(32->1) -> squeeze -> (B,5)
+               Severity >= 0  via Softplus()
+  Output     : final = sigmoid(logits_A) x Branch_B  (Expected Severity)
+Loss         : [v10] Dynamic Burn-in Schedule
+  Epoch 1-20 : Loss = Loss_B ONLY  (regression burn-in)
+  Epoch 21+  : Loss = Loss_B + 0.1 * Loss_A  (BCE introduced lightly)
+  Loss_B     : Continuous Smooth L1  W_i = 1.0 + (y_i/5)^2 * 3.0
+  Loss_A     : BCEWithLogitsLoss(logits_output, binary_target)
+LR Schedule  : [v10] Manual Warm-up Epochs 1-5: 1e-5 -> 1e-3 (linear)
+               Epoch 6+: ReduceLROnPlateau (factor=0.5, patience=10)
+Early Stop   : pure L1Loss(final_output, y)  [Kaggle MAE aligned]
+Pooling      : Temporal Attention  [v8: retained]
+LayerNorm    : LayerNorm(input_size) before LSTM  [v7: retained]
+Features     : 37  (11 weather + 2 cyclic + 9 rolling + 8 lag + 5 drought + 2 TE)
+  Cyclic     : week_sin, week_cos  [v9: retained]
+  TE         : region_mean_score, region_zero_prob  [v9: retained]
+Strategy     : Fold Ensembling  (3 folds x 5 weeks, avg test predictions)
+Epochs       : 200  |  Patience: 35
+Seed         : 42  (cuDNN deterministic=True)
+BatchSize    : 512  (hardcoded, no OOM fallback)
+
+Loading processed data ...
+  train raw: (1789408, 41)  |  test raw: (30199, 38)
+  train regions: 2248  |  test regions: 2248
+
+[v9 Feature Validation]
+  v week_sin, week_cos present  |  month, week_of_year correctly absent.
+
+[Data Leakage Check]
+  v No raw-score autoregressive features in FEATURE_COLS.
+  FEATURE_COLS (37): ['prec', 'surf_pre', 'humidity', 'tmp', 'tmp_max', 'tmp_min', 'tmp_range', 'wind', 'wind_max', 'wind_min', 'wind_range', 'week_sin', 'week_cos', 'prec_roll_sum_4w', 'tmp_roll_mean_4w', 'humidity_roll_mean_4w', 'prec_roll_sum_8w', 'tmp_roll_mean_8w', 'humidity_roll_mean_8w', 'prec_roll_sum_13w', 'tmp_roll_mean_13w', 'humidity_roll_mean_13w', 'tmp_lag1w', 'humidity_lag1w', 'prec_lag1w', 'wind_lag1w', 'tmp_lag2w', 'humidity_lag2w', 'prec_lag2w', 'wind_lag2w', 'pet', 'deficit', 'deficit_roll_cum_4w', 'deficit_roll_cum_8w', 'deficit_roll_cum_13w', 'region_mean_score', 'region_zero_prob']
+
+Refining features (drought proxy index + log1p precipitation) ...
+  train after refinement: (1784912, 43)  |  test: (30199, 40)
+  [NaN drop] Removed 29,224 rows with NaN score from train_df.
+
+[Training Target Distribution]
+  mean=0.8354  std=1.2613  min=0.00  max=5.00
+  [v9] Zero-inflation: 59.64% of training scores == 0.0
+  score > 1.0: 23.10%  [405,493 samples]
+  score > 2.0: 12.50%  [219,470 samples]
+  score > 3.0: 5.76%  [101,188 samples]
+  score > 4.0: 1.82%  [31,939 samples]
+
+[v9] Computing full-train Target Encoding statistics ...
+  Regions with TE stats : 2248
+  Global region_mean_score : 0.8354
+  Global region_zero_prob  : 0.5964
+  v region_mean_score, region_zero_prob added to train_df (full-train stats)
+
+Fitting StandardScaler on training feature matrix ...
+  Input features (37): ['prec', 'surf_pre', 'humidity', 'tmp', 'tmp_max', 'tmp_min', 'tmp_range', 'wind', 'wind_max', 'wind_min', 'wind_range', 'week_sin', 'week_cos', 'prec_roll_sum_4w', 'tmp_roll_mean_4w', 'humidity_roll_mean_4w', 'prec_roll_sum_8w', 'tmp_roll_mean_8w', 'humidity_roll_mean_8w', 'prec_roll_sum_13w', 'tmp_roll_mean_13w', 'humidity_roll_mean_13w', 'tmp_lag1w', 'humidity_lag1w', 'prec_lag1w', 'wind_lag1w', 'tmp_lag2w', 'humidity_lag2w', 'prec_lag2w', 'wind_lag2w', 'pet', 'deficit', 'deficit_roll_cum_4w', 'deficit_roll_cum_8w', 'deficit_roll_cum_13w', 'region_mean_score', 'region_zero_prob']
+  Scaler saved -> /home/sean/文件/NYCU/114-2/Data Mining/FinalProject/models/scaler.pkl
+  train after refinement + TE: (1755688, 45)
+
+====================================================================
+Walk-Forward Cross-Validation  (3 folds x 5 weeks)
+Train loss  : v10 Burn-in: epochs 1-20 = Smooth L1 only; 21+ = Smooth L1 + 0.1*BCE
+Val metric  : pure MAE  (unweighted, Kaggle-aligned)
+TE strategy : fold-specific (train rows only) -> leakage-free
+Checkpoints : fold_0_best.pt / fold_1_best.pt / fold_2_best.pt
+Strategy    : Fold Ensembling  (v8 retained)
+AMP : True  |  batch_size=512  |  num_workers=8
+====================================================================
+
+-- Fold 1/3 --
+  [v9 TE] Regions covered: 2248  |  fold_mean_score=0.8386  |  fold_zero_prob=0.5949
+  Train seqs: 1,706,232  |  Val seqs: 2,248
+
+  [Tensor Shape Verification] First Batch (Fold 1):
+    X shape : (512, 13, 37)  ->  (Batch=512, Seq=13, Features=37)
+    y shape : (512, 5)  ->  (Batch=512, Horizon=5)
+    Expected: Features=37  (11 weather + 2 cyclic + 9 rolling + 8 lag + 5 drought + 2 TE = 37)
+    v Shape assertion PASSED.
+
+=================================================================
+ Epoch   TrainLoss     ValMAE         LR
+=================================================================
+     1       0.8982      0.6422    1.00e-05 *
+     2       0.5145      0.3322    2.58e-04 *
+     3       0.4266      0.3676    5.05e-04
+     4       0.3753      0.3170    7.53e-04 *
+     5       0.3291      0.3417    1.00e-03
+     6       0.2900      0.3358    1.00e-03
+     7       0.2636      0.3516    1.00e-03
+     8       0.2445      0.3408    1.00e-03
+     9       0.2306      0.3199    1.00e-03
+    10       0.2199      0.3213    1.00e-03
+    11       0.2118      0.3374    1.00e-03
+    12       0.2046      0.3299    1.00e-03
+    13       0.1986      0.3235    1.00e-03
+    14       0.1940      0.3307    1.00e-03
+    15       0.1900      0.3184    1.00e-03
+    16       0.1862      0.3281    1.00e-03
+    17       0.1831      0.3228    1.00e-03
+    18       0.1801      0.3257    1.00e-03
+    19       0.1778      0.3322    1.00e-03
+    20       0.1752      0.3642    1.00e-03
+    21       0.2040      0.3120    1.00e-03 *
+    22       0.2005      0.3190    1.00e-03
+    23       0.1986      0.3149    1.00e-03
+    24       0.1962      0.3248    1.00e-03
+    25       0.1943      0.3248    1.00e-03
+    26       0.1926      0.3345    1.00e-03
+    27       0.1910      0.3017    1.00e-03 *
+    28       0.1897      0.3450    1.00e-03
+    29       0.1883      0.3269    1.00e-03
+    30       0.1870      0.3253    1.00e-03
+    31       0.1857      0.3203    1.00e-03
+    32       0.1842      0.3145    1.00e-03
+    33       0.1835      0.3172    1.00e-03
+    34       0.1820      0.3298    1.00e-03
+    35       0.1816      0.3362    1.00e-03
+    36       0.1805      0.3163    1.00e-03
+    37       0.1795      0.3256    1.00e-03
+    38       0.1788      0.3263    5.00e-04
+    39       0.1711      0.3209    5.00e-04
+    40       0.1702      0.3297    5.00e-04
+    41       0.1698      0.3338    5.00e-04
+    42       0.1694      0.3241    5.00e-04
+    43       0.1689      0.3290    5.00e-04
+    44       0.1684      0.3301    5.00e-04
+    45       0.1680      0.3285    5.00e-04
+    46       0.1677      0.3149    5.00e-04
+    47       0.1672      0.3222    5.00e-04
+    48       0.1667      0.3249    5.00e-04
+    49       0.1667      0.3269    2.50e-04
+    50       0.1629      0.3168    2.50e-04
+    51       0.1624      0.3382    2.50e-04
+    52       0.1623      0.3282    2.50e-04
+    53       0.1618      0.3282    2.50e-04
+    54       0.1616      0.3220    2.50e-04
+    55       0.1616      0.3252    2.50e-04
+    56       0.1614      0.3253    2.50e-04
+    57       0.1611      0.3265    2.50e-04
+    58       0.1611      0.3278    2.50e-04
+    59       0.1605      0.3237    2.50e-04
+    60       0.1609      0.3230    1.25e-04
+    61       0.1586      0.3201    1.25e-04
+    62       0.1586      0.3203    1.25e-04
+
+  Early stopping at epoch 62 (no MAE improvement for 35 epochs).
+=================================================================
+  Best Val MAE: 0.3017  (epoch 27)
+  Fold 1 Best Val MAE: 0.3017  |  Best Epoch: 27
+  Checkpoint saved -> /home/sean/文件/NYCU/114-2/Data Mining/FinalProject/models/fold_0_best.pt
+
+  [Fold 1 Prediction Percentiles -- best checkpoint]
+  [Prediction Diagnostics] n=11,240
+    p50=0.0292  p90=0.8926  p95=1.6555  p99=3.0383  max=3.9243
+    v p99 >= 2.0 -- model is predicting away from the mean.
+
+-- Fold 2/3 --
+  [v9 TE] Regions covered: 2248  |  fold_mean_score=0.8416  |  fold_zero_prob=0.5935
+  Train seqs: 1,694,992  |  Val seqs: 2,248
+=================================================================
+ Epoch   TrainLoss     ValMAE         LR
+=================================================================
+     1       0.8908      0.8262    1.00e-05 *
+     2       0.5207      0.4606    2.58e-04 *
+     3       0.4325      0.4042    5.05e-04 *
+     4       0.3773      0.4464    7.53e-04
+     5       0.3325      0.3391    1.00e-03 *
+     6       0.2918      0.3542    1.00e-03
+     7       0.2656      0.3449    1.00e-03
+     8       0.2469      0.3473    1.00e-03
+     9       0.2329      0.3404    1.00e-03
+    10       0.2221      0.3695    1.00e-03
+    11       0.2135      0.3669    1.00e-03
+    12       0.2061      0.3346    1.00e-03 *
+    13       0.2007      0.3254    1.00e-03 *
+    14       0.1957      0.3522    1.00e-03
+    15       0.1915      0.3669    1.00e-03
+    16       0.1875      0.3457    1.00e-03
+    17       0.1842      0.3712    1.00e-03
+    18       0.1811      0.3764    1.00e-03
+    19       0.1787      0.4039    1.00e-03
+    20       0.1762      0.4150    1.00e-03
+    21       0.2050      0.3921    1.00e-03
+    22       0.2022      0.4202    1.00e-03
+    23       0.1996      0.4813    1.00e-03
+    24       0.1977      0.4577    5.00e-04
+    25       0.1883      0.4433    5.00e-04
+    26       0.1869      0.4556    5.00e-04
+    27       0.1859      0.5276    5.00e-04
+    28       0.1849      0.4922    5.00e-04
+    29       0.1840      0.5016    5.00e-04
+    30       0.1830      0.5289    5.00e-04
+    31       0.1822      0.4994    5.00e-04
+    32       0.1815      0.5929    5.00e-04
+    33       0.1808      0.5431    5.00e-04
+    34       0.1801      0.5937    5.00e-04
+    35       0.1793      0.5594    2.50e-04
+    36       0.1749      0.5693    2.50e-04
+    37       0.1745      0.5597    2.50e-04
+    38       0.1741      0.5818    2.50e-04
+    39       0.1736      0.5646    2.50e-04
+    40       0.1735      0.6139    2.50e-04
+    41       0.1730      0.6058    2.50e-04
+    42       0.1727      0.5967    2.50e-04
+    43       0.1724      0.5835    2.50e-04
+    44       0.1720      0.5843    2.50e-04
+    45       0.1718      0.5974    2.50e-04
+    46       0.1715      0.6393    1.25e-04
+    47       0.1693      0.6070    1.25e-04
+    48       0.1691      0.5847    1.25e-04
+
+  Early stopping at epoch 48 (no MAE improvement for 35 epochs).
+=================================================================
+  Best Val MAE: 0.3254  (epoch 13)
+  Fold 2 Best Val MAE: 0.3254  |  Best Epoch: 13
+  Checkpoint saved -> /home/sean/文件/NYCU/114-2/Data Mining/FinalProject/models/fold_1_best.pt
+
+  [Fold 2 Prediction Percentiles -- best checkpoint]
+  [Prediction Diagnostics] n=11,240
+    p50=0.0689  p90=0.7258  p95=1.6906  p99=3.0545  max=4.6734
+    v p99 >= 2.0 -- model is predicting away from the mean.
+
+-- Fold 3/3 --
+  [v9 TE] Regions covered: 2248  |  fold_mean_score=0.8435  |  fold_zero_prob=0.5928
+  Train seqs: 1,683,752  |  Val seqs: 2,248
+=================================================================
+ Epoch   TrainLoss     ValMAE         LR
+=================================================================
+     1       0.9043      0.8487    1.00e-05 *
+     2       0.5233      0.6966    2.58e-04 *
+     3       0.4346      0.6453    5.05e-04 *
+     4       0.3801      0.6493    7.53e-04
+     5       0.3335      0.4945    1.00e-03 *
+     6       0.2924      0.5053    1.00e-03
+     7       0.2653      0.5000    1.00e-03
+     8       0.2460      0.5217    1.00e-03
+     9       0.2310      0.4654    1.00e-03 *
+    10       0.2202      0.5301    1.00e-03
+    11       0.2119      0.4835    1.00e-03
+    12       0.2046      0.4883    1.00e-03
+    13       0.1987      0.4634    1.00e-03 *
+    14       0.1936      0.5447    1.00e-03
+    15       0.1895      0.4710    1.00e-03
+    16       0.1858      0.4862    1.00e-03
+    17       0.1822      0.4713    1.00e-03
+    18       0.1792      0.4960    1.00e-03
+    19       0.1769      0.5329    1.00e-03
+    20       0.1749      0.5067    1.00e-03
+    21       0.2027      0.4868    1.00e-03
+    22       0.2000      0.5169    1.00e-03
+    23       0.1975      0.5050    1.00e-03
+    24       0.1958      0.5245    5.00e-04
+    25       0.1867      0.5129    5.00e-04
+    26       0.1853      0.5060    5.00e-04
+    27       0.1843      0.5188    5.00e-04
+    28       0.1830      0.5359    5.00e-04
+    29       0.1824      0.5299    5.00e-04
+    30       0.1816      0.5020    5.00e-04
+    31       0.1809      0.5500    5.00e-04
+    32       0.1801      0.5235    5.00e-04
+    33       0.1795      0.5235    5.00e-04
+    34       0.1790      0.5327    5.00e-04
+    35       0.1781      0.5246    2.50e-04
+    36       0.1740      0.5405    2.50e-04
+    37       0.1732      0.5235    2.50e-04
+    38       0.1727      0.5546    2.50e-04
+    39       0.1723      0.5413    2.50e-04
+    40       0.1721      0.5694    2.50e-04
+    41       0.1717      0.5437    2.50e-04
+    42       0.1714      0.5591    2.50e-04
+    43       0.1710      0.5501    2.50e-04
+    44       0.1705      0.5815    2.50e-04
+    45       0.1704      0.5457    2.50e-04
+    46       0.1702      0.5466    1.25e-04
+    47       0.1680      0.5455    1.25e-04
+    48       0.1677      0.5497    1.25e-04
+
+  Early stopping at epoch 48 (no MAE improvement for 35 epochs).
+=================================================================
+  Best Val MAE: 0.4634  (epoch 13)
+  Fold 3 Best Val MAE: 0.4634  |  Best Epoch: 13
+  Checkpoint saved -> /home/sean/文件/NYCU/114-2/Data Mining/FinalProject/models/fold_2_best.pt
+
+  [Fold 3 Prediction Percentiles -- best checkpoint]
+  [Prediction Diagnostics] n=11,240
+    p50=0.1890  p90=2.2859  p95=2.7859  p99=3.4147  max=4.1257
+    v p99 >= 2.0 -- model is predicting away from the mean.
+
+====================================================================
+Fold MAEs          : ['0.3017', '0.3254', '0.4634']
+Average_Val_MAE    : 0.3635
+Fold Best Epochs   : [27, 13, 13]
+Mean Best Epoch    : 17.7
+Strategy (v8/v9)   : Fold Ensembling (NO blind retraining)
+
+Fold Prediction Percentiles Summary:
+  Fold 1: p50=0.029  p95=1.655  p99=3.038  max=3.924
+  Fold 2: p50=0.069  p95=1.691  p99=3.055  max=4.673
+  Fold 3: p50=0.189  p95=2.786  p99=3.415  max=4.126
+====================================================================
+
+[v9] Preparing test_df with full-train Target Encoding ...
+  test_df after TE injection: (30199, 42)
+  v region_mean_score, region_zero_prob added to test_df (full-train stats)
+
+====================================================================
+Fold Ensemble Inference  (v8/v9 -- Average Blending)
+  Blending 3 fold checkpoints:
+    /home/sean/文件/NYCU/114-2/Data Mining/FinalProject/models/fold_0_best.pt
+    /home/sean/文件/NYCU/114-2/Data Mining/FinalProject/models/fold_1_best.pt
+    /home/sean/文件/NYCU/114-2/Data Mining/FinalProject/models/fold_2_best.pt
+  final_pred = mean(pred_0, pred_1, pred_2)
+  Safety clip: np.clip(final_pred, 0.0, 5.0)
+====================================================================
+
+DroughtLSTM Architecture (v10 – Horizon Encoding + Burn-in + LR Warm-up)
+===========================================================================
+  Input size   : 37  (features per week, 37 total)
+  LayerNorm    : LayerNorm(37)  [v7: concept-drift stabiliser]
+  LSTM layers  : 2
+  Hidden size  : 64
+  Dropout      : 0.4
+  Pooling      : Temporal Attention  [v8: retained]
+                 attention = Linear(hidden->1); softmax over time; weighted sum
+  [v10] Horizon Encoding:
+     context_vector (B, hidden) -> expand (B, 5, hidden)
+     horizon_idx [0.2,0.4,0.6,0.8,1.0] -> (B, 5, 1)
+     cat(dim=-1) -> encoded_state (B, 5, hidden+1)
+  Branch A     : Linear(65->32) -> GELU -> Linear(32->1) [per step, NO Sigmoid]
+                 squeeze(-1) -> (B,5);  sigmoid() applied inline in forward()
+  Branch B     : Linear(65->32) -> GELU -> Linear(32->1) -> Softplus()
+                 squeeze(-1) -> (B,5) >= 0  -- Severity of Drought
+  Final Output : sigmoid(logits_A) x Branch_B  (Expected Severity)
+  Returns      : (final_output, logits_output) -- two tensors
+  Inference    : np.clip(final_output, 0, 5) applied in train.py
+---------------------------------------------------------------------------
+  [v10] Dynamic Loss Weighting (Burn-in):
+     Epochs  1-20 : Loss = Loss_B  ONLY  (regression burn-in)
+     Epoch  21+   : Loss = Loss_B + 0.1 * Loss_A  (BCE introduced)
+  [v10] Manual LR Warm-up:
+     Epochs  1-5  : LR linearly ramps 1e-5 -> 1e-3
+     Epoch   6+   : ReduceLROnPlateau takes over
+  Loss_A       : BCEWithLogitsLoss(logits_output, binary_target)
+                 (AMP-safe: fused sigmoid+BCE avoids float16 underflow)
+  Loss_B       : Continuous Smooth L1(final_output, y)   [weight 1.0]
+  Early Stop   : pure L1Loss(final_output, y)  [Kaggle MAE aligned]
+---------------------------------------------------------------------------
+  Total params : 64,077
+
+  [Fold 1] Loading checkpoint: /home/sean/文件/NYCU/114-2/Data Mining/FinalProject/models/fold_0_best.pt
+  [Fold 1] Inference complete. Regions predicted: 2248
+
+  [Fold 2] Loading checkpoint: /home/sean/文件/NYCU/114-2/Data Mining/FinalProject/models/fold_1_best.pt
+  [Fold 2] Inference complete. Regions predicted: 2248
+
+  [Fold 3] Loading checkpoint: /home/sean/文件/NYCU/114-2/Data Mining/FinalProject/models/fold_2_best.pt
+  [Fold 3] Inference complete. Regions predicted: 2248
+
+  Blending 3 fold predictions via simple average ...
+
+[Submission Prediction Diagnostics]
+  n=11,240  mean=1.4354  std=0.9197
+  p50=1.3030  p90=2.7048  p95=3.2788  p99=3.9423  max=4.4063
+  v Submission p99 >= 2.0 -- model collapse is BROKEN.
+  Fraction of near-zero predictions (<0.05): 0.30%
+
+Formatting submission.csv ...
+  v Submission assertion passed: 2248 rows, 6 columns.
+  v Train/test regions match (2248).
+  submission.csv -> /home/sean/文件/NYCU/114-2/Data Mining/FinalProject/submission.csv
+  Rows (excl. header): 2248
+  Columns: ['region_id', 'pred_week1', 'pred_week2', 'pred_week3', 'pred_week4', 'pred_week5']
+
+  Preview:
+region_id  pred_week1  pred_week2  pred_week3  pred_week4  pred_week5
+       R1    0.367427    0.288654    0.231690    0.195119    0.172857
+    R1001    1.762184    1.660698    1.551204    1.447374    1.356984
+    R1002    1.747187    1.598032    1.433176    1.280618    1.158574
+    R1005    2.010640    2.069009    2.115960    2.153041    2.177924
+    R1006    2.147079    2.166175    2.174908    2.178844    2.177028
+
+Total elapsed: 1526.7s

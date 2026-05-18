@@ -1,6 +1,6 @@
 """
-train.py -- Drought Score Forecasting Pipeline (v9 – Two-Stage MTL + Zero-Inflation)
-=====================================================================================
+train.py -- Drought Score Forecasting Pipeline (v10 – Horizon Encoding + Burn-in + LR Warm-up)
+================================================================================================
 Usage:
     python src/train.py
 
@@ -10,46 +10,41 @@ Outputs:
     models/fold_1_best.pt        -- Best weights for fold 1
     models/fold_2_best.pt        -- Best weights for fold 2
     models/scaler.pkl            -- Fitted StandardScaler
-    _training_log_9th.txt        -- Full console log
+    _training_log_10th.txt       -- Full console log
 
-Key improvements (v9 – Two-Stage MTL + Zero-Inflation)
--------------------------------------------------------
-  1. Two-Stage Multi-Task Architecture
-       - Branch A (Probability): Linear(64→32) → GELU → Linear(32→5) → Sigmoid
-         Output: probability of drought occurring at each future step
-       - Branch B (Severity):    Linear(64→32) → GELU → Linear(32→5) → Softplus
-         Output: drought severity conditioned on it occurring
-       - Final Prediction = Branch_A × Branch_B  (Expected Severity)
-       - Directly addresses the 58% zero-inflation in the target score.
+Key improvements (v10 – Horizon Encoding + Burn-in + LR Warm-up)
+-----------------------------------------------------------------
+  1. Horizon Encoding (model.py)
+       - context_vector (B, hidden) expanded to (B, 5, hidden).
+       - Normalised horizon index [0.2, 0.4, 0.6, 0.8, 1.0] concatenated
+         -> encoded_state (B, 5, hidden+1).
+       - Branch A and B now output 1 value per horizon step (squeezed to B×5).
+       - Forces the model to compute severity for each specific future week,
+         fixing the "temporally blind" monotonic-decrease issue in v9.
 
-  2. Joint Loss Function
-       - Loss_A = BCELoss(prob_output, binary_target)  where binary_target = (y > 0)
-       - Loss_B = Continuous Smooth L1 (final_output, y)  [W_i = 1 + (y/5)^2 * 3]
-       - Total  = Loss_B + 0.5 * Loss_A
-       - Early stopping monitors ONLY pure L1Loss(final_output, y)  [Kaggle-aligned]
+  2. Dynamic Loss Weighting / Burn-in (train.py)
+       - Epochs  1-20: Loss = Loss_B ONLY (regression burn-in).
+         Prevents BCE from dominating early and crashing LR prematurely.
+       - Epoch  21+  : Loss = Loss_B + 0.1 * Loss_A (BCE introduced lightly).
 
-  3. Leakage-Free Target Encoding
-       - For each CV fold: compute region_mean_score and region_zero_prob
-         strictly from the TRAINING SPLIT of that fold's data.
-       - TE features injected dynamically into group DataFrames.
-       - For test inference: computed from entire training dataset.
-       - Global mean imputation for unseen regions.
+  3. Manual LR Warm-up (train.py)
+       - Epochs 1-5: LR linearly ramps from 1e-5 -> 1e-3.
+         Prevents ReduceLROnPlateau from firing during the volatile
+         feature-alignment phase before the model has learned anything.
+       - Epoch 6+  : ReduceLROnPlateau scheduler takes over normally.
 
-  4. Cyclical Time Features
-       - week_sin = sin(2π * week_of_year / 53.0)
-       - week_cos = cos(2π * week_of_year / 53.0)
-       - Replaces linear `month` + `week_of_year` (no encoding discontinuity).
-
-  5. Tensor Shape Verification
-       - Prints exact (Batch, Seq, Feature) shape of first batch in fold 0
-         so the user can verify TE and sin/cos features are correct.
+  Retained from v9:
+  4. Two-Stage Multi-Task Architecture (Probability x Severity)
+  5. Leakage-Free Target Encoding
+  6. Cyclical Time Features (week_sin, week_cos)
+  7. Tensor Shape Verification
 
   Retained from v8:
-  6. Temporal Attention (replaces GAP, v8)
-  7. Fold Ensembling (3 fold checkpoints averaged for test prediction)
-  8. BATCH_SIZE=512, set_seed(42), np.clip(pred, 0, 5)
-  9. LayerNorm on inputs (v7)
-  10. Extended training budget NUM_EPOCHS=200, PATIENCE=35
+  8. Temporal Attention (replaces GAP, v8)
+  9. Fold Ensembling (3 fold checkpoints averaged for test prediction)
+  10. BATCH_SIZE=512, set_seed(42), np.clip(pred, 0, 5)
+  11. LayerNorm on inputs (v7)
+  12. Extended training budget NUM_EPOCHS=200, PATIENCE=35
 
 Hardware note
 -------------
@@ -135,7 +130,7 @@ _bce_criterion = nn.BCEWithLogitsLoss()
 
 
 # ---------------------------------------------------------------------------
-# Continuous Smooth Loss  (v7 – retained in v9, applied to final_output)
+# Continuous Smooth Loss  (v7 – retained in v9/v10, applied to final_output)
 # ---------------------------------------------------------------------------
 # Mathematical definition:
 #   For each (pred_i, target_i) pair:
@@ -147,12 +142,12 @@ _bce_criterion = nn.BCEWithLogitsLoss()
 #   - weight at target=0 : 1.0  (no amplification for no-drought samples)
 #   - weight at target=3 : 1.0 + (3/5)^2 * 3.0 = 2.08   (moderate amplification)
 #   - weight at target=5 : 1.0 + (5/5)^2 * 3.0 = 4.0    (maximum amplification)
-#   - No step function → smooth gradients and stable training.
+#   - No step function -> smooth gradients and stable training.
 # ---------------------------------------------------------------------------
 def continuous_smooth_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     """
-    Loss_B (v9): Continuous quadratically-weighted Smooth L1 / Huber loss.
-    Applied to final_output (= P × Severity).
+    Loss_B (v9/v10): Continuous quadratically-weighted Smooth L1 / Huber loss.
+    Applied to final_output (= P x Severity).
 
     Parameters
     ----------
@@ -172,19 +167,29 @@ def joint_loss(
     final_output: torch.Tensor,
     logits_output: torch.Tensor,
     target: torch.Tensor,
+    epoch: int,
 ) -> torch.Tensor:
     """
-    v9 Joint Loss = Loss_B + 0.5 * Loss_A
+    v10 Dynamic Joint Loss (Burn-in Schedule)
 
-    Loss_A = BCELoss(prob_output, binary_target)
+    Burn-in Phase  (epoch <= 20): Loss = Loss_B ONLY
+      Rationale: Let the regression head (Severity) learn magnitude freely
+      before the BCE loss locks the Probability head onto binary predictions.
+
+    Post Burn-in   (epoch > 20) : Loss = Loss_B + 0.1 * Loss_A
+      Rationale: Introduce BCE with reduced weight (0.1) so it guides the
+      Probability head without dominating the regression signal.
+
+    Loss_A = BCEWithLogitsLoss(logits_output, binary_target)
              where binary_target = (target > 0.0).float()
     Loss_B = Continuous Smooth L1 Loss(final_output, target)
 
     Parameters
     ----------
-    final_output : (B, H)  Branch_A × Branch_B  (Expected Severity)
-    prob_output  : (B, H)  Branch_A sigmoid output in [0, 1]
+    final_output : (B, H)  Branch_A x Branch_B  (Expected Severity)
+    logits_output: (B, H)  Branch_A raw logits (pre-sigmoid)
     target       : (B, H)  ground-truth scores in [0, 5]
+    epoch        : int     current epoch number (1-indexed)
 
     Returns
     -------
@@ -192,18 +197,26 @@ def joint_loss(
     """
     binary_target = (target > 0.0).float()  # (B, H); 1 = drought exists, 0 = no drought
     loss_b = continuous_smooth_loss(final_output, target)
-    loss_a = _bce_criterion(logits_output, binary_target)
-    return loss_b + 0.5 * loss_a
+
+    if epoch <= 20:
+        # Burn-in phase: regression ONLY -- let Severity head calibrate freely
+        return loss_b
+    else:
+        # Post burn-in: introduce BCE with light weight (0.1)
+        loss_a = _bce_criterion(logits_output, binary_target)
+        return loss_b + 0.1 * loss_a
 
 
 # ---------------------------------------------------------------------------
 # Training / validation helpers
 # ---------------------------------------------------------------------------
 
-def train_epoch(model, loader, optimizer, device):
+def train_epoch(model, loader, optimizer, device, epoch: int):
     """
-    One training epoch – Joint Loss (Loss_B + 0.5 * Loss_A) with AMP.
-    v9: model returns (final_output, prob_output); both used in loss.
+    One training epoch -- v10 Dynamic Joint Loss with AMP.
+
+    v10: epoch number passed to joint_loss for burn-in schedule.
+         Epochs 1-20: Loss_B only.  Epoch 21+: Loss_B + 0.1 * Loss_A.
     """
     model.train()
     total_loss, n = 0.0, 0
@@ -213,7 +226,7 @@ def train_epoch(model, loader, optimizer, device):
 
         with autocast(device_type=device.type, enabled=USE_AMP):
             final_output, logits_output = model(X)
-            loss = joint_loss(final_output, logits_output, y)
+            loss = joint_loss(final_output, logits_output, y, epoch)
 
         _scaler.scale(loss).backward()
         _scaler.unscale_(optimizer)
@@ -230,8 +243,8 @@ def train_epoch(model, loader, optimizer, device):
 @torch.no_grad()
 def eval_mae(model, loader, device) -> float:
     """
-    Evaluate pure (unweighted) MAE on final_output – used for early stopping.
-    v9: only uses final_output (Branch_A × Branch_B); ignores prob_output.
+    Evaluate pure (unweighted) MAE on final_output -- used for early stopping.
+    Only uses final_output (Branch_A x Branch_B); ignores logits_output.
     This strictly aligns with the Kaggle metric.
     """
     model.eval()
@@ -239,7 +252,7 @@ def eval_mae(model, loader, device) -> float:
     for X, y in loader:
         X, y = X.to(device), y.to(device)
         with autocast(device_type=device.type, enabled=USE_AMP):
-            final_output, _ = model(X)   # v9: unpack tuple; only use final_output
+            final_output, _ = model(X)
         total_mae += _l1_criterion(final_output, y).item() * X.size(0)
         n += X.size(0)
     return total_mae / n if n > 0 else float("inf")
@@ -250,14 +263,13 @@ def eval_prediction_percentiles(model, loader, device, log) -> dict:
     """
     Diagnostic hook: collect all final_output predictions and log percentile stats.
     Self-Correction Check: if p99 < 2.0, the model is still evading extremes.
-    v9: only uses final_output (ignores prob_output).
     """
     model.eval()
     all_preds = []
     for X, y in loader:
         X = X.to(device)
         with autocast(device_type=device.type, enabled=USE_AMP):
-            final_output, _ = model(X)   # v9: unpack; only use final_output
+            final_output, _ = model(X)
         all_preds.append(final_output.cpu().float().numpy())
 
     if not all_preds:
@@ -273,9 +285,9 @@ def eval_prediction_percentiles(model, loader, device, log) -> dict:
     log(f"  [Prediction Diagnostics] n={len(preds_flat):,}")
     log(f"    p50={p50:.4f}  p90={p90:.4f}  p95={p95:.4f}  p99={p99:.4f}  max={pmax:.4f}")
     if p99 < 2.0:
-        log("    *** WARNING: p99 < 2.0 — model is still evading extremes (collapse not fixed)! ***")
+        log("    *** WARNING: p99 < 2.0 -- model is still evading extremes (collapse not fixed)! ***")
     else:
-        log("    ✓ p99 >= 2.0 — model is predicting away from the mean.")
+        log("    v p99 >= 2.0 -- model is predicting away from the mean.")
 
     return {"p50": p50, "p90": p90, "p95": p95, "p99": p99, "max": pmax}
 
@@ -308,7 +320,7 @@ def _make_loader(dataset, shuffle: bool, batch_size: int = BATCH_SIZE) -> DataLo
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
-        num_workers=8,            # i9-13980HX has 32 threads → 8 workers for IO
+        num_workers=8,            # i9-13980HX has 32 threads -> 8 workers for IO
         pin_memory=True,          # zero-copy transfer to GPU
         persistent_workers=True,
         prefetch_factor=2,
@@ -331,8 +343,12 @@ def train_model(
     """
     Train model with early stopping on pure (unweighted) MAE.
 
-    v9 Training loss: Joint Loss = Continuous Smooth L1(final_output) + 0.5 * BCELoss(prob)
-    Early stopping: pure L1Loss(final_output, y) – strictly Kaggle-metric-aligned.
+    v10 Training:
+      - Manual LR warm-up epochs 1-5: linear ramp 1e-5 -> 1e-3.
+      - ReduceLROnPlateau only active from epoch 6+.
+      - Dynamic joint loss: regression-only burn-in epochs 1-20,
+        then Loss_B + 0.1*Loss_A from epoch 21+.
+    Early stopping: pure L1Loss(final_output, y) -- strictly Kaggle-metric-aligned.
 
     Returns best_val_mae, best_epoch, history.
     """
@@ -350,9 +366,22 @@ def train_model(
     history      = []
 
     for epoch in range(1, num_epochs + 1):
-        train_loss = train_epoch(model, train_loader, optimiser, DEVICE)
+        # --- v10: Manual LR Warm-up (Epochs 1-5) ---
+        # Linear ramp from 1e-5 to 1e-3 over the first 5 epochs.
+        # Prevents ReduceLROnPlateau from firing during the volatile
+        # feature-alignment phase before the model has learned anything.
+        if epoch <= 5:
+            lr = 1e-5 + (1e-3 - 1e-5) * ((epoch - 1) / 4.0)
+            for param_group in optimiser.param_groups:
+                param_group['lr'] = lr
+
+        train_loss = train_epoch(model, train_loader, optimiser, DEVICE, epoch)
         val_mae    = eval_mae(model, val_loader, DEVICE)
-        scheduler.step(val_mae)
+
+        # --- v10: Only step ReduceLROnPlateau after warm-up is complete ---
+        if epoch > 5:
+            scheduler.step(val_mae)
+
         curr_lr = optimiser.param_groups[0]["lr"]
 
         history.append((epoch, train_loss, val_mae))
@@ -476,7 +505,7 @@ def _merge_te_to_df(
 def predict_test_set(model, test_df, feat_cols, scaler, log) -> dict:
     """
     Run inference for every region in test_df using the given model.
-    v9: model returns (final_output, prob_output) – only final_output is used.
+    Model returns (final_output, logits_output) -- only final_output is used.
 
     Returns
     -------
@@ -501,9 +530,9 @@ def predict_test_set(model, test_df, feat_cols, scaler, log) -> dict:
         X_tensor = torch.tensor(X, dtype=torch.float32).unsqueeze(0).to(DEVICE)
 
         with autocast(device_type=DEVICE.type, enabled=USE_AMP):
-            final_output, _ = model(X_tensor)   # v9: unpack; use only final_output
+            final_output, _ = model(X_tensor)
 
-        # Safety clip – ensures Kaggle-valid range
+        # Safety clip -- ensures Kaggle-valid range
         pred = final_output.squeeze(0).cpu().float().numpy()
         pred = np.clip(pred, 0.0, 5.0)
         predictions[region_id] = pred
@@ -524,25 +553,31 @@ def main():
 
     # -- 0. Architecture & loss description ------------------------------------
     log("=" * 68)
-    log("Drought Forecasting Pipeline  v9")
-    log("Two-Stage Multi-Task Learning + Zero-Inflation + Dynamic Target Encoding")
+    log("Drought Forecasting Pipeline  v10")
+    log("Horizon Encoding + Dynamic Loss Burn-in + Manual LR Warm-up")
     log("=" * 68)
-    log("Architecture : Two-Stage LSTM MTL")
-    log("  Branch A   : Linear(64→32) → GELU → Linear(32→5) → Sigmoid()")
-    log("               P(drought) ∈ [0,1] — probability head")
-    log("  Branch B   : Linear(64→32) → GELU → Linear(32→5) → Softplus()")
-    log("               Severity ≥ 0    — regression head")
-    log("  Output     : final = Branch_A × Branch_B  (Expected Severity)")
-    log("Loss         : Loss_B + 0.5 * Loss_A")
+    log("Architecture : Two-Stage LSTM MTL + Horizon Encoding  [v10]")
+    log("  context_vector (B,64) -> expand (B,5,64) + horizon_idx (B,5,1)")
+    log("  encoded_state  (B,5,65)  [v10: horizon-aware representation]")
+    log("  Branch A   : Linear(65->32) -> GELU -> Linear(32->1) -> squeeze -> (B,5)")
+    log("               P(drought) logits -- sigmoid() inline in forward()")
+    log("  Branch B   : Linear(65->32) -> GELU -> Linear(32->1) -> squeeze -> (B,5)")
+    log("               Severity >= 0  via Softplus()")
+    log("  Output     : final = sigmoid(logits_A) x Branch_B  (Expected Severity)")
+    log("Loss         : [v10] Dynamic Burn-in Schedule")
+    log("  Epoch 1-20 : Loss = Loss_B ONLY  (regression burn-in)")
+    log("  Epoch 21+  : Loss = Loss_B + 0.1 * Loss_A  (BCE introduced lightly)")
     log("  Loss_B     : Continuous Smooth L1  W_i = 1.0 + (y_i/5)^2 * 3.0")
-    log("  Loss_A     : BCELoss(prob_output, binary_target)  binary_target=(y>0)")
+    log("  Loss_A     : BCEWithLogitsLoss(logits_output, binary_target)")
+    log("LR Schedule  : [v10] Manual Warm-up Epochs 1-5: 1e-5 -> 1e-3 (linear)")
+    log("               Epoch 6+: ReduceLROnPlateau (factor=0.5, patience=10)")
     log("Early Stop   : pure L1Loss(final_output, y)  [Kaggle MAE aligned]")
     log("Pooling      : Temporal Attention  [v8: retained]")
     log("LayerNorm    : LayerNorm(input_size) before LSTM  [v7: retained]")
     log("Features     : 37  (11 weather + 2 cyclic + 9 rolling + 8 lag + 5 drought + 2 TE)")
-    log("  Cyclic     : week_sin, week_cos  [v9: replaces linear month+week_of_year]")
-    log("  TE         : region_mean_score, region_zero_prob  [v9: leakage-free]")
-    log("Strategy     : Fold Ensembling  (3 folds × 5 weeks, avg test predictions)")
+    log("  Cyclic     : week_sin, week_cos  [v9: retained]")
+    log("  TE         : region_mean_score, region_zero_prob  [v9: retained]")
+    log("Strategy     : Fold Ensembling  (3 folds x 5 weeks, avg test predictions)")
     log(f"Epochs       : {NUM_EPOCHS}  |  Patience: {PATIENCE}")
     log(f"Seed         : 42  (cuDNN deterministic={torch.backends.cudnn.deterministic})")
     log(f"BatchSize    : {BATCH_SIZE}  (hardcoded, no OOM fallback)")
@@ -561,36 +596,36 @@ def main():
 
     # -- 1b. Validate v9 features in processed CSV ----------------------------
     log("\n[v9 Feature Validation]")
-    assert "week_sin" in train_raw.columns, "week_sin missing – run eda.py first"
-    assert "week_cos" in train_raw.columns, "week_cos missing – run eda.py first"
-    assert "month" not in train_raw.columns, "month still present – should be dropped by preprocess"
-    assert "week_of_year" not in train_raw.columns, "week_of_year still present – should be dropped"
-    log("  ✓ week_sin, week_cos present  |  month, week_of_year correctly absent.")
+    assert "week_sin" in train_raw.columns, "week_sin missing -- run eda.py first"
+    assert "week_cos" in train_raw.columns, "week_cos missing -- run eda.py first"
+    assert "month" not in train_raw.columns, "month still present -- should be dropped by preprocess"
+    assert "week_of_year" not in train_raw.columns, "week_of_year still present -- should be dropped"
+    log("  v week_sin, week_cos present  |  month, week_of_year correctly absent.")
 
-    # -- 1c. Data Leakage Check -------------------------------------------------
+    # -- 1c. Data Leakage Check ------------------------------------------------
     log("\n[Data Leakage Check]")
     leaky_cols = [c for c in FEATURE_COLS if "score" in c.lower()
                   and c not in ("region_mean_score", "region_zero_prob")]
     if leaky_cols:
         log(f"  *** WARNING: Potential leaky features found: {leaky_cols} ***")
     else:
-        log("  ✓ No raw-score autoregressive features in FEATURE_COLS.")
+        log("  v No raw-score autoregressive features in FEATURE_COLS.")
     log(f"  FEATURE_COLS ({len(FEATURE_COLS)}): {FEATURE_COLS}")
 
-    # -- 2. Feature refinement (incl. Drought Index + log1p precip) ------------
+    # -- 2. Feature refinement (incl. Drought Index + log1p precip) -----------
     log("\nRefining features (drought proxy index + log1p precipitation) ...")
     train_df = refine_features(train_raw, is_train=True)
     test_df  = refine_features(test_raw,  is_train=False)
     log(f"  train after refinement: {train_df.shape}  |  test: {test_df.shape}")
 
-    # -- 3. Drop rows with NaN score (prevents NaN loss) -----------------------
+    # -- 3. Drop rows with NaN score (prevents NaN loss) ----------------------
     before = len(train_df)
     train_df = train_df.dropna(subset=["score"]).reset_index(drop=True)
     dropped_nan = before - len(train_df)
     if dropped_nan:
         log(f"  [NaN drop] Removed {dropped_nan:,} rows with NaN score from train_df.")
 
-    # -- 4. Target score distribution summary ----------------------------------
+    # -- 4. Target score distribution summary ---------------------------------
     log("\n[Training Target Distribution]")
     all_scores = train_df["score"].values
     zero_frac  = (all_scores == 0.0).mean()
@@ -601,7 +636,7 @@ def main():
         frac = (all_scores > thresh).mean() * 100
         log(f"  score > {thresh:.1f}: {frac:.2f}%  [{int((all_scores > thresh).sum()):,} samples]")
 
-    # -- 5. Full-train Target Encoding (for scaler fitting + test inference) ---
+    # -- 5. Full-train Target Encoding (for scaler fitting + test inference) --
     log("\n[v9] Computing full-train Target Encoding statistics ...")
     te_map_full, global_mean_te, global_zero_prob_te = _compute_te_stats(train_df)
     log(f"  Regions with TE stats : {len(te_map_full)}")
@@ -610,9 +645,9 @@ def main():
 
     # Add full-train TE to train_df (for scaler fitting over correct distribution)
     train_df = _merge_te_to_df(train_df, te_map_full, global_mean_te, global_zero_prob_te)
-    log("  ✓ region_mean_score, region_zero_prob added to train_df (full-train stats)")
+    log("  v region_mean_score, region_zero_prob added to train_df (full-train stats)")
 
-    # -- 6. Fit scaler on training features (includes TE) ----------------------
+    # -- 6. Fit scaler on training features (includes TE) ---------------------
     log("\nFitting StandardScaler on training feature matrix ...")
     feat_cols  = [c for c in FEATURE_COLS if c in train_df.columns]
     input_size = len(feat_cols)
@@ -629,15 +664,15 @@ def main():
 
     with open(os.path.join(MODELS_DIR, "scaler.pkl"), "wb") as f:
         pickle.dump(scaler, f)
-    log(f"  Scaler saved → {os.path.join(MODELS_DIR, 'scaler.pkl')}")
+    log(f"  Scaler saved -> {os.path.join(MODELS_DIR, 'scaler.pkl')}")
     log(f"  train after refinement + TE: {train_df.shape}")
 
-    # -- 7. Walk-Forward Cross-Validation with Fold Checkpointing ---------------
+    # -- 7. Walk-Forward Cross-Validation with Fold Checkpointing -------------
     log(f"\n{'='*68}")
-    log(f"Walk-Forward Cross-Validation  ({WF_NUM_FOLDS} folds × {WF_FOLD_WEEKS} weeks)")
-    log(f"Train loss  : Joint Loss = Continuous Smooth L1 + 0.5 * BCE")
+    log(f"Walk-Forward Cross-Validation  ({WF_NUM_FOLDS} folds x {WF_FOLD_WEEKS} weeks)")
+    log(f"Train loss  : v10 Burn-in: epochs 1-20 = Smooth L1 only; 21+ = Smooth L1 + 0.1*BCE")
     log(f"Val metric  : pure MAE  (unweighted, Kaggle-aligned)")
-    log(f"TE strategy : fold-specific (train rows only) → leakage-free")
+    log(f"TE strategy : fold-specific (train rows only) -> leakage-free")
     log(f"Checkpoints : fold_0_best.pt / fold_1_best.pt / fold_2_best.pt")
     log(f"Strategy    : Fold Ensembling  (v8 retained)")
     log(f"AMP : {USE_AMP}  |  batch_size={BATCH_SIZE}  |  num_workers=8")
@@ -652,7 +687,7 @@ def main():
     for fold_k, (fold_train_groups, fold_val_groups) in enumerate(folds):
         log(f"\n-- Fold {fold_k + 1}/{WF_NUM_FOLDS} --")
 
-        # ---- v9: Compute FOLD-SPECIFIC Target Encoding (leakage-free) -------
+        # ---- v9: Compute FOLD-SPECIFIC Target Encoding (leakage-free) ------
         # Use rows 0..val_start from training groups exclusively.
         # val_start = train_i_max + WINDOW_SIZE + HORIZON
         fold_te_rows = []
@@ -695,14 +730,14 @@ def main():
             fold_loader_val = DataLoader(fold_val_ds,   batch_size=BATCH_SIZE,
                                          shuffle=False, num_workers=0, pin_memory=USE_AMP)
 
-        # ---- Tensor Shape Verification (fold 0 only) -------------------------
+        # ---- Tensor Shape Verification (fold 0 only) ------------------------
         if fold_k == 0:
             first_X, first_y = next(iter(fold_loader_tr))
             log(f"\n  [Tensor Shape Verification] First Batch (Fold 1):")
             log(f"    X shape : {tuple(first_X.shape)}"
-                f"  →  (Batch={first_X.shape[0]}, Seq={first_X.shape[1]}, Features={first_X.shape[2]})")
+                f"  ->  (Batch={first_X.shape[0]}, Seq={first_X.shape[1]}, Features={first_X.shape[2]})")
             log(f"    y shape : {tuple(first_y.shape)}"
-                f"  →  (Batch={first_y.shape[0]}, Horizon={first_y.shape[1]})")
+                f"  ->  (Batch={first_y.shape[0]}, Horizon={first_y.shape[1]})")
             log(f"    Expected: Features={input_size}  "
                 f"(11 weather + 2 cyclic + 9 rolling + 8 lag + 5 drought + 2 TE = 37)")
             assert first_X.shape[1] == WINDOW_SIZE, \
@@ -711,7 +746,7 @@ def main():
                 f"Feature mismatch: got {first_X.shape[2]}, expected {input_size}"
             assert first_y.shape[1] == HORIZON, \
                 f"Horizon mismatch: got {first_y.shape[1]}, expected {HORIZON}"
-            log(f"    ✓ Shape assertion PASSED.\n")
+            log(f"    v Shape assertion PASSED.\n")
             del first_X, first_y
 
         fold_model = make_model(input_size)
@@ -732,10 +767,10 @@ def main():
         fold_maes.append(best_fold_mae)
         fold_best_epochs.append(best_fold_epoch)
         log(f"  Fold {fold_k+1} Best Val MAE: {best_fold_mae:.4f}  |  Best Epoch: {best_fold_epoch}")
-        log(f"  Checkpoint saved → {fold_ckpt}")
+        log(f"  Checkpoint saved -> {fold_ckpt}")
 
         # --- Diagnostic Hook: load best checkpoint and check prediction distribution ---
-        log(f"\n  [Fold {fold_k+1} Prediction Percentiles – best checkpoint]")
+        log(f"\n  [Fold {fold_k+1} Prediction Percentiles -- best checkpoint]")
         if os.path.exists(fold_ckpt) and best_fold_mae < float("inf"):
             fold_model.load_state_dict(torch.load(fold_ckpt, map_location=DEVICE))
             pct = eval_prediction_percentiles(fold_model, fold_loader_val, DEVICE, log)
@@ -766,15 +801,15 @@ def main():
                 f"max={p.get('max',float('nan')):.3f}")
     log(f"{'='*68}")
 
-    # -- 8. Prepare test_df with full-train TE for inference -------------------
+    # -- 8. Prepare test_df with full-train TE for inference ------------------
     log(f"\n[v9] Preparing test_df with full-train Target Encoding ...")
     test_df = _merge_te_to_df(test_df, te_map_full, global_mean_te, global_zero_prob_te)
     log(f"  test_df after TE injection: {test_df.shape}")
-    log(f"  ✓ region_mean_score, region_zero_prob added to test_df (full-train stats)")
+    log(f"  v region_mean_score, region_zero_prob added to test_df (full-train stats)")
 
-    # -- 9. Fold Ensemble Inference on Test Set --------------------------------
+    # -- 9. Fold Ensemble Inference on Test Set -------------------------------
     log(f"\n{'='*68}")
-    log(f"Fold Ensemble Inference  (v8/v9 – Average Blending)")
+    log(f"Fold Ensemble Inference  (v8/v9 -- Average Blending)")
     log(f"  Blending {len(fold_ckpt_paths)} fold checkpoints:")
     for p in fold_ckpt_paths:
         log(f"    {p}")
@@ -820,7 +855,7 @@ def main():
         final_pred = np.clip(final_pred, 0.0, 5.0)                           # Kaggle format
         predictions[region_id] = final_pred
 
-    # -- 10. Submission-level prediction diagnostics ---------------------------
+    # -- 10. Submission-level prediction diagnostics --------------------------
     log("\n[Submission Prediction Diagnostics]")
     all_sub_preds = np.array(list(predictions.values())).ravel()
     p50  = float(np.percentile(all_sub_preds, 50))
@@ -831,15 +866,15 @@ def main():
     log(f"  n={len(all_sub_preds):,}  mean={all_sub_preds.mean():.4f}  std={all_sub_preds.std():.4f}")
     log(f"  p50={p50:.4f}  p90={p90:.4f}  p95={p95:.4f}  p99={p99:.4f}  max={pmax:.4f}")
     if p99 < 2.0:
-        log("  *** WARNING: Submission p99 < 2.0 — model collapse still present! ***")
+        log("  *** WARNING: Submission p99 < 2.0 -- model collapse still present! ***")
     else:
-        log("  ✓ Submission p99 >= 2.0 — model collapse is BROKEN.")
+        log("  v Submission p99 >= 2.0 -- model collapse is BROKEN.")
 
     # Zero-inflation: did the model predict many exact zeros?
     zero_pred_frac = (all_sub_preds < 0.05).mean()
     log(f"  Fraction of near-zero predictions (<0.05): {zero_pred_frac:.2%}")
 
-    # -- 11. Format & save submission.csv --------------------------------------
+    # -- 11. Format & save submission.csv -------------------------------------
     log("\nFormatting submission.csv ...")
     rows = []
     for region_id, preds in sorted(predictions.items()):
@@ -856,7 +891,7 @@ def main():
     sub_path   = os.path.join(ROOT, "submission.csv")
     submission.to_csv(sub_path, index=False)
 
-    # -- 12. Sanity checks -----------------------------------------------------
+    # -- 12. Sanity checks ----------------------------------------------------
     assert len(submission) == 2248, (
         f"Expected 2248 rows, got {len(submission)}"
     )
@@ -864,26 +899,26 @@ def main():
         "region_id", "pred_week1", "pred_week2",
         "pred_week3", "pred_week4", "pred_week5",
     ], f"Unexpected columns: {list(submission.columns)}"
-    log("  ✓ Submission assertion passed: 2248 rows, 6 columns.")
+    log("  v Submission assertion passed: 2248 rows, 6 columns.")
 
     test_regions  = set(test_df["region_id"].unique())
     train_regions = set(train_df["region_id"].unique())
     assert test_regions == train_regions, (
         f"Region mismatch: train={len(train_regions)}, test={len(test_regions)}"
     )
-    log("  ✓ Train/test regions match (2248).")
+    log("  v Train/test regions match (2248).")
 
-    log(f"  submission.csv → {sub_path}")
+    log(f"  submission.csv -> {sub_path}")
     log(f"  Rows (excl. header): {len(submission)}")
     log(f"  Columns: {list(submission.columns)}")
     log(f"\n  Preview:\n{submission.head(5).to_string(index=False)}")
 
     # Save full training log
     log(f"\nTotal elapsed: {(time.time() - t0):.1f}s")
-    log_path = os.path.join(ROOT, "_training_log_9th.txt")
+    log_path = os.path.join(ROOT, "_training_log_10th.txt")
     with open(log_path, "w") as f:
         f.write("\n".join(log_lines))
-    print(f"\nTraining log saved → {log_path}")
+    print(f"\nTraining log saved -> {log_path}")
 
     return {
         "fold_maes":              fold_maes,
