@@ -1,43 +1,46 @@
 """
-train.py -- Drought Score Forecasting Pipeline (v6 – Anti-Collapse Refactor)
-=============================================================================
+train.py -- Drought Score Forecasting Pipeline (v7 – Architecture Refinement & Smooth Loss)
+============================================================================================
 Usage:
     python src/train.py
 
 Outputs:
     submission.csv               -- Kaggle submission (2248 rows + header)
-    models/final_model_v6.pt     -- Blind full-retrained model (TARGET_EPOCHS, 100% data)
+    models/final_model_v7.pt     -- Blind full-retrained model (TARGET_EPOCHS, 100% data)
     models/scaler.pkl            -- Fitted StandardScaler
     models/training_history.csv  -- Per-epoch metrics for final training run
-    _training_log_6th.txt        -- Full console log
+    _training_log_7th.txt        -- Full console log
 
-Key improvements (v6 – Anti-Collapse Refactor)
------------------------------------------------
-  1. Weighted Smooth L1 Loss  -- Samples with ground-truth score > 3.0 (severe
-                                  drought) receive a 4× loss penalty, forcing
-                                  the model to take risks and predict extremes.
-  2. Deeper Prediction Head   -- Linear(64→32)→GELU→Dropout(0.3)→Linear(32→5)
-                                  replaces the single Linear(64→5).
-  3. Softplus + clamp(0,5)    -- Replaces Sigmoid×5 to eliminate vanishing
-                                  gradients at the output extremes.
-  4. No Forced Bias           -- Removed -1.61 bias init that trapped the model
-                                  at the global mean prediction.
-  5. Diagnostic Logging       -- 95th and 99th prediction percentiles are logged
-                                  after every CV fold to detect collapse.
-  6. Data Leakage Check       -- Verified: FEATURE_COLS contains no score_lag
-                                  or any autoregressive target leakage.
-  7. Log1p Precipitation      -- Already applied in dataset.refine_features()
-                                  for all prec / prec_roll_sum_* / prec_lag* cols.
+Key improvements (v7 – Architecture Refinement & Smooth Loss)
+--------------------------------------------------------------
+  1. Continuous Smooth Loss      -- Replaces hard-threshold weighted loss.
+                                    W_i = 1.0 + (y_i / 5.0)^2 * 3.0
+                                    Smooth gradient transitions; no sudden jumps.
+  2. LayerNorm on Inputs         -- nn.LayerNorm(input_size) before LSTM to
+                                    stabilise training under concept drift.
+  3. Global Average Pooling      -- Replaces naive last-step extraction.
+                                    All 13 weekly hidden states are averaged so
+                                    the full temporal profile informs predictions.
+  4. No Clamp in Model           -- torch.clamp removed from forward pass;
+                                    Softplus output is unbounded to keep gradients
+                                    active across the full score range.
+  5. Inference Safety Clip       -- np.clip(predictions, 0.0, 5.0) applied to
+                                    NumPy arrays before writing submission.csv.
+  6. Strict Reproducibility      -- set_seed(42) called at startup; deterministic
+                                    cuDNN; no dynamic OOM batch-size fallback.
+  7. Hardcoded BATCH_SIZE=512    -- Removes all OOM-retry complexity.
+  8. Diagnostic Logging          -- 95th and 99th prediction percentiles logged
+                                    after every CV fold to detect collapse.
 
 Hardware note
 -------------
-  RTX 4070 Laptop has 8 GB VRAM.  At batch_size=1024 with AMP, expected peak
-  VRAM ≈ 3–4 GB.  If CUDA OOM is raised at startup, set BATCH_SIZE=512 below.
+  RTX 4070 Laptop has 8 GB VRAM.  BATCH_SIZE fixed to 512 for stability.
 """
 
 import os
 import sys
 import time
+import random
 import pickle
 import numpy as np
 import pandas as pd
@@ -66,24 +69,36 @@ from src.dataset import (
 from src.model import DroughtLSTM
 
 # ---------------------------------------------------------------------------
+# Reproducibility  (v7 – must be called before ANY torch/numpy/random usage)
+# ---------------------------------------------------------------------------
+def set_seed(seed: int = 42) -> None:
+    """Seed all RNG sources for full reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+set_seed(42)
+
+# ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-PROCESSED_DIR  = os.path.join(ROOT, "data", "processed")
-MODELS_DIR     = os.path.join(ROOT, "models")
+PROCESSED_DIR = os.path.join(ROOT, "data", "processed")
+MODELS_DIR    = os.path.join(ROOT, "models")
 os.makedirs(MODELS_DIR, exist_ok=True)
 
-HIDDEN_SIZE    = 64
-NUM_LAYERS     = 2
-DROPOUT        = 0.4
-LEARNING_RATE  = 1e-3
-WEIGHT_DECAY   = 1e-3
-BATCH_SIZE     = 1024        # RTX 4070 8GB + AMP → fits comfortably; fallback=512
-NUM_EPOCHS     = 150         # extended; early stopping governs CV folds
-PATIENCE       = 25          # patience on pure val MAE (CV only)
-
-# Weighted loss – severe drought penalty
-DROUGHT_THRESHOLD = 3.0      # ground-truth score threshold for "severe" drought
-DROUGHT_PENALTY   = 4.0      # loss multiplier for samples above threshold
+HIDDEN_SIZE   = 64
+NUM_LAYERS    = 2
+DROPOUT       = 0.4
+LEARNING_RATE = 1e-3
+WEIGHT_DECAY  = 1e-3
+BATCH_SIZE    = 512          # hardcoded; no OOM fallback (v7)
+NUM_EPOCHS    = 150          # extended; early stopping governs CV folds
+PATIENCE      = 25           # patience on pure val MAE (CV only)
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Device: {DEVICE}")
@@ -96,35 +111,36 @@ _scaler = GradScaler(device="cuda", enabled=USE_AMP)
 
 
 # ---------------------------------------------------------------------------
-# Weighted Smooth L1 (Huber) Loss  [v6 – core anti-collapse mechanism]
+# Continuous Smooth Loss  (v7 – replaces hard-threshold weighted loss)
 # ---------------------------------------------------------------------------
 # Mathematical definition:
 #   For each (pred_i, target_i) pair:
-#     huber_i = SmoothL1(pred_i, target_i)          [element-wise, reduction='none']
-#     weight_i = DROUGHT_PENALTY  if target_i > DROUGHT_THRESHOLD  else 1.0
+#     huber_i  = SmoothL1(pred_i, target_i)               [element-wise, reduction='none']
+#     weight_i = 1.0 + (target_i / 5.0)^2 * 3.0          [continuous, smooth curve]
 #     loss     = mean(weight_i * huber_i)
 #
-# Effect: severe-drought samples (score > 3) contribute 4× to the gradient,
-#         overcoming the data imbalance and forcing the model to predict extremes.
+# Properties:
+#   - weight at target=0 : 1.0  (no amplification for no-drought samples)
+#   - weight at target=3 : 1.0 + (3/5)^2 * 3.0 = 2.08   (moderate amplification)
+#   - weight at target=5 : 1.0 + (5/5)^2 * 3.0 = 4.0    (maximum amplification)
+#   - No step function → smooth gradients and stable training.
 # ---------------------------------------------------------------------------
-def weighted_smooth_l1_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+def continuous_smooth_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     """
-    Weighted Smooth L1 / Huber loss.
+    Continuous quadratically-weighted Smooth L1 / Huber loss.
 
     Parameters
     ----------
     pred   : (B, H) model predictions
-    target : (B, H) ground-truth scores
+    target : (B, H) ground-truth scores in [0, 5]
 
     Returns
     -------
     scalar loss
     """
     element_loss = F.smooth_l1_loss(pred, target, reduction="none")  # (B, H)
-    # Weight mask: 4× penalty wherever ground-truth exceeds threshold
-    weight = torch.where(target > DROUGHT_THRESHOLD,
-                         torch.full_like(target, DROUGHT_PENALTY),
-                         torch.ones_like(target))
+    # Continuous weight: quadratic ramp from 1.0 (at target=0) to 4.0 (at target=5)
+    weight = 1.0 + (target / 5.0) ** 2 * 3.0                        # (B, H)
     return (weight * element_loss).mean()
 
 
@@ -137,7 +153,7 @@ _l1_criterion = nn.L1Loss()
 # ---------------------------------------------------------------------------
 
 def train_epoch(model, loader, optimizer, device):
-    """One training epoch – Weighted Smooth L1 with AMP."""
+    """One training epoch – Continuous Smooth Loss with AMP."""
     model.train()
     total_loss, n = 0.0, 0
     for X, y in loader:
@@ -146,7 +162,7 @@ def train_epoch(model, loader, optimizer, device):
 
         with autocast(device_type=device.type, enabled=USE_AMP):
             pred = model(X)
-            loss = weighted_smooth_l1_loss(pred, y)
+            loss = continuous_smooth_loss(pred, y)
 
         _scaler.scale(loss).backward()
         _scaler.unscale_(optimizer)
@@ -236,8 +252,8 @@ def _make_loader(dataset, shuffle: bool, batch_size: int = BATCH_SIZE) -> DataLo
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
-        num_workers=8,       # i9-13980HX has 32 threads → 8 workers for IO
-        pin_memory=True,     # zero-copy transfer to GPU
+        num_workers=8,            # i9-13980HX has 32 threads → 8 workers for IO
+        pin_memory=True,          # zero-copy transfer to GPU
         persistent_workers=True,
         prefetch_factor=2,
     )
@@ -258,7 +274,7 @@ def train_model(
 ):
     """
     Train model with early stopping on pure (unweighted) MAE.
-    Loss during training: Weighted Smooth L1.
+    Loss during training: Continuous Smooth Loss (v7).
 
     Returns best_val_mae, best_epoch, history.
     """
@@ -311,7 +327,7 @@ def train_model(
 
 
 # ---------------------------------------------------------------------------
-# Blind full retraining (v6) -- no validation, no early stopping
+# Blind full retraining (v7) -- no validation, no early stopping
 # ---------------------------------------------------------------------------
 def train_model_blind(
     model,
@@ -322,7 +338,7 @@ def train_model_blind(
 ):
     """
     Blind full retraining on 100% of training data for exactly num_epochs.
-    Uses CosineAnnealingLR.  Weighted Smooth L1 loss.  AMP enabled.
+    Uses CosineAnnealingLR.  Continuous Smooth Loss (v7).  AMP enabled.
     """
     optimiser = make_optimiser(model)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -362,12 +378,15 @@ def main():
 
     # -- 0. Architecture & loss description ------------------------------------
     log("=" * 65)
-    log("Drought Forecasting Pipeline  v6  (Anti-Collapse Refactor)")
+    log("Drought Forecasting Pipeline  v7  (Architecture Refinement & Smooth Loss)")
     log("=" * 65)
-    log(f"Loss      : Weighted Smooth L1  (severe drought >{DROUGHT_THRESHOLD:.1f} → {DROUGHT_PENALTY:.0f}× penalty)")
-    log(f"Activation: Softplus → clamp(0, 5)  [replaces Sigmoid×5]")
-    log(f"Head      : Linear(64→32)→GELU→Dropout(0.3)→Linear(32→5)")
-    log(f"Bias init : default (no forced -1.61 mean bias)")
+    log("Loss      : Continuous Smooth Loss  W_i = 1.0 + (y_i/5)^2 * 3.0")
+    log("Activation: Softplus  [NO clamp – unbounded; np.clip at inference]")
+    log("Pooling   : Global Average Pooling (dim=1)  [all 13 steps averaged]")
+    log("LayerNorm : LayerNorm(input_size) applied before LSTM")
+    log("Head      : Linear(64→32)→GELU→Dropout(0.3)→Linear(32→5)")
+    log(f"Seed      : 42  (cuDNN deterministic={torch.backends.cudnn.deterministic})")
+    log(f"BatchSize : {BATCH_SIZE}  (hardcoded, no OOM fallback)")
 
     # -- 1. Load data ----------------------------------------------------------
     log("\nLoading processed data ...")
@@ -428,7 +447,7 @@ def main():
     # -- 5. Walk-Forward Cross-Validation --------------------------------------
     log(f"\n{'='*65}")
     log(f"Walk-Forward Cross-Validation  ({WF_NUM_FOLDS} folds × {WF_FOLD_WEEKS} weeks)")
-    log(f"Train loss  : Weighted Smooth L1  (threshold={DROUGHT_THRESHOLD}, penalty={DROUGHT_PENALTY}×)")
+    log(f"Train loss  : Continuous Smooth Loss  W_i = 1.0 + (y_i/5)^2 * 3.0")
     log(f"Val metric  : pure MAE  (unweighted, fair comparison)")
     log(f"AMP : {USE_AMP}  |  batch_size={BATCH_SIZE}  |  num_workers=8")
     log(f"{'='*65}")
@@ -456,31 +475,16 @@ def main():
         fold_model = make_model(input_size)
         fold_ckpt  = os.path.join(MODELS_DIR, f"fold_{fold_k}_best.pt")
 
-        try:
-            best_fold_mae, best_fold_epoch, _ = train_model(
-                fold_model,
-                fold_loader_tr,
-                fold_loader_val,
-                num_epochs=NUM_EPOCHS,
-                patience=PATIENCE,
-                ckpt_path=fold_ckpt,
-                log=log,
-                show_header=True,
-            )
-        except torch.cuda.OutOfMemoryError:
-            log(f"\n  [!] CUDA OOM at batch_size={BATCH_SIZE}.  "
-                f"Retrying with batch_size=512 ...")
-            torch.cuda.empty_cache()
-            fold_loader_tr  = DataLoader(fold_train_ds, batch_size=512,
-                                         shuffle=True,  num_workers=4, pin_memory=True)
-            fold_loader_val = DataLoader(fold_val_ds,   batch_size=512,
-                                         shuffle=False, num_workers=4, pin_memory=True)
-            fold_model = make_model(input_size)
-            best_fold_mae, best_fold_epoch, _ = train_model(
-                fold_model, fold_loader_tr, fold_loader_val,
-                num_epochs=NUM_EPOCHS, patience=PATIENCE,
-                ckpt_path=fold_ckpt, log=log, show_header=True,
-            )
+        best_fold_mae, best_fold_epoch, _ = train_model(
+            fold_model,
+            fold_loader_tr,
+            fold_loader_val,
+            num_epochs=NUM_EPOCHS,
+            patience=PATIENCE,
+            ckpt_path=fold_ckpt,
+            log=log,
+            show_header=True,
+        )
 
         fold_maes.append(best_fold_mae)
         fold_best_epochs.append(best_fold_epoch)
@@ -505,7 +509,7 @@ def main():
     log(f"Average_Val_MAE   : {avg_val_mae:.4f}")
     log(f"Fold Best Epochs  : {fold_best_epochs}")
     log(f"Mean Best Epoch   : {mean_best_epoch:.1f}")
-    log(f"TARGET_EPOCHS (v6): {TARGET_EPOCHS}  (mean * 1.05, rounded)")
+    log(f"TARGET_EPOCHS (v7): {TARGET_EPOCHS}  (mean * 1.05, rounded)")
     log(f"\nFold Prediction Percentiles Summary:")
     for i, p in enumerate(fold_percentiles):
         if p:
@@ -515,10 +519,10 @@ def main():
                 f"max={p.get('max',float('nan')):.3f}")
     log(f"{'='*65}")
 
-    # -- 6. Blind full retraining on 100% training data (v6) -------------------
+    # -- 6. Blind full retraining on 100% training data (v7) -------------------
     log(f"\n{'='*65}")
-    log(f"Blind Full Retraining  (TARGET_EPOCHS={TARGET_EPOCHS}, 100% data, v6)")
-    log(f"Loss      : Weighted Smooth L1  (threshold={DROUGHT_THRESHOLD}, penalty={DROUGHT_PENALTY}×)")
+    log(f"Blind Full Retraining  (TARGET_EPOCHS={TARGET_EPOCHS}, 100% data, v7)")
+    log(f"Loss      : Continuous Smooth Loss  W_i = 1.0 + (y_i/5)^2 * 3.0")
     log(f"Scheduler : CosineAnnealingLR(T_max={TARGET_EPOCHS})")
     log(f"AMP       : {USE_AMP}  |  batch_size={BATCH_SIZE}")
     log("No validation split. No early stopping.")
@@ -532,41 +536,26 @@ def main():
     log(f"  Full train sequences: {len(full_train_ds):,}")
 
     try:
-        # Use fewer workers/smaller batch for blind retrain to avoid OOM
-        # (fold datasets are freed but full dataset is ~10% larger than fold datasets)
         full_train_loader = DataLoader(
-            full_train_ds, batch_size=512, shuffle=True,
+            full_train_ds, batch_size=BATCH_SIZE, shuffle=True,
             num_workers=4, pin_memory=True,
             persistent_workers=True, prefetch_factor=2,
         )
     except Exception:
-        full_train_loader = DataLoader(full_train_ds, batch_size=512,
+        full_train_loader = DataLoader(full_train_ds, batch_size=BATCH_SIZE,
                                        shuffle=True, num_workers=0, pin_memory=USE_AMP)
 
     final_model = make_model(input_size)
     log("\n" + final_model.architecture_summary(input_size))
 
-    v6_ckpt = os.path.join(MODELS_DIR, "final_model_v6.pt")
+    v7_ckpt = os.path.join(MODELS_DIR, "final_model_v7.pt")
 
-    try:
-        final_history = train_model_blind(
-            final_model, full_train_loader,
-            num_epochs=TARGET_EPOCHS,
-            ckpt_path=v6_ckpt,
-            log=log,
-        )
-    except torch.cuda.OutOfMemoryError:
-        log("\n  [!] CUDA OOM on blind retrain – retrying with batch_size=512 ...")
-        torch.cuda.empty_cache()
-        full_train_loader = DataLoader(full_train_ds, batch_size=512,
-                                       shuffle=True, num_workers=4, pin_memory=True)
-        final_model = make_model(input_size)
-        final_history = train_model_blind(
-            final_model, full_train_loader,
-            num_epochs=TARGET_EPOCHS,
-            ckpt_path=v6_ckpt,
-            log=log,
-        )
+    final_history = train_model_blind(
+        final_model, full_train_loader,
+        num_epochs=TARGET_EPOCHS,
+        ckpt_path=v7_ckpt,
+        log=log,
+    )
 
     log(f"Blind training complete. Epochs trained : {TARGET_EPOCHS}")
     log(f"Training time so far: {(time.time() - t0):.1f}s")
@@ -577,7 +566,7 @@ def main():
 
     # -- 7. Inference on test set ----------------------------------------------
     log("\nRunning inference on test set ...")
-    final_model.load_state_dict(torch.load(v6_ckpt, map_location=DEVICE))
+    final_model.load_state_dict(torch.load(v7_ckpt, map_location=DEVICE))
     final_model.eval()
 
     predictions = {}   # region_id -> np.array of shape (5,)
@@ -600,6 +589,9 @@ def main():
         with torch.no_grad():
             with autocast(device_type=DEVICE.type, enabled=USE_AMP):
                 pred = final_model(X_tensor).squeeze(0).cpu().float().numpy()
+
+        # v7: Safety clip – model is now unbounded; clip to Kaggle-valid range
+        pred = np.clip(pred, 0.0, 5.0)
 
         predictions[region_id] = pred
 
@@ -659,7 +651,7 @@ def main():
 
     # Save full training log
     log(f"\nTotal elapsed: {(time.time() - t0):.1f}s")
-    log_path = os.path.join(ROOT, "_training_log_6th.txt")
+    log_path = os.path.join(ROOT, "_training_log_7th.txt")
     with open(log_path, "w") as f:
         f.write("\n".join(log_lines))
     print(f"\nTraining log saved -> {log_path}")
