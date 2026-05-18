@@ -3,23 +3,44 @@ DroughtLSTM
 ===========
 Multi-output LSTM for direct 5-step drought score forecasting.
 
-Architecture (v7 – Architecture Refinement & Smooth Loss)
-----------------------------------------------------------
+Architecture (v9 – Two-Stage Multi-Task Learning for Zero-Inflation)
+--------------------------------------------------------------------
+  Problem:  58% of target scores are 0 (zero-inflation).
+            A single regression head is pulled heavily toward zero.
+  Solution: Decompose prediction into two independent branches:
+
   Input  -> LayerNorm(input_size)                          ← concept-drift stabiliser
           -> LSTM (hidden_size=64, num_layers=2, dropout=0.4)
-          -> Global Average Pooling across sequence dim     ← replaces last-step extraction
+          -> Temporal Attention (Linear(hidden→1) → Softmax over time)
+             context_vector = sum(attn_weights * lstm_out, dim=1)  ← (B, hidden)
           -> Dropout(0.4)
-          -> Linear(64, 32) -> GELU -> Dropout(0.3)
-          -> Linear(32, 5)                                  ← raw logits
-          -> Softplus()                                     ← non-negative, gradient everywhere
-          (NO clamp – unbounded positive output; clipping applied at inference in train.py)
+          -> Branch A (Probability of Drought):
+               Linear(64, 32) → GELU → Linear(32, 5) → Sigmoid()
+               Output: (B, 5)  values in [0, 1]
+               Meaning: Probability that drought is occurring at each future step
+          -> Branch B (Severity of Drought):
+               Linear(64, 32) → GELU → Linear(32, 5) → Softplus()
+               Output: (B, 5)  non-negative values
+               Meaning: Severity of drought conditioned on it occurring
 
-Changes from v6 (v7 architecture refinement)
----------------------------------------------
-  - REMOVED: torch.clamp(0, 5) from forward pass (killed gradients at extreme ends).
-  - ADDED  : nn.LayerNorm applied to inputs before LSTM to handle concept drift.
-  - CHANGED: Sequence pooling from last-hidden-step to Global Average Pooling (GAP)
-             across all 13 time steps so the full temporal profile is utilised.
+  Forward Pass Outputs:
+    1. final_output = Branch_A × Branch_B  (element-wise Expected Severity)
+    2. prob_output  = Branch_A raw output  (needed for BCE loss)
+
+  Joint Loss (defined in train.py):
+    Loss_A = BCELoss(prob_output, binary_target)          0.5× weight
+    Loss_B = Continuous Smooth L1 (final_output, target)  1.0× weight
+    Total  = Loss_B + 0.5 * Loss_A
+
+  Early Stopping: monitors pure L1Loss(final_output, target) only → Kaggle-aligned
+
+Changes from v8
+---------------
+  - REMOVED: Single Softplus regression head.
+  - ADDED  : Two-branch heads (Branch A: probability, Branch B: severity).
+  - ADDED  : Forward method returns (final_output, prob_output) tuple.
+  - Temporal Attention mechanism RETAINED from v8.
+  - LayerNorm on inputs RETAINED from v7.
 """
 
 import torch
@@ -63,21 +84,33 @@ class DroughtLSTM(nn.Module):
             batch_first=True,
         )
 
+        # --- Temporal Attention (v8: retained) ---
+        # Projects each hidden state to a scalar attention score,
+        # then softmax normalises across the time dimension W.
+        self.attention = nn.Linear(hidden_size, 1)
+
         self.dropout = nn.Dropout(p=dropout)
 
-        # --- Prediction head: Linear(64→32) → GELU → Dropout(0.3) → Linear(32→horizon) ---
-        self.head = nn.Sequential(
+        # --- Branch A: Probability of Drought (per future step) ---
+        # Output in [0, 1] via Sigmoid; used with BCELoss in train.py
+        self.head_prob = nn.Sequential(
             nn.Linear(hidden_size, 32),
             nn.GELU(),
-            nn.Dropout(p=0.3),
             nn.Linear(32, horizon),
         )
+        self.sigmoid = nn.Sigmoid()
 
-        # Softplus: smooth non-negative activation with gradient everywhere
+        # --- Branch B: Severity of Drought (per future step) ---
+        # Output non-negative via Softplus; represents magnitude if drought occurs
+        self.head_severity = nn.Sequential(
+            nn.Linear(hidden_size, 32),
+            nn.GELU(),
+            nn.Linear(32, horizon),
+        )
         self.softplus = nn.Softplus(beta=1)
 
     # -----------------------------------------------------------------------
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor):
         """
         Parameters
         ----------
@@ -85,23 +118,37 @@ class DroughtLSTM(nn.Module):
 
         Returns
         -------
-        out : (batch, horizon)  -- unbounded non-negative values
-              Caller should np.clip(out, 0, 5) before writing submission.csv.
+        final_output : (batch, horizon)
+            Element-wise product of prob_output × severity_output.
+            Represents Expected Severity = P(drought) × E[severity | drought].
+            Caller should np.clip(out, 0, 5) before writing submission.csv.
+
+        prob_output : (batch, horizon)
+            Raw sigmoid output of Branch A (probability of drought).
+            Used for BCELoss in train.py.
         """
         # v7: Normalise inputs to mitigate concept drift
-        x = self.input_norm(x)                        # (B, W, F)
+        x = self.input_norm(x)                              # (B, W, F)
 
-        lstm_out, _ = self.lstm(x)                    # (B, W, hidden)
+        lstm_out, _ = self.lstm(x)                          # (B, W, hidden)
 
-        # v7: Global Average Pooling – aggregate the entire temporal profile
-        pooled = lstm_out.mean(dim=1)                 # (B, hidden)
+        # v8: Temporal Attention – learn which time steps matter most
+        attn_weights = self.attention(lstm_out)              # (B, W, 1)
+        attn_weights = torch.softmax(attn_weights, dim=1)   # Softmax over time dim W
+        context_vector = torch.sum(attn_weights * lstm_out, dim=1)  # (B, hidden)
 
-        dropped = self.dropout(pooled)
-        raw = self.head(dropped)                      # (B, horizon)
-        out = self.softplus(raw)                      # non-negative, gradient everywhere
-        # NO clamp here – kept unbounded so gradients are never killed.
-        # np.clip(predictions, 0.0, 5.0) is applied in train.py before saving.
-        return out
+        dropped = self.dropout(context_vector)               # (B, hidden)
+
+        # Branch A – Probability of Drought
+        prob_output = self.sigmoid(self.head_prob(dropped))  # (B, H) in [0, 1]
+
+        # Branch B – Severity of Drought (non-negative, unbounded above)
+        severity = self.softplus(self.head_severity(dropped))  # (B, H) ≥ 0
+
+        # Expected Severity = P(drought) × Severity
+        final_output = prob_output * severity                # (B, H)
+
+        return final_output, prob_output
 
     # -----------------------------------------------------------------------
     def count_parameters(self) -> int:
@@ -109,18 +156,28 @@ class DroughtLSTM(nn.Module):
 
     def architecture_summary(self, input_size: int) -> str:
         lines = [
-            "DroughtLSTM Architecture (v7 – Architecture Refinement & Smooth Loss)",
-            "=" * 65,
-            f"  Input size   : {input_size}  (features per week)",
+            "DroughtLSTM Architecture (v9 – Two-Stage Multi-Task + Zero-Inflation)",
+            "=" * 68,
+            f"  Input size   : {input_size}  (features per week, 37 total)",
             f"  LayerNorm    : LayerNorm({input_size})  [v7: concept-drift stabiliser]",
             f"  LSTM layers  : {self.num_layers}",
             f"  Hidden size  : {self.hidden_size}",
             f"  Dropout      : {self.dropout.p}",
-            "  Pooling      : Global Average Pooling (dim=1)  [v7: replaces last-step]",
-            "  Head         : Linear(64→32) → GELU → Dropout(0.3) → Linear(32→5)",
-            "  Activation   : Softplus  [v7: NO clamp – unbounded positive output]",
-            "  Inference    : np.clip(pred, 0, 5) applied in train.py",
-            "-" * 65,
+            "  Pooling      : Temporal Attention  [v8: retained]",
+            "                 attention = Linear(hidden→1); softmax over time; weighted sum",
+            "  Branch A     : Linear(64→32) → GELU → Linear(32→5) → Sigmoid()",
+            "                 Output: (B,5) in [0,1] — Probability of Drought",
+            "  Branch B     : Linear(64→32) → GELU → Linear(32→5) → Softplus()",
+            "                 Output: (B,5) ≥ 0   — Severity of Drought",
+            "  Final Output : Branch_A × Branch_B  (Expected Severity)",
+            "  Returns      : (final_output, prob_output) — two tensors",
+            "  Inference    : np.clip(final_output, 0, 5) applied in train.py",
+            "-" * 68,
+            "  Loss_A       : BCELoss(prob_output, binary_target)     [weight 0.5]",
+            "  Loss_B       : Continuous Smooth L1(final_output, y)   [weight 1.0]",
+            "  Total Loss   : Loss_B + 0.5 * Loss_A",
+            "  Early Stop   : pure L1Loss(final_output, y)  [Kaggle MAE aligned]",
+            "-" * 68,
             f"  Total params : {self.count_parameters():,}",
         ]
         return "\n".join(lines)

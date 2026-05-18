@@ -10,6 +10,15 @@ Design
 - Region boundaries are strictly respected – windows NEVER cross regions.
 - Feature pruning, log1p precipitation transform, and Drought Index
   (PET-based deficit rolling sums) are applied here.
+
+v9 Changes
+----------
+- FEATURE_COLS updated: `month` and `week_of_year` replaced with
+  `week_sin` and `week_cos` (cyclical encoding from preprocess.py).
+- Added `region_mean_score` and `region_zero_prob` for target encoding.
+  These are computed leakage-free in train.py (fold-specific) and
+  dynamically injected into region group DataFrames before Dataset creation.
+- Total feature count: 37 (up from 35).
 """
 
 import numpy as np
@@ -40,13 +49,15 @@ PREC_COLS = [
 ]
 
 # Feature columns fed to the model (order matters for scaler alignment)
+# v9: `month` and `week_of_year` replaced by `week_sin` and `week_cos`;
+#     `region_mean_score` and `region_zero_prob` added (target encoding).
 FEATURE_COLS = [
     # --- base weather (11) ---
     "prec", "surf_pre", "humidity",
     "tmp", "tmp_max", "tmp_min", "tmp_range",
     "wind", "wind_max", "wind_min", "wind_range",
-    # --- calendar (2) ---
-    "month", "week_of_year",
+    # --- cyclical calendar (2) [v9: replaces month + week_of_year] ---
+    "week_sin", "week_cos",
     # --- rolling aggregates (9) ---
     "prec_roll_sum_4w",  "tmp_roll_mean_4w",  "humidity_roll_mean_4w",
     "prec_roll_sum_8w",  "tmp_roll_mean_8w",  "humidity_roll_mean_8w",
@@ -58,7 +69,9 @@ FEATURE_COLS = [
     # --- drought proxy index (5) ---
     "pet", "deficit",
     "deficit_roll_cum_4w", "deficit_roll_cum_8w", "deficit_roll_cum_13w",
-]   # total = 35 features
+    # --- target encoding (2) [v9: leakage-free region stats, injected in train.py] ---
+    "region_mean_score", "region_zero_prob",
+]   # total = 37 features
 
 
 # ---------------------------------------------------------------------------
@@ -72,6 +85,9 @@ def refine_features(df: pd.DataFrame, is_train: bool = True) -> pd.DataFrame:
     4. Handle NaN rows:
        - Train: drop rows where any FEATURE_COL is NaN (lag head).
        - Test:  forward-fill then zero-fill lag NaN so we keep all rows.
+
+    NOTE: `region_mean_score` and `region_zero_prob` are NOT added here.
+    They are injected by train.py (leakage-free, per-fold) AFTER this call.
 
     Returns a clean copy of df.
     """
@@ -88,7 +104,11 @@ def refine_features(df: pd.DataFrame, is_train: bool = True) -> pd.DataFrame:
         if col in df.columns:
             df[col] = np.log1p(df[col].clip(lower=0))
 
-    present_feats = [c for c in FEATURE_COLS if c in df.columns]
+    # Step 3 – NaN handling (only on features present in df, excl. TE cols)
+    present_feats = [
+        c for c in FEATURE_COLS
+        if c in df.columns and c not in ("region_mean_score", "region_zero_prob")
+    ]
 
     if is_train:
         # Step 3a – drop NaN rows (usually the first 2 rows per region)

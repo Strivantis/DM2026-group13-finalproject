@@ -1,0 +1,63 @@
+=================================================================
+Drought Prediction — EDA Pipeline v9 (Cyclical + Zero-Inflation)
+=================================================================
+
+Loading raw data …
+  Raw train: (12319040, 17)  |  Raw test: (204568, 16)
+Imputing …
+Outlier clipping (Z=3.5) …
+Weekly aggregation (v9: produces week_sin, week_cos; drops month, week_of_year) …
+  ✓ week_sin range: [-1.000, 1.000]
+  ✓ week_cos range: [-0.998, 1.000]
+Feature engineering …
+  train_w: (1789408, 41)  |  test_w: (30199, 38)
+  ✓ Region counts: train=2248, test=2248
+
+[v9 Zero-Inflation Check]
+  Score mean  : 0.8357
+  Score == 0  : 59.63%  (1,048,333 / 1,757,936 rows)
+  Score >  0  : 40.37%
+  ==> Two-Stage architecture directly addresses this zero-inflation.
+
+Exporting processed data to data/processed/ …
+  Exported train → /home/sean/文件/NYCU/114-2/Data Mining/FinalProject/data/processed/train_processed.csv  (1789408, 41)
+  Exported test  → /home/sean/文件/NYCU/114-2/Data Mining/FinalProject/data/processed/test_processed.csv   (30199, 38)
+
+[1/7] Correlation heatmaps …
+  Saved → /home/sean/文件/NYCU/114-2/Data Mining/FinalProject/plots/corr_heatmap_pearson.png
+  Saved → /home/sean/文件/NYCU/114-2/Data Mining/FinalProject/plots/corr_score_bar_pearson.png
+  Saved → /home/sean/文件/NYCU/114-2/Data Mining/FinalProject/plots/corr_heatmap_spearman.png
+  Saved → /home/sean/文件/NYCU/114-2/Data Mining/FinalProject/plots/corr_score_bar_spearman.png
+[2/7] Region time-series plots (5 regions) …
+  Saved → /home/sean/文件/NYCU/114-2/Data Mining/FinalProject/plots/timeseries_R1722.png
+  Saved → /home/sean/文件/NYCU/114-2/Data Mining/FinalProject/plots/timeseries_R1151.png
+  Saved → /home/sean/文件/NYCU/114-2/Data Mining/FinalProject/plots/timeseries_R2526.png
+  Saved → /home/sean/文件/NYCU/114-2/Data Mining/FinalProject/plots/timeseries_R2355.png
+  Saved → /home/sean/文件/NYCU/114-2/Data Mining/FinalProject/plots/timeseries_R2272.png
+[3/7] Score histogram …
+  Saved → /home/sean/文件/NYCU/114-2/Data Mining/FinalProject/plots/score_histogram.png
+[4/7] Feature boxplots …
+  Saved → /home/sean/文件/NYCU/114-2/Data Mining/FinalProject/plots/feature_boxplots.png
+[5/7] Zero-Inflation analysis (v9 new) …
+  Saved → /home/sean/文件/NYCU/114-2/Data Mining/FinalProject/plots/zero_inflation_analysis_v9.png
+[6/7] Cyclical feature coverage (v9 new) …
+  Saved → /home/sean/文件/NYCU/114-2/Data Mining/FinalProject/plots/cyclical_features_v9.png
+[7/7] Region target encoding stats (v9 new) …
+  Saved → /home/sean/文件/NYCU/114-2/Data Mining/FinalProject/plots/region_te_stats_v9.png
+
+[Validation] NaN counts per column (train_w):
+score             31472
+tmp_lag1w          2248
+tmp_lag2w          4496
+humidity_lag1w     2248
+humidity_lag2w     4496
+prec_lag1w         2248
+prec_lag2w         4496
+wind_lag1w         2248
+wind_lag2w         4496
+score_lag1w       31472
+score_lag2w       33720
+
+NaN in meteorological feature columns: 0
+
+✓ EDA pipeline v9 completed. All plots saved to: /home/sean/文件/NYCU/114-2/Data Mining/FinalProject/plots

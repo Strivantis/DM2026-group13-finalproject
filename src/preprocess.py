@@ -1,5 +1,5 @@
 """
-preprocess.py – Full Preprocessing Pipeline (v5)
+preprocess.py – Full Preprocessing Pipeline (v9)
 =================================================
 Functions
 ---------
@@ -12,6 +12,16 @@ Functions
   export_processed       : save to /data/processed/
 
   add_drought_index      : PET / deficit rolling features (used by dataset.py)
+
+Changes from v5
+---------------
+  v9: Cyclical Time Features
+    - `week_of_year` converted to cyclic sin/cos representation:
+        week_sin = sin(2π * week_of_year / 53.0)
+        week_cos = cos(2π * week_of_year / 53.0)
+    - Original `month` and `week_of_year` columns DROPPED from output.
+    - Cyclic encoding avoids disruptive linearity (week 1 ≠ week 53 discontinuity).
+    - Output now includes `week_sin`, `week_cos` in place of temporal scalars.
 
 Root Cause of v4 "Region Extinction Event"
 ------------------------------------------
@@ -184,6 +194,12 @@ def align_labels_strategy_a(df: pd.DataFrame) -> pd.DataFrame:
     score                   : mean of non-NaN daily scores in the week.
     week_end_date           : last date string in the group.
 
+    v9 changes:
+    - Computes week_sin = sin(2π * week_of_year / 53.0) and
+                week_cos = cos(2π * week_of_year / 53.0) for cyclical encoding.
+    - Drops original `month` and `week_of_year` columns from output to
+      prevent disruption of spatial-temporal relationships via linear encoding.
+
     All 2248 regions are always preserved (pure groupby, no secondary join).
     Uses custom 366-day calendar – safe for years > 9999 and Feb 29 every year.
     """
@@ -207,6 +223,11 @@ def align_labels_strategy_a(df: pd.DataFrame) -> pd.DataFrame:
     df["week_of_year"] = date_col.map(_woy).astype(np.int32)
     df["day_ordinal"]  = date_col.map(_ord).astype(np.float64)
 
+    # v9: Cyclical time features – encode week_of_year as sin/cos to
+    # preserve circular continuity (week 53 → week 1 is continuous in cyclic space)
+    df["week_sin"] = np.sin(2.0 * np.pi * df["week_of_year"] / 53.0).astype(np.float32)
+    df["week_cos"] = np.cos(2.0 * np.pi * df["week_of_year"] / 53.0).astype(np.float32)
+
     # Aggregation spec
     agg = {}
     for col in MET_COLS:
@@ -216,8 +237,13 @@ def align_labels_strategy_a(df: pd.DataFrame) -> pd.DataFrame:
         agg["score"] = "mean"   # mean of non-NaN scored days
 
     agg.update({
+        # Keep month/week_of_year in agg temporarily (needed for groupby consistency)
+        # They will be DROPPED after aggregation per v9 spec.
         "month":        "first",
         "week_of_year": "first",
+        # v9: cyclical features – constant within a week, "first" is exact
+        "week_sin":     "first",
+        "week_cos":     "first",
         "year":         "first",
         "day_ordinal":  "last",   # ordinal of last day in the week
         "date":         "last",   # → week_end_date
@@ -230,6 +256,10 @@ def align_labels_strategy_a(df: pd.DataFrame) -> pd.DataFrame:
     )
     weekly.rename(columns={"date": "week_end_date"}, inplace=True)
     weekly.sort_values(["region_id", "week_key"], inplace=True, ignore_index=True)
+
+    # v9: Drop linear calendar columns – replaced by cyclical week_sin / week_cos
+    weekly.drop(columns=["month", "week_of_year"], errors="ignore", inplace=True)
+
     return weekly
 
 
@@ -343,12 +373,12 @@ def add_drought_index(df: pd.DataFrame, is_train: bool = True) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 def main():
     import time
-    import math
     t0 = time.time()
 
     print("=" * 65)
-    print("Preprocessing Pipeline v5  (Region Extinction Fix)")
+    print("Preprocessing Pipeline v9  (Cyclical Time Features)")
     print("Custom 366-day calendar: Feb 29 every year, years > 9999 OK")
+    print("v9 changes: week_sin/week_cos replaces month/week_of_year")
     print("=" * 65)
 
     # 1. Load
@@ -365,6 +395,15 @@ def main():
     test_w  = aggregate_test_weekly(test_raw)
     print(f"  train_w: {train_w.shape}  regions: {train_w['region_id'].nunique()}")
     print(f"  test_w : {test_w.shape}   regions: {test_w['region_id'].nunique()}")
+
+    # Verify week_sin/week_cos are present and month/week_of_year are NOT
+    assert "week_sin" in train_w.columns, "FAIL: week_sin not in train_w"
+    assert "week_cos" in train_w.columns, "FAIL: week_cos not in train_w"
+    assert "month" not in train_w.columns, "FAIL: month still in train_w (should be dropped)"
+    assert "week_of_year" not in train_w.columns, "FAIL: week_of_year still in train_w"
+    print("  ✓ Cyclical features: week_sin ∈ "
+          f"[{train_w['week_sin'].min():.3f}, {train_w['week_sin'].max():.3f}]  "
+          f"week_cos ∈ [{train_w['week_cos'].min():.3f}, {train_w['week_cos'].max():.3f}]")
 
     # 3. Impute on weekly data (7× faster than on raw daily rows)
     print("Imputing met features (ffill/bfill per region) …")
@@ -404,10 +443,12 @@ def main():
     print(f"\n✓ VALIDATION PASSED: {n_train_regions} train regions, "
           f"{n_test_regions} test regions.")
 
-    score_mean = train_w["score"].mean()
-    print(f"  Score mean (weekly): {score_mean:.4f}")
-    bias = math.log((score_mean / 5.0) / (1.0 - score_mean / 5.0))
-    print(f"  Bias init (Sigmoid*5 head): {bias:.4f}")
+    # Zero-inflation check
+    score_vals = train_w["score"].dropna()
+    zero_frac  = (score_vals == 0.0).mean()
+    print(f"  Score mean (weekly): {score_vals.mean():.4f}")
+    print(f"  Zero-inflation: {zero_frac:.2%} of weekly scores == 0")
+    print(f"  [v9] Two-Stage architecture addresses this zero-inflation directly.")
 
     # 7. Export
     print("\nExporting processed data …")
