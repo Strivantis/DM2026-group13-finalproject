@@ -131,7 +131,7 @@ _scaler = GradScaler(device="cuda", enabled=USE_AMP)
 # Loss Criteria (module-level for reuse)
 # ---------------------------------------------------------------------------
 _l1_criterion  = nn.L1Loss()
-_bce_criterion = nn.BCELoss()
+_bce_criterion = nn.BCEWithLogitsLoss()
 
 
 # ---------------------------------------------------------------------------
@@ -170,7 +170,7 @@ def continuous_smooth_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Te
 
 def joint_loss(
     final_output: torch.Tensor,
-    prob_output: torch.Tensor,
+    logits_output: torch.Tensor,
     target: torch.Tensor,
 ) -> torch.Tensor:
     """
@@ -192,7 +192,7 @@ def joint_loss(
     """
     binary_target = (target > 0.0).float()  # (B, H); 1 = drought exists, 0 = no drought
     loss_b = continuous_smooth_loss(final_output, target)
-    loss_a = _bce_criterion(prob_output, binary_target)
+    loss_a = _bce_criterion(logits_output, binary_target)
     return loss_b + 0.5 * loss_a
 
 
@@ -212,8 +212,8 @@ def train_epoch(model, loader, optimizer, device):
         optimizer.zero_grad()
 
         with autocast(device_type=device.type, enabled=USE_AMP):
-            final_output, prob_output = model(X)
-            loss = joint_loss(final_output, prob_output, y)
+            final_output, logits_output = model(X)
+            loss = joint_loss(final_output, logits_output, y)
 
         _scaler.scale(loss).backward()
         _scaler.unscale_(optimizer)
