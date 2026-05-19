@@ -3,26 +3,30 @@ DroughtLSTM
 ===========
 Multi-output LSTM for direct 5-step drought score forecasting.
 
-Architecture (v11 – BiLSTM + Scale-Up + Learnable Horizon Embedding)
-----------------------------------------------------------------------
-  Problem (v10): The model lacked capacity (hidden=64, unidirectional) to
-    memorise extreme climate features; and the rigid linspace scalar horizon
-    encoding [0.2, 0.4, 0.6, 0.8, 1.0] could not learn non-uniform horizon
-    dynamics.
+Architecture (v14 – Gap-Replay + Target-Time Injection + Gap Embedding)
+------------------------------------------------------------------------
+  Problem (v12.2): The model was predicting distant futures blindly,
+    unaware of the target season or the actual calendar gap between the
+    last training week and the first prediction week.
 
-  Solution (v11):
-    1. BiLSTM Upgrade: bidirectional=True.  Every timestep now receives
-       context from BOTH past AND future within the input window, giving the
-       attention mechanism richer feature vectors.
-       LSTM output width doubles to hidden_size * 2 (D=2).
-    2. Massive Capacity Scale-up: hidden_size=256, num_layers=3.
-       With BiLSTM this yields an effective width of 512 per timestep.
-    3. Learnable Horizon Embedding: Replace the hardcoded linspace scalar
-       [0.2,0.4,0.6,0.8,1.0] with nn.Embedding(5, 32).  The embedding for
-       each horizon step i ∈ {0,1,2,3,4} is learned end-to-end, allowing the
-       model to discover complex, non-linear horizon-specific patterns.
-    4. Retained: Dynamic Loss Weighting (Burn-in), Manual LR Warm-up,
-       Temporal Attention, LayerNorm, Softplus severity, AMP-safe logits.
+  Solution (v14):
+    1. Target-Time Injection: Pass the `week_sin` and `week_cos` of the
+       5 future target weeks directly to each branch head. The model now
+       "knows" WHEN it is predicting, breaking seasonal blindness.
+    2. Gap Embedding (Learnable): Project the scalar gap_size (normalised
+       actual_gap / 100.0) through a Linear(1, 16) layer into a 16-dim
+       continuous embedding. Expanded to (B, 5, 16) and concatenated with
+       the context_vector and horizon_embed per horizon step.
+    3. New combined input to branch heads:
+         [context_vector(512) + horizon_embed(32) + target_time(2) + gap_embed(16)]
+         = 562 dim  →  Linear(562, 128)
+
+  Retained from v12:
+    4. BiLSTM: bidirectional=True. Hidden=256, Layers=3 → 512 effective.
+    5. Learnable Horizon Embedding: nn.Embedding(5, 32).
+    6. Temporal Attention: Linear(512→1) softmax over time dim.
+    7. Branch A (prob logits) + Branch B (severity), Dropout(0.2) heads.
+    8. Dynamic Loss Weighting (Burn-in), Manual LR Warm-up (train.py).
 
 Architecture Detail
 -------------------
@@ -33,31 +37,43 @@ Architecture Detail
              context_vector = sum(attn_weights * lstm_out, dim=1)  (B, 512)
           -> Dropout(0.4)
 
-          [v11 Learnable Horizon Embedding]
+          [v11 Learnable Horizon Embedding – retained]
           -> Expand context_vector: (B, 512) -> (B, 5, 512)
           -> horizon_ids = [0,1,2,3,4]  (long tensor)
           -> horizon_embed(horizon_ids): (5, 32) -> expand (B, 5, 32)
-          -> Concatenate along dim=-1 -> encoded_state: (B, 5, 512+32) = (B, 5, 544)
+
+          [v14 Target-Time Injection]
+          -> target_time input: (B, 5, 2)  week_sin/cos of 5 future weeks
+
+          [v14 Gap Embedding]
+          -> gap_size input: (B, 1)
+          -> gap_embed = Linear(1, 16) -> (B, 16) -> expand (B, 5, 16)
+
+          -> Concatenate along dim=-1:
+             [ctx(512) + h_emb(32) + target_time(2) + gap_emb(16)] = (B, 5, 562)
 
           -> Branch A (Drought Probability Logits) [NO Sigmoid layer]:
-               Linear(544, 128) -> GELU -> Dropout(0.2) -> Linear(128, 1)  [per horizon step]
+               Linear(562, 128) -> GELU -> Dropout(0.2) -> Linear(128, 1)  [per horizon step]
                Squeeze last dim -> (B, 5)  raw logits (unbounded)
                torch.sigmoid() applied inline in forward() only
 
           -> Branch B (Severity of Drought):
-               Linear(544, 128) -> GELU -> Dropout(0.2) -> Linear(128, 1) -> Softplus()
+               Linear(562, 128) -> GELU -> Dropout(0.2) -> Linear(128, 1) -> Softplus()
                Squeeze last dim -> (B, 5)  non-negative values
+
+  Forward Pass Signature (v14):
+    forward(self, x, target_time, gap_size)
 
   Forward Pass Outputs:
     1. final_output  = sigmoid(logits_output) * severity   (Expected Severity)
     2. logits_output = Branch_A raw logits  (passed to BCEWithLogitsLoss)
 
-  v9 AMP Fix (retained):
+  AMP Fix (retained from v9):
     BCELoss + Sigmoid is UNSAFE under torch.autocast (float16 underflow / NaN).
     Solution: Return raw logits from Branch A; use BCEWithLogitsLoss in train.py.
-    BCEWithLogitsLoss fuses sigmoid+BCE in a numerically stable kernel safe for AMP.
+    BCEWithLogitsLoss fuses sigmoid+BCE in numerically stable kernel safe for AMP.
 
-  Joint Loss (defined in train.py — v10 Dynamic Weighting, retained in v11):
+  Joint Loss (defined in train.py — v10 Dynamic Weighting, retained in v14):
     Epochs  1–20 (Burn-in): Loss = Loss_B only
     Epoch  21+:             Loss = Loss_B + 0.1 * Loss_A
     Loss_A = BCEWithLogitsLoss(logits_output, binary_target)
@@ -65,30 +81,14 @@ Architecture Detail
 
   Early Stopping: monitors pure L1Loss(final_output, target) only -> Kaggle-aligned
 
-Changes from v10
+Changes from v12
 ----------------
-  - CHANGED : LSTM bidirectional=True.  Attention and branch heads updated to
-              accept hidden_size * 2 (doubled width).
-  - SCALED  : hidden_size default 64 -> 256, num_layers default 2 -> 3.
-  - REPLACED: Hardcoded linspace horizon scalar ([0.2,...,1.0]) replaced with
-              nn.Embedding(num_embeddings=5, embedding_dim=32) -- fully learnable.
-  - CHANGED : branch_in = hidden_size * 2 + 32  (was hidden_size + 1).
-  - UPDATED : architecture_summary() and v11 Shape Debug print.
-  - RETAINED: Dynamic Loss Weighting (Burn-in), Manual LR Warm-up (train.py).
-
-Changes from v9 (retained from v10)
-------------------------------------
-  - ADDED  : Horizon Encoding before branch heads (v10 temporal awareness).
-  - Dynamic Loss Weighting (Burn-in) implementation in train.py.
-  - Manual LR Warm-up implementation in train.py.
-
-Changes from v8 (retained from v9/v10)
----------------------------------------
-  - FIXED   : AMP crash: Sigmoid() removed from Branch A head.
-               torch.sigmoid() applied dynamically in forward() instead.
-               BCELoss -> BCEWithLogitsLoss in train.py (AMP-safe fused kernel).
-  - Temporal Attention mechanism RETAINED from v8.
-  - LayerNorm on inputs RETAINED from v7.
+  - CHANGED : forward() signature now accepts `target_time` (B,5,2) and
+              `gap_size` (B,1) in addition to `x` (B,26,37).
+  - ADDED   : self.gap_embed = nn.Linear(1, 16)  in __init__.
+  - CHANGED : branch_in changed 544 -> 562  (512+32+2+16).
+  - UPDATED : architecture_summary() for v14.
+  - RETAINED: All v12 training dynamics (burn-in, warm-up, AMP, etc.)
 """
 
 import torch
@@ -150,9 +150,18 @@ class DroughtLSTM(nn.Module):
         # that is learned end-to-end, replacing the hardcoded linspace scalar.
         self.horizon_embed = nn.Embedding(num_embeddings=5, embedding_dim=32)
 
-        # After concatenating context_vector (hidden*2) + horizon embedding (32):
-        # branch_in = hidden_size * 2 + 32
-        branch_in = lstm_out_size + 32
+        # --- v14: Learnable Gap Embedding ---
+        # Project the scalar normalised gap (B,1) into a 16-dim continuous space.
+        # Allows the model to learn how different calendar gaps affect predictions.
+        self.gap_embed = nn.Linear(1, 16)
+
+        # After concatenating:
+        #   context_vector (hidden*2=512)
+        #   + horizon embedding (32)
+        #   + target_time (2)    [v14: week_sin/cos of target weeks]
+        #   + gap_embedded (16)  [v14: learnable gap embedding]
+        # branch_in = 512 + 32 + 2 + 16 = 562
+        branch_in = lstm_out_size + 32 + 2 + 16
 
         # --- Branch A: Drought Probability Logits (v9.1: NO Sigmoid layer) ---
         # Outputs raw logits so BCEWithLogitsLoss in train.py can operate
@@ -177,24 +186,31 @@ class DroughtLSTM(nn.Module):
         )
         self.softplus = nn.Softplus(beta=1)
 
-        # --- v11: Shape debug flag (prints once on first forward pass) ---
+        # --- v14: Shape debug flag (prints once on first forward pass) ---
         self._printed_shape = False
 
     # -----------------------------------------------------------------------
-    def forward(self, x: torch.Tensor):
+    def forward(
+        self,
+        x: torch.Tensor,
+        target_time: torch.Tensor,
+        gap_size: torch.Tensor,
+    ):
         """
         Parameters
         ----------
-        x : (batch, seq_len, input_size)
+        x           : (B, seq_len, input_size)  -- input feature window
+        target_time : (B, 5, 2)                 -- [v14] week_sin/cos of future target weeks
+        gap_size    : (B, 1)                    -- [v14] normalised actual_gap (gap / 100.0)
 
         Returns
         -------
-        final_output : (batch, horizon)
+        final_output : (B, horizon)
             Element-wise product of sigmoid(logits_output) x severity_output.
             Represents Expected Severity = P(drought) x E[severity | drought].
             Caller should np.clip(out, 0, 5) before writing submission.csv.
 
-        logits_output : (batch, horizon)
+        logits_output : (B, horizon)
             Raw logits of Branch A (pre-sigmoid).
             Passed to BCEWithLogitsLoss in train.py.
             BCEWithLogitsLoss internally applies sigmoid + BCE in a numerically
@@ -232,9 +248,18 @@ class DroughtLSTM(nn.Module):
         h_emb = self.horizon_embed(horizon_ids)              # (5, 32)
         h_emb = h_emb.unsqueeze(0).expand(B, self.horizon, 32)  # (B, 5, 32)
 
-        # Step 4: Concatenate along last dim -> (B, 5, hidden*2 + 32)
-        encoded_state = torch.cat([ctx_expanded, h_emb], dim=-1)
-        # (B, 5, hidden*2 + 32)
+        # --- v14: Gap Embedding ---
+        # Project scalar gap_size (B, 1) -> (B, 16) -> expand to (B, 5, 16)
+        gap_embedded = self.gap_embed(gap_size)              # (B, 16)
+        gap_expanded = gap_embedded.unsqueeze(1).expand(B, self.horizon, 16)
+        # (B, 5, 16)
+
+        # target_time is already (B, 5, 2) – passed directly
+
+        # Step 4: Concatenate all along last dim -> (B, 5, 562)
+        #   [ctx(512) + h_emb(32) + target_time(2) + gap_emb(16)] = 562
+        encoded_state = torch.cat([ctx_expanded, h_emb, target_time, gap_expanded], dim=-1)
+        # (B, 5, 562)
 
         # Branch A: raw logits for drought probability (v9.1: no Sigmoid layer)
         # encoded_state: (B, 5, branch_in) -> head_prob produces (B, 5, 1) -> squeeze (B, 5)
@@ -251,9 +276,9 @@ class DroughtLSTM(nn.Module):
         # train.py receives raw logits for numerically stable AMP-safe training.
         final_output = torch.sigmoid(logits_output) * severity        # (B, H)
 
-        # v12: Shape debug – print once on first forward call
+        # v14: Shape debug – print once on first forward call
         if not self._printed_shape:
-            print(f"  [v12 Shape Debug] lstm_out: {tuple(lstm_out.shape)}  "
+            print(f"  [v14 Shape Debug] lstm_out: {tuple(lstm_out.shape)}  "
                   f"|  encoded_state: {tuple(encoded_state.shape)}  "
                   f"|  final_output: {tuple(final_output.shape)}")
             self._printed_shape = True
@@ -266,10 +291,10 @@ class DroughtLSTM(nn.Module):
 
     def architecture_summary(self, input_size: int) -> str:
         lstm_out_size = self.hidden_size * 2
-        branch_in     = lstm_out_size + 32
+        branch_in     = lstm_out_size + 32 + 2 + 16   # 512+32+2+16=562
         lines = [
-            "DroughtLSTM Architecture (v12 – Bottleneck Relief + Dropout Heads)",
-            "=" * 85,
+            "DroughtLSTM Architecture (v14 – Gap-Replay + Target-Time Injection + Gap Embedding)",
+            "=" * 90,
             f"  Input size   : {input_size}  (features per week, 37 total)",
             f"  LayerNorm    : LayerNorm({input_size})  [v7: concept-drift stabiliser]",
             f"  LSTM layers  : {self.num_layers}  (BiLSTM, bidirectional=True)  [v11]",
@@ -280,26 +305,32 @@ class DroughtLSTM(nn.Module):
             "  [v11] Learnable Horizon Embedding:",
             f"     context_vector (B, {lstm_out_size}) -> expand (B, 5, {lstm_out_size})",
             "     horizon_ids [0,1,2,3,4] -> Embedding(5,32) -> (B, 5, 32)",
-            f"     cat(dim=-1) -> encoded_state (B, 5, {branch_in})",
-            f"  Branch A     : Linear({branch_in}->128) -> GELU -> Dropout(0.2) -> Linear(128->1) [per step, NO Sigmoid]  [v12]",
+            "  [v14] Target-Time Injection:",
+            "     target_time input (B, 5, 2)  -- week_sin/cos of 5 future target weeks",
+            "  [v14] Gap Embedding:",
+            "     gap_size input (B, 1)  -- normalised actual_gap (gap / 100.0)",
+            "     gap_embed = Linear(1, 16) -> (B, 16) -> expand (B, 5, 16)",
+            f"  Concatenation: [ctx({lstm_out_size}) + h_emb(32) + target_time(2) + gap_emb(16)]",
+            f"     -> encoded_state (B, 5, {branch_in})",
+            f"  Branch A     : Linear({branch_in}->128) -> GELU -> Dropout(0.2) -> Linear(128->1) [per step, NO Sigmoid]  [v12+v14]",
             "                 squeeze(-1) -> (B,5);  sigmoid() applied inline in forward()",
-            f"  Branch B     : Linear({branch_in}->128) -> GELU -> Dropout(0.2) -> Linear(128->1) -> Softplus()  [v12]",
+            f"  Branch B     : Linear({branch_in}->128) -> GELU -> Dropout(0.2) -> Linear(128->1) -> Softplus()  [v12+v14]",
             "                 squeeze(-1) -> (B,5) >= 0  -- Severity of Drought",
             "  Final Output : sigmoid(logits_A) x Branch_B  (Expected Severity)",
             "  Returns      : (final_output, logits_output) -- two tensors",
             "  Inference    : np.clip(final_output, 0, 5) applied in train.py",
-            "-" * 85,
-            "  [v12] Dynamic Loss Weighting (Burn-in):",
+            "-" * 90,
+            "  [v14] Dynamic Loss Weighting (Burn-in):",
             "     Epochs  1-20 : Loss = Loss_B  ONLY  (regression burn-in)",
             "     Epoch  21+   : Loss = Loss_B + 0.1 * Loss_A  (BCE introduced)",
-            "  [v12] Manual LR Warm-up (Batch=2048, Peak LR=2e-3):",
-            "     Epochs  1-5  : LR linearly ramps 1e-5 -> 2e-3  [v12: scaled 4x]",
+            "  [v14] Manual LR Warm-up (Peak LR=1e-3):",
+            "     Epochs  1-5  : LR linearly ramps 1e-5 -> 1e-3",
             "     Epoch   6+   : ReduceLROnPlateau takes over",
             "  Loss_A       : BCEWithLogitsLoss(logits_output, binary_target)",
             "                 (AMP-safe: fused sigmoid+BCE avoids float16 underflow)",
             "  Loss_B       : Continuous Smooth L1(final_output, y)   [weight 1.0]",
             "  Early Stop   : pure L1Loss(final_output, y)  [Kaggle MAE aligned]",
-            "-" * 85,
+            "-" * 90,
             f"  Total params : {self.count_parameters():,}",
         ]
         return "\n".join(lines)
