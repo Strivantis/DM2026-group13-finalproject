@@ -1,0 +1,299 @@
+================================================================================
+Drought Forecasting Pipeline  v15
+Parallel Dual-Stream (CNN+BiLSTM) + Single-Fold Data-Maximizing Paradigm
+================================================================================
+Architecture : Parallel Dual-Stream CNN+BiLSTM MTL  [v15]
+  == LSTM Stream ==
+  BiLSTM     : hidden_size=256/dir -> 512 effective  [v11]
+  Layers     : 3  [v11]
+  lstm_context (B,512) -> expand (B,5,512)
+  == CNN Stream (v15: NEW) ==
+  Conv1d     : Conv1d(37->128, k=3, pad=1) + GELU -> (B,128,26)
+  GlobalPool : AdaptiveAvgPool1d(1) -> (B,128,1) -> squeeze -> (B,128)
+  cnn_context (B,128) -> expand (B,5,128)
+  == Fusion ==
+  horizon_ids [0-4] -> Embedding(5,32) -> (B,5,32)  [v11: learnable]
+  target_time (B,5,2) -- week_sin/cos of 5 future target weeks  [v14]
+  gap_size (B,1) -> Linear(1,16) -> (B,16) -> expand (B,5,16)  [v14]
+  encoded_state (B,5,690)  [v15: 512+128+32+2+16=690]
+  Branch A   : Linear(690->128) -> GELU -> Dropout(0.2) -> Linear(128->1)  [v15]
+               P(drought) logits -- sigmoid() inline in forward()
+  Branch B   : Linear(690->128) -> GELU -> Dropout(0.2) -> Linear(128->1)  [v15]
+               Severity >= 0  via Softplus()
+  Output     : final = sigmoid(logits_A) x Branch_B  (Expected Severity)
+CV Strategy  : [v15] Single-Fold Data-Maximizing (100% regions, last 5 wks as Val_Y)
+  WINDOW_SIZE: 26 weeks  [v11: was 13]
+  actual_gap : computed from real calendar distance (train last -> test first)
+  Val_Y      : last 5 rows per region (fixed, no rotation)
+  Train      : ALL historical sliding windows ending before Val_Y (data max)
+  Scaler     : StandardScaler fit on entire maximized training split  [v15]
+  Fallback   : ZeroDataWaste (shrink gap if history too short)
+Loss         : [v15] Dynamic Burn-in Schedule (unchanged from v14)
+  Epoch 1-20 : Loss = Loss_B ONLY  (regression burn-in)
+  Epoch 21+  : Loss = Loss_B + 0.1 * Loss_A  (BCE introduced lightly)
+  Loss_B     : Continuous Smooth L1  W_i = 1.0 + (y_i/5)^2 * 3.0
+  Loss_A     : BCEWithLogitsLoss(logits_output, binary_target)
+LR Schedule  : [v15] Manual Warm-up Epochs 1-5: 1e-5 -> 1e-3 (linear)
+               Epoch 6+: ReduceLROnPlateau (factor=0.5, patience=10)
+Early Stop   : pure L1Loss(final_output, y)  [Kaggle MAE aligned]
+Pooling      : Temporal Attention  [v8: retained; v11: updated for hidden*2]
+LayerNorm    : LayerNorm(input_size) before LSTM  [v7: retained]
+Features     : 37  (11 weather + 2 cyclic + 9 rolling + 8 lag + 5 drought + 2 TE)
+  Cyclic     : week_sin, week_cos  [v9: retained]
+  TE         : region_mean_score, region_zero_prob  [v9: retained]
+Scaler       : Single StandardScaler fit on maximized train split  [v15]
+Checkpoint   : single_fold_best.pt  [v15: replaces fold_k_best.pt]
+Inference    : Single model (no fold ensembling)  [v15]
+OOM Guard    : try-except RuntimeError -> fallback BATCH_SIZE=256  [v12]
+Epochs       : 200  |  Patience: 35
+Seed         : 42  (cuDNN deterministic=True)
+BatchSize    : 512  (OOM fallback: 256)
+
+Loading processed data ...
+  train raw: (1789408, 41)  |  test raw: (30199, 38)
+  train regions: 2248  |  test regions: 2248
+
+[v9 Feature Validation]
+  v week_sin, week_cos present  |  month, week_of_year correctly absent.
+
+[Data Leakage Check]
+  v No raw-score autoregressive features in FEATURE_COLS.
+  FEATURE_COLS (37): ['prec', 'surf_pre', 'humidity', 'tmp', 'tmp_max', 'tmp_min', 'tmp_range', 'wind', 'wind_max', 'wind_min', 'wind_range', 'week_sin', 'week_cos', 'prec_roll_sum_4w', 'tmp_roll_mean_4w', 'humidity_roll_mean_4w', 'prec_roll_sum_8w', 'tmp_roll_mean_8w', 'humidity_roll_mean_8w', 'prec_roll_sum_13w', 'tmp_roll_mean_13w', 'humidity_roll_mean_13w', 'tmp_lag1w', 'humidity_lag1w', 'prec_lag1w', 'wind_lag1w', 'tmp_lag2w', 'humidity_lag2w', 'prec_lag2w', 'wind_lag2w', 'pet', 'deficit', 'deficit_roll_cum_4w', 'deficit_roll_cum_8w', 'deficit_roll_cum_13w', 'region_mean_score', 'region_zero_prob']
+
+Refining features (drought proxy index + log1p precipitation) ...
+  train after refinement: (1784912, 43)  |  test: (30199, 40)
+  [NaN drop] Removed 29,224 rows with NaN score from train_df.
+
+[Training Target Distribution]
+  mean=0.8354  std=1.2613  min=0.00  max=5.00
+  [v9] Zero-inflation: 59.64% of training scores == 0.0
+  score > 1.0: 23.10%  [405,493 samples]
+  score > 2.0: 12.50%  [219,470 samples]
+  score > 3.0: 5.76%  [101,188 samples]
+  score > 4.0: 1.82%  [31,939 samples]
+
+[v15] Computing per-region actual deployment gaps ...
+  Regions with gap computed : 2248
+  Gap stats: min=1  p25=32  median=65  p75=82  max=88  mean=57.1
+  Top-5 most common gaps: [(87, 116), (88, 111), (31, 96), (85, 76), (82, 72)]
+
+[v9] Computing full-train Target Encoding statistics ...
+  Regions with TE stats : 2248
+  Global region_mean_score : 0.8354
+  Global region_zero_prob  : 0.5964
+  v region_mean_score, region_zero_prob added to train_df (full-train stats)
+
+[v15] Determining feature columns ...
+  Input features (37): ['prec', 'surf_pre', 'humidity', 'tmp', 'tmp_max', 'tmp_min', 'tmp_range', 'wind', 'wind_max', 'wind_min', 'wind_range', 'week_sin', 'week_cos', 'prec_roll_sum_4w', 'tmp_roll_mean_4w', 'humidity_roll_mean_4w', 'prec_roll_sum_8w', 'tmp_roll_mean_8w', 'humidity_roll_mean_8w', 'prec_roll_sum_13w', 'tmp_roll_mean_13w', 'humidity_roll_mean_13w', 'tmp_lag1w', 'humidity_lag1w', 'prec_lag1w', 'wind_lag1w', 'tmp_lag2w', 'humidity_lag2w', 'prec_lag2w', 'wind_lag2w', 'pet', 'deficit', 'deficit_roll_cum_4w', 'deficit_roll_cum_8w', 'deficit_roll_cum_13w', 'region_mean_score', 'region_zero_prob']
+
+================================================================================
+Single-Fold Data-Maximizing Training  [v15]
+[v15] Strategy: 100% of regions → Val_Y = last 5 weeks (fixed)
+[v15] Train    : ALL historical sliding windows before Val_Y (data-maximizing)
+[v15] Relative Gap-Replay: actual_gap replaces fixed GAP_WEEKS=4
+[v15] Window Size: 26 weeks
+Train loss  : v15 Burn-in: epochs 1-20 = Smooth L1 only; 21+ = Smooth L1 + 0.1*BCE
+Val metric  : pure MAE  (unweighted, Kaggle-aligned)
+TE strategy : full-train stats (leakage-free TE inserted before split)
+Scaler      : Single StandardScaler fit on maximized train features  [v15]
+Checkpoint  : single_fold_best.pt  [v15: replaces fold_k_best.pt]
+AMP : True  |  batch_size=512 (OOM fallback: 256)  |  num_workers=8
+================================================================================
+
+  [v15 Single-Fold] Raw train groups: 2248  |  Raw val groups: 2248
+
+  [v15 Scaler] Fitting StandardScaler on maximized single-fold train features ...
+  [v15 Scaler] Fit on 1,755,688 rows (37 features)
+  Train sequences: 1,548,748  |  Val sequences: 2,248
+
+  [v15 Tensor Shape Verification] First Batch:
+    X shape          : (512, 26, 37)  ->  (Batch, Seq=26, Features=37)
+    y shape          : (512, 5)  ->  (Batch, Horizon=5)
+    target_time shape: (512, 5, 2)  ->  (Batch, Horizon=5, 2=week_sin/cos)  [v14]
+    gap_size shape   : (512, 1)  ->  (Batch, 1=normalised_gap)  [v14]
+    Expected: Features=37, Window=26, Horizon=5
+    v Shape assertion PASSED (v15: target_time and gap_size verified).
+
+=================================================================
+ Epoch   TrainLoss     ValMAE         LR
+=================================================================
+     1       0.9197      1.0191    1.00e-05 *
+     2       0.6655      0.6348    2.58e-04 *
+     3       0.4278      0.4687    5.05e-04 *
+     4       0.2523      0.4301    7.53e-04 *
+     5       0.1949      0.3211    1.00e-03 *
+     6       0.1600      0.3704    1.00e-03
+     7       0.1407      0.3061    1.00e-03 *
+     8       0.1276      0.3239    1.00e-03
+     9       0.1179      0.2949    1.00e-03 *
+    10       0.1104      0.2729    1.00e-03 *
+    11       0.1051      0.2877    1.00e-03
+    12       0.0999      0.2681    1.00e-03 *
+    13       0.0964      0.2444    1.00e-03 *
+    14       0.0934      0.2787    1.00e-03
+    15       0.0908      0.2809    1.00e-03
+    16       0.0883      0.2410    1.00e-03 *
+    17       0.0863      0.2443    1.00e-03
+    18       0.0842      0.2304    1.00e-03 *
+    19       0.0826      0.2588    1.00e-03
+    20       0.0809      0.2411    1.00e-03
+    21       0.1006      0.2338    1.00e-03
+    22       0.0969      0.2405    1.00e-03
+    23       0.0947      0.2271    1.00e-03 *
+    24       0.0930      0.2212    1.00e-03 *
+    25       0.0911      0.2256    1.00e-03
+    26       0.0899      0.2132    1.00e-03 *
+    27       0.0889      0.2297    1.00e-03
+    28       0.0877      0.2269    1.00e-03
+    29       0.0870      0.2094    1.00e-03 *
+    30       0.0856      0.2197    1.00e-03
+    31       0.0847      0.1990    1.00e-03 *
+    32       0.0839      0.2258    1.00e-03
+    33       0.0834      0.2264    1.00e-03
+    34       0.0826      0.2348    1.00e-03
+    35       0.0815      0.2298    1.00e-03
+    36       0.0811      0.2220    1.00e-03
+    37       0.0804      0.2099    1.00e-03
+    38       0.0802      0.2220    1.00e-03
+    39       0.0792      0.2241    1.00e-03
+    40       0.0787      0.2276    1.00e-03
+    41       0.0782      0.2052    1.00e-03
+    42       0.0776      0.2182    5.00e-04
+    43       0.0689      0.2081    5.00e-04
+    44       0.0669      0.2102    5.00e-04
+    45       0.0659      0.2029    5.00e-04
+    46       0.0652      0.2137    5.00e-04
+    47       0.0645      0.2000    5.00e-04
+    48       0.0639      0.2142    5.00e-04
+    49       0.0636      0.2168    5.00e-04
+    50       0.0631      0.2123    5.00e-04
+    51       0.0627      0.2185    5.00e-04
+    52       0.0624      0.2133    5.00e-04
+    53       0.0620      0.2025    2.50e-04
+    54       0.0579      0.2007    2.50e-04
+    55       0.0568      0.2079    2.50e-04
+    56       0.0563      0.2038    2.50e-04
+    57       0.0560      0.2052    2.50e-04
+    58       0.0556      0.2112    2.50e-04
+    59       0.0553      0.2099    2.50e-04
+    60       0.0550      0.2060    2.50e-04
+    61       0.0548      0.2110    2.50e-04
+    62       0.0545      0.2089    2.50e-04
+    63       0.0543      0.2096    2.50e-04
+    64       0.0541      0.2071    1.25e-04
+    65       0.0521      0.2043    1.25e-04
+    66       0.0516      0.2049    1.25e-04
+
+  Early stopping at epoch 66 (no MAE improvement for 35 epochs).
+=================================================================
+  Best Val MAE: 0.1990  (epoch 31)
+
+  [v15 Single-Fold] Best Val MAE : 0.1990
+  [v15 Single-Fold] Best Epoch  : 31
+  Checkpoint saved -> /home/sean/文件/NYCU/114-2/Data Mining/FinalProject/models/single_fold_best.pt
+
+  [v15 Single-Fold Prediction Percentiles -- best checkpoint]
+  [Prediction Diagnostics] n=11,240
+    p50=0.0036  p90=1.4605  p95=2.1473  p99=3.8344  max=4.9321
+    v p99 >= 2.0 -- model is predicting away from the mean.
+
+================================================================================
+Single-Fold Best Val MAE   : 0.1990
+Single-Fold Best Epoch     : 31
+Val Prediction Percentiles :  p50=0.004  p95=2.147  p99=3.834  max=4.932
+================================================================================
+
+[v15] Saving single StandardScaler (fit on maximized train split) ...
+  Scaler saved -> /home/sean/文件/NYCU/114-2/Data Mining/FinalProject/models/scaler.pkl
+
+[v9] Preparing test_df with full-train Target Encoding ...
+  test_df after TE injection: (30199, 42)
+  v region_mean_score, region_zero_prob added to test_df (full-train stats)
+
+================================================================================
+Single-Model Inference  [v15 – single_fold_best.pt]
+  Checkpoint: /home/sean/文件/NYCU/114-2/Data Mining/FinalProject/models/single_fold_best.pt
+  Scaler: single_fold_best scaler (fit on maximized train split)  [v15]
+  [v14] target_time: week_sin/cos of 5 test target weeks
+  [v14] gap_size: per-region actual_gap / 100.0
+  Safety clip: np.clip(pred, 0.0, 5.0)
+================================================================================
+
+DroughtLSTM Architecture (v15 – Parallel Dual-Stream CNN+BiLSTM + Single-Fold)
+==========================================================================================
+  Input size   : 37  (features per week, 37 total)
+
+  == LSTM Stream ==
+  LayerNorm    : LayerNorm(37)  [v7: concept-drift stabiliser]
+  BiLSTM       : hidden=256/dir → 512 effective  (layers=3, bidirectional=True)  [v11]
+  Dropout      : 0.4
+  Attn         : Linear(512→1); softmax over time; weighted sum
+  lstm_context : (B, 512) → expand (B, 5, 512)
+
+  == CNN Stream (v15: NEW) ==
+  Transpose    : (B, 26, 37) → (B, 37, 26)
+  Conv1d       : Conv1d(37→128, k=3, pad=1) + GELU → (B, 128, 26)
+  GlobalPool   : AdaptiveAvgPool1d(1) → (B, 128, 1) → squeeze → (B, 128)
+  cnn_context  : (B, 128) → expand (B, 5, 128)
+
+  == Embeddings ==
+  [v11] Learnable Horizon Embedding:
+     horizon_ids [0,1,2,3,4] → Embedding(5,32) → (B, 5, 32)
+  [v14] Target-Time Injection:
+     target_time input (B, 5, 2)  -- week_sin/cos of 5 future target weeks
+  [v14] Gap Embedding:
+     gap_size input (B, 1)  -- normalised actual_gap / 100.0
+     gap_embed = Linear(1, 16) → (B, 16) → expand (B, 5, 16)
+
+  == Feature Fusion (v15) ==
+  Concat: [lstm(512) + cnn(128) + h_emb(32) + tt(2) + gap(16)]
+     → encoded_state (B, 5, 690)
+
+  Branch A : Linear(690→128) → GELU → Dropout(0.2) → Linear(128→1)  [NO Sigmoid]
+             squeeze(-1) → (B,5); sigmoid() applied inline in forward()
+  Branch B : Linear(690→128) → GELU → Dropout(0.2) → Linear(128→1) → Softplus
+             squeeze(-1) → (B,5) >= 0  -- Severity of Drought
+  Final    : sigmoid(logitsA) × Branch_B  (Expected Severity)
+  Returns  : (final_output, logits_output) -- two tensors
+  Inference: np.clip(final_output, 0, 5) applied in train.py
+------------------------------------------------------------------------------------------
+  [v15] Single-Fold Paradigm:
+     Val_Y = last 5 weeks of each region (100% regions, fixed)
+     Train = ALL available historical sliding windows (data-maximizing)
+  [v14/v15] Dynamic Loss Weighting (Burn-in):
+     Epochs  1-20 : Loss = Loss_B ONLY  (regression burn-in)
+     Epoch  21+   : Loss = Loss_B + 0.1 * Loss_A  (BCE introduced)
+  [v14/v15] Manual LR Warm-up (Peak LR=1e-3):
+     Epochs  1-5  : LR linearly ramps 1e-5 → 1e-3
+     Epoch   6+   : ReduceLROnPlateau takes over
+  Loss_A       : BCEWithLogitsLoss(logits_output, binary_target)
+  Loss_B       : Continuous Smooth L1  W = 1.0 + (y/5)^2 * 3.0
+  Early Stop   : pure L1Loss(final_output, y)  [Kaggle MAE aligned]
+  Checkpoint   : single_fold_best.pt
+------------------------------------------------------------------------------------------
+  Total params : 3,950,349
+
+  Inference complete. Regions predicted: 2248
+
+[Submission Prediction Diagnostics]
+  n=11,240  mean=0.5971  std=0.7530
+  p50=0.2576  p90=1.6917  p95=2.1387  p99=3.1058  max=4.4415
+  v Submission p99 >= 2.0 -- model collapse is BROKEN.
+  Fraction of near-zero predictions (<0.05): 32.17%
+
+Formatting submission.csv ...
+  v Submission assertion passed: 2248 rows, 6 columns.
+  v Train/test regions match (2248).
+  submission.csv -> /home/sean/文件/NYCU/114-2/Data Mining/FinalProject/submission.csv
+  Rows (excl. header): 2248
+  Columns: ['region_id', 'pred_week1', 'pred_week2', 'pred_week3', 'pred_week4', 'pred_week5']
+
+  Preview:
+region_id  pred_week1  pred_week2  pred_week3  pred_week4  pred_week5
+       R1    1.490665    1.301984    1.098818    0.900530    0.706121
+    R1001    0.729131    0.758979    0.774336    0.778473    0.835000
+    R1002    1.337435    1.013178    0.636867    0.381242    0.234649
+    R1005    0.339278    0.414788    0.475785    0.503192    0.531799
+    R1006    1.026787    1.069077    1.083929    1.069806    1.072713
+
+Total elapsed: 3684.0s

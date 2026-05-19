@@ -44,6 +44,17 @@ v14 Changes
     gap_size    : (1,)    actual_gap / 100.0  (normalised scalar)
 - build_gap_replay_folds() replaces build_walk_forward_folds().
 - build_full_train_groups() unchanged (used for final model training).
+
+v15 Changes
+-----------
+- PARADIGM SHIFT 2: 3-Fold Walk-Forward CV abolished in favour of a
+  Single-Fold data-maximizing strategy (build_single_fold).
+  - Val_Y = last 5 weeks of each region's historical data (fixed, no rotation).
+  - Train set uses ALL available sliding windows ending strictly before
+    Val_Y (no data left on the table from folding).
+  - Scaler is fit on the entire maximized training split.
+- build_gap_replay_folds() and build_walk_forward_folds() are retained
+  as backward-compat stubs but are no longer called by train.py.
 """
 
 import numpy as np
@@ -319,7 +330,98 @@ def compute_actual_gaps(train_df: pd.DataFrame, test_df: pd.DataFrame) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Helper – Walk-Forward Gap-Replay Fold builder  (v14)
+# v15: Single-Fold Data-Maximizing Split builder
+# ---------------------------------------------------------------------------
+def build_single_fold(
+    df: pd.DataFrame,
+    actual_gaps: dict,
+):
+    """
+    v15 Single-Fold Data-Maximizing CV.
+
+    For each region:
+      - Val_Y  = last 5 rows (HORIZON) of historical train data (fixed).
+      - Val_X  (length WINDOW_SIZE) ends exactly `actual_gap` weeks before
+        Val_Y starts.
+      - Train (X, Y) pairs use ALL available sliding windows; each pair
+        enforces the same `actual_gap` distance between End_of_X and
+        Start_of_Y, and the target window must end strictly before Val_Y
+        begins (no leakage into validation).
+      - Zero Data Waste Fallback: if history is too short for
+        `WINDOW_SIZE + actual_gap + HORIZON`, shrink the gap dynamically
+        to the largest value that yields ≥1 pair.
+
+    Returns
+    -------
+    train_groups : list of (group_df, i_min, i_max, effective_gap)
+    val_groups   : list of (group_df, val_i, val_i, effective_gap)
+    """
+    train_groups = []
+    val_groups   = []
+
+    for _, group in df.groupby("region_id"):
+        group = group.reset_index(drop=True)
+        n     = len(group)
+        rid   = group["region_id"].iloc[0]
+
+        # Retrieve per-region actual gap; fall back to global default
+        actual_gap = actual_gaps.get(rid, GAP_WEEKS)
+
+        # Val_Y = last HORIZON rows: indices [n-HORIZON : n]
+        val_y_start = n - HORIZON  # inclusive index of first val target row
+
+        # --------------------------------------------------------------------
+        # Zero Data Waste: shrink gap if needed
+        # Minimum requirement: WINDOW_SIZE + actual_gap + HORIZON <= n
+        #   → actual_gap <= n - WINDOW_SIZE - HORIZON
+        # --------------------------------------------------------------------
+        min_required = WINDOW_SIZE + actual_gap + HORIZON
+        if min_required > n:
+            max_feasible_gap = n - WINDOW_SIZE - HORIZON
+            if max_feasible_gap < 1:
+                # Region too short even for minimal window
+                continue
+            effective_gap = max_feasible_gap
+        else:
+            effective_gap = actual_gap
+
+        # --------------------------------------------------------------------
+        # Val split: Val_X ends `effective_gap` weeks before val_y_start
+        # Val_X window: rows [val_x_start : val_x_end]  len=WINDOW_SIZE
+        #   val_x_end   = val_y_start - effective_gap   (exclusive)
+        #   val_x_start = val_x_end - WINDOW_SIZE       (inclusive)
+        # --------------------------------------------------------------------
+        val_x_end   = val_y_start - effective_gap
+        val_x_start = val_x_end - WINDOW_SIZE
+
+        if val_x_start < 0 or val_x_end < WINDOW_SIZE:
+            # Not enough history for a valid val window
+            continue
+
+        # Verify target fits within group
+        val_tgt_start = val_x_end + effective_gap   # == val_y_start
+        val_tgt_end   = val_tgt_start + HORIZON
+        if val_tgt_end > n:
+            continue
+
+        val_groups.append((group, val_x_start, val_x_start, effective_gap))
+
+        # --------------------------------------------------------------------
+        # Train: ALL sliding windows with target strictly before val_y_start.
+        # Each (X, Y) pair: X=[i : i+WINDOW_SIZE], Y=[i+W+gap : i+W+gap+H]
+        # Constraint: end of Y must be <= val_y_start
+        #   i.e.  i + WINDOW_SIZE + effective_gap + HORIZON <= val_y_start
+        #         i <= val_y_start - WINDOW_SIZE - effective_gap - HORIZON
+        # --------------------------------------------------------------------
+        train_i_max = val_y_start - WINDOW_SIZE - effective_gap - HORIZON
+        if train_i_max >= 0:
+            train_groups.append((group, 0, train_i_max, effective_gap))
+
+    return train_groups, val_groups
+
+
+# ---------------------------------------------------------------------------
+# Helper – Walk-Forward Gap-Replay Fold builder  (v14 – retained as stub)
 # ---------------------------------------------------------------------------
 def build_gap_replay_folds(
     df: pd.DataFrame,
@@ -327,38 +429,18 @@ def build_gap_replay_folds(
 ):
     """
     v14 Relative Gap-Replay Walk-Forward CV.
-
-    For each region:
-      - Val_Y  = last 5 rows of historical train data.
-      - Val_X  (length WINDOW_SIZE) ends exactly `actual_gap` weeks before
-        Val_Y starts.
-      - Train (X, Y) pairs are generated by sliding backwards from this
-        validation cut-point; every pair enforces the same `actual_gap`
-        distance between End_of_X and Start_of_Y.
-      - Zero Data Waste Fallback: if the history is too short for
-        `WINDOW_SIZE + actual_gap + HORIZON`, shrink the gap dynamically
-        to the largest value that yields ≥1 pair.
+    Retained for backward compatibility. New code uses build_single_fold().
 
     Returns
     -------
-    folds : list of 1 tuple (train_groups, val_groups)
-        train_groups / val_groups are lists of
-        (group_df, i_min, i_max, effective_gap).
-
-    Note: We return a single "fold" here (the Replay fold).
-    To keep the 3-fold CV structure, we replicate the same fold 3 times
-    with slight backward-shifted val windows (similar to v11).
+    folds : list of 3 tuples (train_groups, val_groups)
     """
     folds = []
 
     # We still run 3 folds where each fold uses last 5, prev-5, prev-10 as val.
-    # Val windows (from the end):
-    #   fold 0: rows [-5:]        val_start_from_end=5
-    #   fold 1: rows [-10:-5]     val_start_from_end=10
-    #   fold 2: rows [-15:-10]    val_start_from_end=15
     for fold_k in range(WF_NUM_FOLDS):
-        val_end_from_end   = fold_k * WF_FOLD_WEEKS            # 0,  5, 10
-        val_start_from_end = val_end_from_end + WF_FOLD_WEEKS  # 5, 10, 15
+        val_end_from_end   = fold_k * WF_FOLD_WEEKS
+        val_start_from_end = val_end_from_end + WF_FOLD_WEEKS
 
         train_groups, val_groups = [], []
 
@@ -367,47 +449,27 @@ def build_gap_replay_folds(
             n     = len(group)
             rid   = group["region_id"].iloc[0]
 
-            # Retrieve per-region actual gap; fall back to global default
             actual_gap = actual_gaps.get(rid, GAP_WEEKS)
 
-            # ----------------------------------------------------------------
-            # Absolute indices of the validation window
-            # ----------------------------------------------------------------
-            val_start = n - val_start_from_end   # inclusive
-            val_end   = n - val_end_from_end     # exclusive  (=n for fold 0)
+            val_start = n - val_start_from_end
+            val_end   = n - val_end_from_end
 
-            # ----------------------------------------------------------------
-            # Zero Data Waste: shrink gap if needed
-            # Minimum requirement: WINDOW_SIZE + actual_gap + HORIZON <= n
-            #   → actual_gap <= n - WINDOW_SIZE - HORIZON
-            # ----------------------------------------------------------------
             min_required = WINDOW_SIZE + actual_gap + HORIZON
             if min_required > n:
                 max_feasible_gap = n - WINDOW_SIZE - HORIZON
                 if max_feasible_gap < 1:
-                    # Region has fewer rows than even WINDOW_SIZE+HORIZON+1
                     continue
                 effective_gap = max_feasible_gap
             else:
                 effective_gap = actual_gap
 
-            # ----------------------------------------------------------------
-            # Val split: Val_X ends `effective_gap` weeks before val_start,
-            # Val_Y = rows [val_start : val_end]
-            # Val_X window: rows [val_x_start : val_x_end]  len=WINDOW_SIZE
-            # ----------------------------------------------------------------
-            # Val_Y first row == val_start
-            # End of Val_X must be: val_start - effective_gap
-            val_x_end   = val_start - effective_gap   # exclusive; Val_X rows [.., val_x_end)
-            val_x_start = val_x_end - WINDOW_SIZE     # inclusive
+            val_x_end   = val_start - effective_gap
+            val_x_start = val_x_end - WINDOW_SIZE
 
             if val_x_start < 0 or val_x_end < WINDOW_SIZE:
-                # Not enough history for a valid val window
                 continue
 
-            # val_i is the single start index for the validation window
             val_i = val_x_start
-            # Verify target fits within group
             val_tgt_start = val_x_end + effective_gap
             val_tgt_end   = val_tgt_start + HORIZON
             if val_tgt_end > n:
@@ -415,13 +477,6 @@ def build_gap_replay_folds(
 
             val_groups.append((group, val_i, val_i, effective_gap))
 
-            # ----------------------------------------------------------------
-            # Train: sliding window backwards from the val cut-point.
-            # Each (X, Y) pair: X=[i : i+WINDOW_SIZE], Y=[i+W+gap : i+W+gap+H]
-            # Constraint: end of Y must be <= val_x_start
-            #   i.e.  i + WINDOW_SIZE + effective_gap + HORIZON <= val_x_start
-            #         i <= val_x_start - WINDOW_SIZE - effective_gap - HORIZON
-            # ----------------------------------------------------------------
             train_i_max = val_x_start - WINDOW_SIZE - effective_gap - HORIZON
             if train_i_max >= 0:
                 train_groups.append((group, 0, train_i_max, effective_gap))
@@ -432,13 +487,13 @@ def build_gap_replay_folds(
 
 
 # ---------------------------------------------------------------------------
-# Backward compat alias  (kept so train.py imports still work in a mixed env)
+# Backward compat alias  (kept so old imports still work in a mixed env)
 # ---------------------------------------------------------------------------
 def build_walk_forward_folds(df: pd.DataFrame):
     """
     Legacy stub that calls build_gap_replay_folds with a zero-gap dict
     (all regions get GAP_WEEKS=4).  Provided only for backward compatibility.
-    New code should call build_gap_replay_folds() directly.
+    New code should call build_single_fold() directly.
     """
     fallback_gaps = {rid: GAP_WEEKS for rid in df["region_id"].unique()}
     return build_gap_replay_folds(df, fallback_gaps)
