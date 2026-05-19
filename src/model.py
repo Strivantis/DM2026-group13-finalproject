@@ -3,46 +3,49 @@ DroughtLSTM
 ===========
 Multi-output LSTM for direct 5-step drought score forecasting.
 
-Architecture (v10 – Horizon Encoding + Dynamic Loss Weighting + LR Warm-up)
-----------------------------------------------------------------------------
-  Problem:  v9 training dynamics failed: BCE loss dominated early epochs,
-            triggering ReduceLROnPlateau too early and starving the Severity
-            head. Additionally, the model was "temporally blind" — it
-            predicted 5 values without any knowledge of which future week
-            was being predicted, causing monotonically decreasing outputs.
+Architecture (v11 – BiLSTM + Scale-Up + Learnable Horizon Embedding)
+----------------------------------------------------------------------
+  Problem (v10): The model lacked capacity (hidden=64, unidirectional) to
+    memorise extreme climate features; and the rigid linspace scalar horizon
+    encoding [0.2, 0.4, 0.6, 0.8, 1.0] could not learn non-uniform horizon
+    dynamics.
 
-  Solution:
-    1. Horizon Encoding: Force the model to compute severity for each
-       specific future week by concatenating a normalised horizon index
-       [0.2, 0.4, 0.6, 0.8, 1.0] onto the context vector before each
-       branch head. This makes the model "horizon-aware".
-    2. Dynamic Loss Weighting (Burn-in): Implemented in train.py.
-       Epochs 1–20: train regression ONLY (loss_b). Epoch 21+: introduce
-       BCE with reduced weight (0.1×). Prevents BCE from dominating early.
-    3. Manual LR Warm-up: Implemented in train.py. Epochs 1–5 linearly
-       ramp LR from 1e-5 to 1e-3. Prevents ReduceLROnPlateau from firing
-       during the initial volatile feature-alignment phase.
+  Solution (v11):
+    1. BiLSTM Upgrade: bidirectional=True.  Every timestep now receives
+       context from BOTH past AND future within the input window, giving the
+       attention mechanism richer feature vectors.
+       LSTM output width doubles to hidden_size * 2 (D=2).
+    2. Massive Capacity Scale-up: hidden_size=256, num_layers=3.
+       With BiLSTM this yields an effective width of 512 per timestep.
+    3. Learnable Horizon Embedding: Replace the hardcoded linspace scalar
+       [0.2,0.4,0.6,0.8,1.0] with nn.Embedding(5, 32).  The embedding for
+       each horizon step i ∈ {0,1,2,3,4} is learned end-to-end, allowing the
+       model to discover complex, non-linear horizon-specific patterns.
+    4. Retained: Dynamic Loss Weighting (Burn-in), Manual LR Warm-up,
+       Temporal Attention, LayerNorm, Softplus severity, AMP-safe logits.
 
 Architecture Detail
 -------------------
   Input  -> LayerNorm(input_size)                          <- concept-drift stabiliser
-          -> LSTM (hidden_size=64, num_layers=2, dropout=0.4)
-          -> Temporal Attention (Linear(hidden->1) -> Softmax over time)
-             context_vector = sum(attn_weights * lstm_out, dim=1)    (B, hidden)
+          -> BiLSTM (hidden_size=256, num_layers=3, dropout=0.4)
+             Output shape: (B, W, hidden_size*2) = (B, W, 512)
+          -> Temporal Attention (Linear(hidden*2 -> 1) -> Softmax over time)
+             context_vector = sum(attn_weights * lstm_out, dim=1)  (B, 512)
           -> Dropout(0.4)
 
-          [Horizon Encoding — v10]
-          -> Expand context_vector: (B, hidden) -> (B, 5, hidden)
-          -> Create horizon_idx:    [0.2,0.4,0.6,0.8,1.0] -> (B, 5, 1)
-          -> Concatenate along dim=-1 -> encoded_state: (B, 5, hidden+1)
+          [v11 Learnable Horizon Embedding]
+          -> Expand context_vector: (B, 512) -> (B, 5, 512)
+          -> horizon_ids = [0,1,2,3,4]  (long tensor)
+          -> horizon_embed(horizon_ids): (5, 32) -> expand (B, 5, 32)
+          -> Concatenate along dim=-1 -> encoded_state: (B, 5, 512+32) = (B, 5, 544)
 
           -> Branch A (Drought Probability Logits) [NO Sigmoid layer]:
-               Linear(hidden+1, 32) -> GELU -> Linear(32, 1)  [per horizon step]
+               Linear(544, 32) -> GELU -> Linear(32, 1)  [per horizon step]
                Squeeze last dim -> (B, 5)  raw logits (unbounded)
                torch.sigmoid() applied inline in forward() only
 
           -> Branch B (Severity of Drought):
-               Linear(hidden+1, 32) -> GELU -> Linear(32, 1) -> Softplus()
+               Linear(544, 32) -> GELU -> Linear(32, 1) -> Softplus()
                Squeeze last dim -> (B, 5)  non-negative values
 
   Forward Pass Outputs:
@@ -54,7 +57,7 @@ Architecture Detail
     Solution: Return raw logits from Branch A; use BCEWithLogitsLoss in train.py.
     BCEWithLogitsLoss fuses sigmoid+BCE in a numerically stable kernel safe for AMP.
 
-  Joint Loss (defined in train.py — v10 Dynamic Weighting):
+  Joint Loss (defined in train.py — v10 Dynamic Weighting, retained in v11):
     Epochs  1–20 (Burn-in): Loss = Loss_B only
     Epoch  21+:             Loss = Loss_B + 0.1 * Loss_A
     Loss_A = BCEWithLogitsLoss(logits_output, binary_target)
@@ -62,19 +65,25 @@ Architecture Detail
 
   Early Stopping: monitors pure L1Loss(final_output, target) only -> Kaggle-aligned
 
-Changes from v9
----------------
+Changes from v10
+----------------
+  - CHANGED : LSTM bidirectional=True.  Attention and branch heads updated to
+              accept hidden_size * 2 (doubled width).
+  - SCALED  : hidden_size default 64 -> 256, num_layers default 2 -> 3.
+  - REPLACED: Hardcoded linspace horizon scalar ([0.2,...,1.0]) replaced with
+              nn.Embedding(num_embeddings=5, embedding_dim=32) -- fully learnable.
+  - CHANGED : branch_in = hidden_size * 2 + 32  (was hidden_size + 1).
+  - UPDATED : architecture_summary() and v11 Shape Debug print.
+  - RETAINED: Dynamic Loss Weighting (Burn-in), Manual LR Warm-up (train.py).
+
+Changes from v9 (retained from v10)
+------------------------------------
   - ADDED  : Horizon Encoding before branch heads (v10 temporal awareness).
-              context_vector expanded to (B, 5, hidden), horizon_idx (B,5,1)
-              concatenated → encoded_state (B, 5, hidden+1).
-  - CHANGED: Branch A/B in_features: hidden -> hidden+1.
-  - CHANGED: Branch A/B out_features per step: horizon -> 1 (then squeezed to B,5).
-  - ADDED  : Shape debug print for first batch (controlled by _printed_shape flag).
   - Dynamic Loss Weighting (Burn-in) implementation in train.py.
   - Manual LR Warm-up implementation in train.py.
 
-Changes from v8 (retained from v9)
------------------------------------
+Changes from v8 (retained from v9/v10)
+---------------------------------------
   - FIXED   : AMP crash: Sigmoid() removed from Branch A head.
                torch.sigmoid() applied dynamically in forward() instead.
                BCELoss -> BCEWithLogitsLoss in train.py (AMP-safe fused kernel).
@@ -92,8 +101,9 @@ class DroughtLSTM(nn.Module):
     Parameters
     ----------
     input_size  : number of features per time step (F)
-    hidden_size : LSTM hidden dimensionality  (default 64)
-    num_layers  : number of stacked LSTM layers
+    hidden_size : LSTM hidden dimensionality per direction (default 256)
+                  Effective LSTM output width = hidden_size * 2 (BiLSTM)
+    num_layers  : number of stacked LSTM layers (default 3)
     dropout     : dropout probability (applied between LSTM layers and before head)
     horizon     : number of future weeks to forecast simultaneously
     """
@@ -101,8 +111,8 @@ class DroughtLSTM(nn.Module):
     def __init__(
         self,
         input_size: int,
-        hidden_size: int = 64,
-        num_layers: int = 2,
+        hidden_size: int = 256,
+        num_layers: int = 3,
         dropout: float = 0.4,
         horizon: int = 5,
     ):
@@ -111,9 +121,13 @@ class DroughtLSTM(nn.Module):
         self.num_layers = num_layers
         self.horizon = horizon
 
+        # Effective output dimension from BiLSTM (forward + backward)
+        lstm_out_size = hidden_size * 2
+
         # --- LayerNorm on raw inputs (v7: concept-drift stabiliser) ---
         self.input_norm = nn.LayerNorm(input_size)
 
+        # --- v11: BiLSTM (bidirectional=True) ---
         self.lstm = nn.LSTM(
             input_size=input_size,
             hidden_size=hidden_size,
@@ -121,20 +135,24 @@ class DroughtLSTM(nn.Module):
             # inter-layer dropout; disabled automatically when num_layers==1
             dropout=dropout if num_layers > 1 else 0.0,
             batch_first=True,
+            bidirectional=True,          # v11: BiLSTM
         )
 
-        # --- Temporal Attention (v8: retained) ---
-        # Projects each hidden state to a scalar attention score,
+        # --- Temporal Attention (v8: retained; v11: updated to lstm_out_size) ---
+        # Projects each hidden state (hidden_size*2) to a scalar attention score,
         # then softmax normalises across the time dimension W.
-        self.attention = nn.Linear(hidden_size, 1)
+        self.attention = nn.Linear(lstm_out_size, 1)
 
         self.dropout = nn.Dropout(p=dropout)
 
-        # --- v10: Horizon Encoding ---
-        # After concatenating the horizon index, each branch receives
-        # in_features = hidden_size + 1 (the +1 is the normalised horizon idx).
-        # Each branch outputs 1 value per horizon step (then squeezed to B×H).
-        branch_in = hidden_size + 1
+        # --- v11: Learnable Horizon Embedding ---
+        # Each horizon step i ∈ {0,1,2,3,4} is mapped to a 32-dim vector
+        # that is learned end-to-end, replacing the hardcoded linspace scalar.
+        self.horizon_embed = nn.Embedding(num_embeddings=5, embedding_dim=32)
+
+        # After concatenating context_vector (hidden*2) + horizon embedding (32):
+        # branch_in = hidden_size * 2 + 32
+        branch_in = lstm_out_size + 32
 
         # --- Branch A: Drought Probability Logits (v9.1: NO Sigmoid layer) ---
         # Outputs raw logits so BCEWithLogitsLoss in train.py can operate
@@ -155,7 +173,7 @@ class DroughtLSTM(nn.Module):
         )
         self.softplus = nn.Softplus(beta=1)
 
-        # --- v10: Shape debug flag (prints once on first forward pass) ---
+        # --- v11: Shape debug flag (prints once on first forward pass) ---
         self._printed_shape = False
 
     # -----------------------------------------------------------------------
@@ -183,42 +201,43 @@ class DroughtLSTM(nn.Module):
         # v7: Normalise inputs to mitigate concept drift
         x = self.input_norm(x)                              # (B, W, F)
 
-        lstm_out, _ = self.lstm(x)                          # (B, W, hidden)
+        # v11: BiLSTM output shape is (B, W, hidden_size*2)
+        lstm_out, _ = self.lstm(x)                          # (B, W, hidden*2)
 
         # v8: Temporal Attention - learn which time steps matter most
+        # v11: attention projects hidden*2 -> 1
         attn_weights = self.attention(lstm_out)              # (B, W, 1)
         attn_weights = torch.softmax(attn_weights, dim=1)   # Softmax over time dim W
-        context_vector = torch.sum(attn_weights * lstm_out, dim=1)  # (B, hidden)
+        context_vector = torch.sum(attn_weights * lstm_out, dim=1)  # (B, hidden*2)
 
-        dropped = self.dropout(context_vector)               # (B, hidden)
+        dropped = self.dropout(context_vector)               # (B, hidden*2)
 
-        # --- v10: Horizon Encoding ---
+        # --- v11: Learnable Horizon Embedding ---
         # Step 1: Expand context_vector across 5 horizon steps
-        #   (B, hidden) -> (B, 5, hidden)
-        ctx_expanded = dropped.unsqueeze(1).expand(B, self.horizon, self.hidden_size)
+        #   (B, hidden*2) -> (B, 5, hidden*2)
+        lstm_out_size = self.hidden_size * 2
+        ctx_expanded = dropped.unsqueeze(1).expand(B, self.horizon, lstm_out_size)
+        # (B, 5, hidden*2)
 
-        # Step 2: Create normalised horizon index [0.2, 0.4, 0.6, 0.8, 1.0]
-        #   Shape: (5,) -> (1, 5, 1) -> (B, 5, 1)
-        horizon_idx = torch.linspace(
-            1.0 / self.horizon,
-            1.0,
-            self.horizon,
-            device=x.device,
-            dtype=x.dtype,
-        )                                                   # (H,)
-        horizon_idx = horizon_idx.view(1, self.horizon, 1).expand(B, self.horizon, 1)
-        # (B, 5, 1)
+        # Step 2: Horizon embedding indices [0, 1, 2, 3, 4]
+        #   horizon_ids: (5,) long tensor on same device as x
+        horizon_ids = torch.arange(self.horizon, device=x.device, dtype=torch.long)
+        # (5,)
 
-        # Step 3: Concatenate along last dim -> (B, 5, hidden+1)
-        encoded_state = torch.cat([ctx_expanded, horizon_idx], dim=-1)
-        # (B, 5, hidden+1)
+        # Step 3: Embed indices -> (5, 32) -> expand to (B, 5, 32)
+        h_emb = self.horizon_embed(horizon_ids)              # (5, 32)
+        h_emb = h_emb.unsqueeze(0).expand(B, self.horizon, 32)  # (B, 5, 32)
+
+        # Step 4: Concatenate along last dim -> (B, 5, hidden*2 + 32)
+        encoded_state = torch.cat([ctx_expanded, h_emb], dim=-1)
+        # (B, 5, hidden*2 + 32)
 
         # Branch A: raw logits for drought probability (v9.1: no Sigmoid layer)
-        # encoded_state: (B, 5, hidden+1) -> head_prob produces (B, 5, 1) -> squeeze to (B, 5)
+        # encoded_state: (B, 5, branch_in) -> head_prob produces (B, 5, 1) -> squeeze (B, 5)
         logits_output = self.head_prob(encoded_state).squeeze(-1)    # (B, H) unbounded
 
         # Branch B: Severity of Drought (non-negative, unbounded above)
-        # (B, 5, hidden+1) -> (B, 5, 1) -> squeeze -> (B, 5)
+        # (B, 5, branch_in) -> (B, 5, 1) -> squeeze -> (B, 5)
         severity = self.softplus(
             self.head_severity(encoded_state).squeeze(-1)
         )                                                              # (B, H) >= 0
@@ -228,9 +247,10 @@ class DroughtLSTM(nn.Module):
         # train.py receives raw logits for numerically stable AMP-safe training.
         final_output = torch.sigmoid(logits_output) * severity        # (B, H)
 
-        # v10: Shape debug – print once on first forward call
+        # v11: Shape debug – print once on first forward call
         if not self._printed_shape:
-            print(f"  [v10 Shape Debug] encoded_state: {tuple(encoded_state.shape)}  "
+            print(f"  [v11 Shape Debug] lstm_out: {tuple(lstm_out.shape)}  "
+                  f"|  encoded_state: {tuple(encoded_state.shape)}  "
                   f"|  final_output: {tuple(final_output.shape)}")
             self._printed_shape = True
 
@@ -241,39 +261,41 @@ class DroughtLSTM(nn.Module):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
     def architecture_summary(self, input_size: int) -> str:
+        lstm_out_size = self.hidden_size * 2
+        branch_in     = lstm_out_size + 32
         lines = [
-            "DroughtLSTM Architecture (v10 – Horizon Encoding + Burn-in + LR Warm-up)",
-            "=" * 75,
+            "DroughtLSTM Architecture (v11 – BiLSTM + Scale-Up + Learnable Horizon Embedding)",
+            "=" * 85,
             f"  Input size   : {input_size}  (features per week, 37 total)",
             f"  LayerNorm    : LayerNorm({input_size})  [v7: concept-drift stabiliser]",
-            f"  LSTM layers  : {self.num_layers}",
-            f"  Hidden size  : {self.hidden_size}",
+            f"  LSTM layers  : {self.num_layers}  (BiLSTM, bidirectional=True)  [v11]",
+            f"  Hidden size  : {self.hidden_size} per direction  ->  {lstm_out_size} effective  [v11]",
             f"  Dropout      : {self.dropout.p}",
-            "  Pooling      : Temporal Attention  [v8: retained]",
-            "                 attention = Linear(hidden->1); softmax over time; weighted sum",
-            "  [v10] Horizon Encoding:",
-            "     context_vector (B, hidden) -> expand (B, 5, hidden)",
-            "     horizon_idx [0.2,0.4,0.6,0.8,1.0] -> (B, 5, 1)",
-            "     cat(dim=-1) -> encoded_state (B, 5, hidden+1)",
-            f"  Branch A     : Linear({self.hidden_size+1}->32) -> GELU -> Linear(32->1) [per step, NO Sigmoid]",
+            "  Pooling      : Temporal Attention  [v8: retained, v11: updated to hidden*2]",
+            f"                 attention = Linear({lstm_out_size}->1); softmax over time; weighted sum",
+            "  [v11] Learnable Horizon Embedding:",
+            f"     context_vector (B, {lstm_out_size}) -> expand (B, 5, {lstm_out_size})",
+            "     horizon_ids [0,1,2,3,4] -> Embedding(5,32) -> (B, 5, 32)",
+            f"     cat(dim=-1) -> encoded_state (B, 5, {branch_in})",
+            f"  Branch A     : Linear({branch_in}->32) -> GELU -> Linear(32->1) [per step, NO Sigmoid]",
             "                 squeeze(-1) -> (B,5);  sigmoid() applied inline in forward()",
-            f"  Branch B     : Linear({self.hidden_size+1}->32) -> GELU -> Linear(32->1) -> Softplus()",
+            f"  Branch B     : Linear({branch_in}->32) -> GELU -> Linear(32->1) -> Softplus()",
             "                 squeeze(-1) -> (B,5) >= 0  -- Severity of Drought",
             "  Final Output : sigmoid(logits_A) x Branch_B  (Expected Severity)",
             "  Returns      : (final_output, logits_output) -- two tensors",
             "  Inference    : np.clip(final_output, 0, 5) applied in train.py",
-            "-" * 75,
-            "  [v10] Dynamic Loss Weighting (Burn-in):",
+            "-" * 85,
+            "  [v10/v11] Dynamic Loss Weighting (Burn-in):",
             "     Epochs  1-20 : Loss = Loss_B  ONLY  (regression burn-in)",
             "     Epoch  21+   : Loss = Loss_B + 0.1 * Loss_A  (BCE introduced)",
-            "  [v10] Manual LR Warm-up:",
+            "  [v10/v11] Manual LR Warm-up:",
             "     Epochs  1-5  : LR linearly ramps 1e-5 -> 1e-3",
             "     Epoch   6+   : ReduceLROnPlateau takes over",
             "  Loss_A       : BCEWithLogitsLoss(logits_output, binary_target)",
             "                 (AMP-safe: fused sigmoid+BCE avoids float16 underflow)",
             "  Loss_B       : Continuous Smooth L1(final_output, y)   [weight 1.0]",
             "  Early Stop   : pure L1Loss(final_output, y)  [Kaggle MAE aligned]",
-            "-" * 75,
+            "-" * 85,
             f"  Total params : {self.count_parameters():,}",
         ]
         return "\n".join(lines)

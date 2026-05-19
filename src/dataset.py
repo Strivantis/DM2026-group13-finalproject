@@ -5,7 +5,7 @@ Custom PyTorch Dataset for drought score multi-step forecasting.
 
 Design
 ------
-- Sliding window (step=1) of W=13 weekly rows as input (X).
+- Sliding window (step=1) of W=26 weekly rows as input (X).
 - Multi-step target: the next H=5 weekly `score` values (Y).
 - Region boundaries are strictly respected – windows NEVER cross regions.
 - Feature pruning, log1p precipitation transform, and Drought Index
@@ -19,6 +19,14 @@ v9 Changes
   These are computed leakage-free in train.py (fold-specific) and
   dynamically injected into region group DataFrames before Dataset creation.
 - Total feature count: 37 (up from 35).
+
+v11 Changes
+-----------
+- WINDOW_SIZE increased from 13 to 26 (half a year of context).
+- GAP_WEEKS = 4 introduced for Gap-Aware Walk-Forward CV.
+  Training fold strictly ends at val_start - GAP_WEEKS (not val_start-1)
+  to simulate the real-world 4-week prediction gap between train and test.
+- Bounds check: gracefully skip or limit regions where val_start < WINDOW_SIZE.
 """
 
 import numpy as np
@@ -31,12 +39,15 @@ from src.preprocess import add_drought_index, DROUGHT_FEAT_COLS
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-WINDOW_SIZE = 13   # look-back (weeks)
+WINDOW_SIZE = 26   # look-back (weeks) -- v11: increased from 13 to 26
 HORIZON = 5        # forecast horizon (weeks)
 
 # Walk-Forward Validation parameters
 WF_FOLD_WEEKS  = 5   # weeks per fold
 WF_NUM_FOLDS   = 3   # number of folds  → 15 total hold-out weeks
+
+# v11: Gap between end of train and start of validation (simulates real deployment)
+GAP_WEEKS = 4
 
 # Drop collinear temp proxies (keep tmp, tmp_max, tmp_min, tmp_range)
 DROP_COLS = ["wb_tmp", "dp_tmp", "surf_tmp"]
@@ -200,7 +211,7 @@ class DroughtDataset(Dataset):
 # ---------------------------------------------------------------------------
 def build_walk_forward_folds(df: pd.DataFrame):
     """
-    Implement Walk-Forward (Time-Series) Cross-Validation.
+    Implement Gap-Aware Walk-Forward (Time-Series) Cross-Validation.
 
     The last WF_NUM_FOLDS * WF_FOLD_WEEKS = 15 weeks of each region are
     reserved for validation and are split into 3 non-overlapping 5-week folds:
@@ -209,8 +220,12 @@ def build_walk_forward_folds(df: pd.DataFrame):
         Fold 1               : rows [-10:-5]
         Fold 2 (oldest)      : rows [-15:-10]
 
-    For each fold k, training uses all rows that precede the fold's
-    validation period (no target leakage).
+    v11 Gap-Aware: For each fold k, training strictly ends at
+        val_start - GAP_WEEKS
+    rather than val_start - 1.  This prevents the model from seeing the
+    4-week "buffer zone" immediately before the validation period, simulating
+    the real-world 4-week deployment gap between the training cutoff and the
+    first test week.
 
     Returns
     -------
@@ -238,12 +253,19 @@ def build_walk_forward_folds(df: pd.DataFrame):
             val_start = n - val_start_from_end  # inclusive
             val_end   = n - val_end_from_end    # exclusive  (=n for fold 0)
 
+            # v11: Need at least WINDOW_SIZE rows of history before val_start
             if val_start < WINDOW_SIZE:
                 # Not enough history – skip region for this fold
                 continue
 
-            # --- train: sequences whose LAST target row < val_start ----------
-            train_i_max = val_start - WINDOW_SIZE - HORIZON
+            # --- v11 Gap-Aware train: last training sequence target must end
+            #     at least GAP_WEEKS before val_start.
+            #     Effective training cutoff row = val_start - GAP_WEEKS
+            #     train_i_max: largest start index i such that
+            #       i + WINDOW_SIZE + HORIZON <= val_start - GAP_WEEKS
+            #     => train_i_max = val_start - GAP_WEEKS - WINDOW_SIZE - HORIZON
+            train_cutoff = val_start - GAP_WEEKS  # exclusive upper bound for train targets
+            train_i_max  = train_cutoff - WINDOW_SIZE - HORIZON
             if train_i_max >= 0:
                 train_groups.append((group, 0, train_i_max))
 

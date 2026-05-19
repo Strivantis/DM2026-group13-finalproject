@@ -1,6 +1,6 @@
 """
-train.py -- Drought Score Forecasting Pipeline (v10 – Horizon Encoding + Burn-in + LR Warm-up)
-================================================================================================
+train.py -- Drought Score Forecasting Pipeline (v11 – BiLSTM + Learnable Horizon + Gap-Aware CV + OOF Scaling)
+=============================================================================================================
 Usage:
     python src/train.py
 
@@ -9,46 +9,49 @@ Outputs:
     models/fold_0_best.pt        -- Best weights for fold 0
     models/fold_1_best.pt        -- Best weights for fold 1
     models/fold_2_best.pt        -- Best weights for fold 2
-    models/scaler.pkl            -- Fitted StandardScaler
-    _training_log_10th.txt       -- Full console log
+    models/scaler.pkl            -- Final StandardScaler (fit on full train set; for test inference)
+    _training_log_11th.txt       -- Full console log
 
-Key improvements (v10 – Horizon Encoding + Burn-in + LR Warm-up)
------------------------------------------------------------------
-  1. Horizon Encoding (model.py)
-       - context_vector (B, hidden) expanded to (B, 5, hidden).
-       - Normalised horizon index [0.2, 0.4, 0.6, 0.8, 1.0] concatenated
-         -> encoded_state (B, 5, hidden+1).
-       - Branch A and B now output 1 value per horizon step (squeezed to B×5).
-       - Forces the model to compute severity for each specific future week,
-         fixing the "temporally blind" monotonic-decrease issue in v9.
+Key improvements (v11 – BiLSTM + Learnable Horizon + Gap-Aware CV + OOF Scaling)
+----------------------------------------------------------------------------------
+  1. Massive Architecture Scale-Up (model.py)
+       - BiLSTM: bidirectional=True.  LSTM output width = hidden_size * 2 = 512.
+       - HIDDEN_SIZE=256 (was 64), NUM_LAYERS=3 (was 2).
+       - Learnable Horizon Embedding: nn.Embedding(5, 32) replaces linspace scalar.
+         Each of the 5 horizon steps now has a 32-dim learned representation.
 
-  2. Dynamic Loss Weighting / Burn-in (train.py)
-       - Epochs  1-20: Loss = Loss_B ONLY (regression burn-in).
-         Prevents BCE from dominating early and crashing LR prematurely.
-       - Epoch  21+  : Loss = Loss_B + 0.1 * Loss_A (BCE introduced lightly).
+  2. Gap-Aware Walk-Forward CV (dataset.py)
+       - WINDOW_SIZE increased from 13 to 26 (half a year of context).
+       - GAP_WEEKS=4: training fold strictly ends at val_start - 4 weeks,
+         simulating the real 4-week deployment gap present in the test set.
 
-  3. Manual LR Warm-up (train.py)
-       - Epochs 1-5: LR linearly ramps from 1e-5 -> 1e-3.
-         Prevents ReduceLROnPlateau from firing during the volatile
-         feature-alignment phase before the model has learned anything.
-       - Epoch 6+  : ReduceLROnPlateau scheduler takes over normally.
+  3. Strict Out-Of-Fold (OOF) StandardScaler (train.py)
+       - Global scaler.fit() REMOVED from before the fold loop.
+       - Each fold instantiates a NEW StandardScaler, fitted EXCLUSIVELY on
+         that fold's training feature matrix.  Both train and val datasets for
+         that fold are transformed with this fold-local scaler.
+       - For Test Set inference: a final StandardScaler is fitted on the ENTIRE
+         1.7M training set and used to transform the test set.  Saved as scaler.pkl.
 
-  Retained from v9:
-  4. Two-Stage Multi-Task Architecture (Probability x Severity)
-  5. Leakage-Free Target Encoding
-  6. Cyclical Time Features (week_sin, week_cos)
-  7. Tensor Shape Verification
+  4. Hardware OOM Protection (train.py)
+       - try-except RuntimeError around the fold training loop.
+       - Default BATCH_SIZE=512.  If CUDA OOM is detected, cache is flushed,
+         BATCH_SIZE falls back to 256, and training restarts for that fold.
+       - pin_memory=True retained throughout.
 
-  Retained from v8:
-  8. Temporal Attention (replaces GAP, v8)
-  9. Fold Ensembling (3 fold checkpoints averaged for test prediction)
-  10. BATCH_SIZE=512, set_seed(42), np.clip(pred, 0, 5)
-  11. LayerNorm on inputs (v7)
-  12. Extended training budget NUM_EPOCHS=200, PATIENCE=35
+  Retained from v10:
+  5. Dynamic Loss Weighting (Burn-in) – epochs 1-20: Loss_B only; 21+: +0.1*Loss_A
+  6. Manual LR Warm-up – epochs 1-5: 1e-5 → 1e-3 linearly
+  7. Two-Stage Multi-Task Architecture (BCE + Smooth L1)
+  8. Leakage-Free Target Encoding (fold-specific)
+  9. Cyclical Time Features (week_sin, week_cos)
+  10. Fold Ensembling (3 fold checkpoints averaged for test prediction)
+  11. Temporal Attention (v8), LayerNorm (v7)
+  12. NUM_EPOCHS=200, PATIENCE=35, np.clip(pred, 0, 5)
 
 Hardware note
 -------------
-  RTX 4070 Laptop has 8 GB VRAM.  BATCH_SIZE fixed to 512 for stability.
+  RTX 4070 Laptop has 8 GB VRAM.  Default BATCH_SIZE=512 with OOM fallback to 256.
 """
 
 import os
@@ -78,6 +81,7 @@ from src.dataset import (
     HORIZON,
     WF_NUM_FOLDS,
     WF_FOLD_WEEKS,
+    GAP_WEEKS,
 )
 from src.model import DroughtLSTM
 
@@ -104,14 +108,15 @@ PROCESSED_DIR = os.path.join(ROOT, "data", "processed")
 MODELS_DIR    = os.path.join(ROOT, "models")
 os.makedirs(MODELS_DIR, exist_ok=True)
 
-HIDDEN_SIZE   = 64
-NUM_LAYERS    = 2
+# v11: Scale-up
+HIDDEN_SIZE   = 256           # v11: was 64
+NUM_LAYERS    = 3             # v11: was 2
 DROPOUT       = 0.4
 LEARNING_RATE = 1e-3
 WEIGHT_DECAY  = 1e-3
-BATCH_SIZE    = 512          # hardcoded; no OOM fallback
-NUM_EPOCHS    = 200          # extended budget; early stopping governs each fold
-PATIENCE      = 35           # deeper convergence patience on pure val MAE
+BATCH_SIZE    = 512           # v11: OOM fallback to 256 inside fold loop
+NUM_EPOCHS    = 200           # extended budget; early stopping governs each fold
+PATIENCE      = 35            # deeper convergence patience on pure val MAE
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Device: {DEVICE}")
@@ -130,7 +135,7 @@ _bce_criterion = nn.BCEWithLogitsLoss()
 
 
 # ---------------------------------------------------------------------------
-# Continuous Smooth Loss  (v7 – retained in v9/v10, applied to final_output)
+# Continuous Smooth Loss  (v7 – retained in v9/v10/v11, applied to final_output)
 # ---------------------------------------------------------------------------
 # Mathematical definition:
 #   For each (pred_i, target_i) pair:
@@ -146,7 +151,7 @@ _bce_criterion = nn.BCEWithLogitsLoss()
 # ---------------------------------------------------------------------------
 def continuous_smooth_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     """
-    Loss_B (v9/v10): Continuous quadratically-weighted Smooth L1 / Huber loss.
+    Loss_B (v9/v10/v11): Continuous quadratically-weighted Smooth L1 / Huber loss.
     Applied to final_output (= P x Severity).
 
     Parameters
@@ -170,7 +175,7 @@ def joint_loss(
     epoch: int,
 ) -> torch.Tensor:
     """
-    v10 Dynamic Joint Loss (Burn-in Schedule)
+    v10/v11 Dynamic Joint Loss (Burn-in Schedule)
 
     Burn-in Phase  (epoch <= 20): Loss = Loss_B ONLY
       Rationale: Let the regression head (Severity) learn magnitude freely
@@ -213,9 +218,9 @@ def joint_loss(
 
 def train_epoch(model, loader, optimizer, device, epoch: int):
     """
-    One training epoch -- v10 Dynamic Joint Loss with AMP.
+    One training epoch -- v10/v11 Dynamic Joint Loss with AMP.
 
-    v10: epoch number passed to joint_loss for burn-in schedule.
+    v10/v11: epoch number passed to joint_loss for burn-in schedule.
          Epochs 1-20: Loss_B only.  Epoch 21+: Loss_B + 0.1 * Loss_A.
     """
     model.train()
@@ -343,7 +348,7 @@ def train_model(
     """
     Train model with early stopping on pure (unweighted) MAE.
 
-    v10 Training:
+    v10/v11 Training:
       - Manual LR warm-up epochs 1-5: linear ramp 1e-5 -> 1e-3.
       - ReduceLROnPlateau only active from epoch 6+.
       - Dynamic joint loss: regression-only burn-in epochs 1-20,
@@ -366,7 +371,7 @@ def train_model(
     history      = []
 
     for epoch in range(1, num_epochs + 1):
-        # --- v10: Manual LR Warm-up (Epochs 1-5) ---
+        # --- v10/v11: Manual LR Warm-up (Epochs 1-5) ---
         # Linear ramp from 1e-5 to 1e-3 over the first 5 epochs.
         # Prevents ReduceLROnPlateau from firing during the volatile
         # feature-alignment phase before the model has learned anything.
@@ -378,7 +383,7 @@ def train_model(
         train_loss = train_epoch(model, train_loader, optimiser, DEVICE, epoch)
         val_mae    = eval_mae(model, val_loader, DEVICE)
 
-        # --- v10: Only step ReduceLROnPlateau after warm-up is complete ---
+        # --- v10/v11: Only step ReduceLROnPlateau after warm-up is complete ---
         if epoch > 5:
             scheduler.step(val_mae)
 
@@ -486,7 +491,7 @@ def _merge_te_to_df(
 ) -> pd.DataFrame:
     """
     Add region_mean_score and region_zero_prob columns to a DataFrame.
-    Used for train_df (scaler fitting) and test_df (inference).
+    Used for train_df (final scaler fitting) and test_df (inference).
     """
     df = df.copy()
     df["region_mean_score"] = df["region_id"].map(
@@ -552,35 +557,44 @@ def main():
         log_lines.append(str(msg))
 
     # -- 0. Architecture & loss description ------------------------------------
-    log("=" * 68)
-    log("Drought Forecasting Pipeline  v10")
-    log("Horizon Encoding + Dynamic Loss Burn-in + Manual LR Warm-up")
-    log("=" * 68)
-    log("Architecture : Two-Stage LSTM MTL + Horizon Encoding  [v10]")
-    log("  context_vector (B,64) -> expand (B,5,64) + horizon_idx (B,5,1)")
-    log("  encoded_state  (B,5,65)  [v10: horizon-aware representation]")
-    log("  Branch A   : Linear(65->32) -> GELU -> Linear(32->1) -> squeeze -> (B,5)")
-    log("               P(drought) logits -- sigmoid() inline in forward()")
-    log("  Branch B   : Linear(65->32) -> GELU -> Linear(32->1) -> squeeze -> (B,5)")
-    log("               Severity >= 0  via Softplus()")
-    log("  Output     : final = sigmoid(logits_A) x Branch_B  (Expected Severity)")
-    log("Loss         : [v10] Dynamic Burn-in Schedule")
-    log("  Epoch 1-20 : Loss = Loss_B ONLY  (regression burn-in)")
-    log("  Epoch 21+  : Loss = Loss_B + 0.1 * Loss_A  (BCE introduced lightly)")
-    log("  Loss_B     : Continuous Smooth L1  W_i = 1.0 + (y_i/5)^2 * 3.0")
-    log("  Loss_A     : BCEWithLogitsLoss(logits_output, binary_target)")
-    log("LR Schedule  : [v10] Manual Warm-up Epochs 1-5: 1e-5 -> 1e-3 (linear)")
-    log("               Epoch 6+: ReduceLROnPlateau (factor=0.5, patience=10)")
-    log("Early Stop   : pure L1Loss(final_output, y)  [Kaggle MAE aligned]")
-    log("Pooling      : Temporal Attention  [v8: retained]")
-    log("LayerNorm    : LayerNorm(input_size) before LSTM  [v7: retained]")
-    log("Features     : 37  (11 weather + 2 cyclic + 9 rolling + 8 lag + 5 drought + 2 TE)")
-    log("  Cyclic     : week_sin, week_cos  [v9: retained]")
-    log("  TE         : region_mean_score, region_zero_prob  [v9: retained]")
-    log("Strategy     : Fold Ensembling  (3 folds x 5 weeks, avg test predictions)")
+    log("=" * 75)
+    log("Drought Forecasting Pipeline  v11")
+    log("BiLSTM + Scale-Up + Learnable Horizon Embedding + Gap-Aware CV + OOF Scaling")
+    log("=" * 75)
+    log("Architecture : Two-Stage BiLSTM MTL + Learnable Horizon Embedding  [v11]")
+    log(f"  BiLSTM     : hidden_size={HIDDEN_SIZE}/dir -> {HIDDEN_SIZE*2} effective  [v11: was 64]")
+    log(f"  Layers     : {NUM_LAYERS}  [v11: was 2]")
+    log(f"  context_vector (B,{HIDDEN_SIZE*2}) -> expand (B,5,{HIDDEN_SIZE*2})")
+    log(f"  horizon_ids [0-4] -> Embedding(5,32) -> (B,5,32)  [v11: learnable]")
+    log(f"  encoded_state (B,5,{HIDDEN_SIZE*2+32})  [v11: replaces linspace scalar]")
+    log(f"  Branch A   : Linear({HIDDEN_SIZE*2+32}->32) -> GELU -> Linear(32->1) -> (B,5)")
+    log( "               P(drought) logits -- sigmoid() inline in forward()")
+    log(f"  Branch B   : Linear({HIDDEN_SIZE*2+32}->32) -> GELU -> Linear(32->1) -> (B,5)")
+    log( "               Severity >= 0  via Softplus()")
+    log( "  Output     : final = sigmoid(logits_A) x Branch_B  (Expected Severity)")
+    log( "Loss         : [v10/v11] Dynamic Burn-in Schedule")
+    log( "  Epoch 1-20 : Loss = Loss_B ONLY  (regression burn-in)")
+    log( "  Epoch 21+  : Loss = Loss_B + 0.1 * Loss_A  (BCE introduced lightly)")
+    log( "  Loss_B     : Continuous Smooth L1  W_i = 1.0 + (y_i/5)^2 * 3.0")
+    log( "  Loss_A     : BCEWithLogitsLoss(logits_output, binary_target)")
+    log( "LR Schedule  : [v10/v11] Manual Warm-up Epochs 1-5: 1e-5 -> 1e-3 (linear)")
+    log( "               Epoch 6+: ReduceLROnPlateau (factor=0.5, patience=10)")
+    log( "Early Stop   : pure L1Loss(final_output, y)  [Kaggle MAE aligned]")
+    log( "Pooling      : Temporal Attention  [v8: retained; v11: updated for hidden*2]")
+    log( "LayerNorm    : LayerNorm(input_size) before LSTM  [v7: retained]")
+    log( "Features     : 37  (11 weather + 2 cyclic + 9 rolling + 8 lag + 5 drought + 2 TE)")
+    log( "  Cyclic     : week_sin, week_cos  [v9: retained]")
+    log( "  TE         : region_mean_score, region_zero_prob  [v9: retained]")
+    log( "CV Strategy  : Gap-Aware Walk-Forward  [v11: GAP_WEEKS=4]")
+    log(f"  WINDOW_SIZE: {WINDOW_SIZE} weeks  [v11: was 13]")
+    log(f"  GAP_WEEKS  : {GAP_WEEKS} weeks  [v11: train cutoff = val_start - {GAP_WEEKS}]")
+    log( "OOF Scaling  : Fold-local StandardScaler (NO global pre-fit)  [v11]")
+    log( "Test Scaler  : Final StandardScaler fit on full 1.7M train set  [v11]")
+    log( "OOM Guard    : try-except RuntimeError -> fallback BATCH_SIZE=256  [v11]")
+    log( "Strategy     : Fold Ensembling  (3 folds x 5 weeks, avg test predictions)")
     log(f"Epochs       : {NUM_EPOCHS}  |  Patience: {PATIENCE}")
     log(f"Seed         : 42  (cuDNN deterministic={torch.backends.cudnn.deterministic})")
-    log(f"BatchSize    : {BATCH_SIZE}  (hardcoded, no OOM fallback)")
+    log(f"BatchSize    : {BATCH_SIZE}  (OOM fallback: 256)")
 
     # -- 1. Load data ----------------------------------------------------------
     log("\nLoading processed data ...")
@@ -643,12 +657,12 @@ def main():
     log(f"  Global region_mean_score : {global_mean_te:.4f}")
     log(f"  Global region_zero_prob  : {global_zero_prob_te:.4f}")
 
-    # Add full-train TE to train_df (for scaler fitting over correct distribution)
+    # Add full-train TE to train_df (used later for test scaler fitting)
     train_df = _merge_te_to_df(train_df, te_map_full, global_mean_te, global_zero_prob_te)
     log("  v region_mean_score, region_zero_prob added to train_df (full-train stats)")
 
-    # -- 6. Fit scaler on training features (includes TE) ---------------------
-    log("\nFitting StandardScaler on training feature matrix ...")
+    # -- 6. Determine feature columns and input_size (v11: NO global scaler fit) --
+    log("\n[v11] Determining feature columns (OOF Scaling: NO global pre-fit) ...")
     feat_cols  = [c for c in FEATURE_COLS if c in train_df.columns]
     input_size = len(feat_cols)
     log(f"  Input features ({input_size}): {feat_cols}")
@@ -658,41 +672,40 @@ def main():
         f"Check that preprocess.py was run (eda.py) and TE cols are present."
     )
 
-    scaler = StandardScaler()
-    train_feat_matrix = train_df[feat_cols].values.astype(np.float32)
-    scaler.fit(train_feat_matrix)
-
-    with open(os.path.join(MODELS_DIR, "scaler.pkl"), "wb") as f:
-        pickle.dump(scaler, f)
-    log(f"  Scaler saved -> {os.path.join(MODELS_DIR, 'scaler.pkl')}")
-    log(f"  train after refinement + TE: {train_df.shape}")
+    log("  v OOF Scaling: each fold will instantiate its OWN StandardScaler,")
+    log("                 fitted EXCLUSIVELY on that fold's training features.")
+    log("  v Test Scaler: a final StandardScaler will be fit on the ENTIRE train set.")
 
     # -- 7. Walk-Forward Cross-Validation with Fold Checkpointing -------------
-    log(f"\n{'='*68}")
+    log(f"\n{'='*75}")
     log(f"Walk-Forward Cross-Validation  ({WF_NUM_FOLDS} folds x {WF_FOLD_WEEKS} weeks)")
-    log(f"Train loss  : v10 Burn-in: epochs 1-20 = Smooth L1 only; 21+ = Smooth L1 + 0.1*BCE")
+    log(f"[v11] Gap-Aware: train cutoff = val_start - GAP_WEEKS ({GAP_WEEKS} weeks)")
+    log(f"[v11] Window Size: {WINDOW_SIZE} weeks (was 13)")
+    log(f"Train loss  : v10/v11 Burn-in: epochs 1-20 = Smooth L1 only; 21+ = Smooth L1 + 0.1*BCE")
     log(f"Val metric  : pure MAE  (unweighted, Kaggle-aligned)")
     log(f"TE strategy : fold-specific (train rows only) -> leakage-free")
+    log(f"Scaler      : OOF (new StandardScaler per fold, fit on fold train features)")
     log(f"Checkpoints : fold_0_best.pt / fold_1_best.pt / fold_2_best.pt")
     log(f"Strategy    : Fold Ensembling  (v8 retained)")
-    log(f"AMP : {USE_AMP}  |  batch_size={BATCH_SIZE}  |  num_workers=8")
-    log(f"{'='*68}")
+    log(f"AMP : {USE_AMP}  |  batch_size={BATCH_SIZE} (OOM fallback: 256)  |  num_workers=8")
+    log(f"{'='*75}")
 
     folds = build_walk_forward_folds(train_df)
     fold_maes         = []
     fold_best_epochs  = []
     fold_percentiles  = []
     fold_ckpt_paths   = []
+    fold_scalers      = []   # v11: retain fold scalers (not used for test, but logged)
 
     for fold_k, (fold_train_groups, fold_val_groups) in enumerate(folds):
         log(f"\n-- Fold {fold_k + 1}/{WF_NUM_FOLDS} --")
 
         # ---- v9: Compute FOLD-SPECIFIC Target Encoding (leakage-free) ------
         # Use rows 0..val_start from training groups exclusively.
-        # val_start = train_i_max + WINDOW_SIZE + HORIZON
+        # val_start = train_i_max + WINDOW_SIZE + HORIZON + GAP_WEEKS (v11)
         fold_te_rows = []
         for group, i_min, i_max in fold_train_groups:
-            val_start = min(i_max + WINDOW_SIZE + HORIZON, len(group))
+            val_start = min(i_max + WINDOW_SIZE + HORIZON + GAP_WEEKS, len(group))
             fold_te_rows.append(group.iloc[:val_start])
 
         if fold_te_rows:
@@ -717,52 +730,103 @@ def main():
             fold_val_groups, fold_te_map, fold_global_mean, fold_global_zero_prob
         )
 
-        fold_train_ds = DroughtDataset(aug_train_groups, scaler=scaler)
-        fold_val_ds   = DroughtDataset(aug_val_groups,   scaler=scaler)
+        # ---- v11: Strict OOF Scaling ----------------------------------------
+        # Instantiate a NEW StandardScaler per fold.
+        # Fit EXCLUSIVELY on the fold's training feature matrix (never on val).
+        # Then transform both train and val datasets with this fold-local scaler.
+        log(f"  [v11 OOF Scaler] Fitting fold-{fold_k+1} StandardScaler on fold train features ...")
+        fold_scaler = StandardScaler()
+
+        # Collect raw feature matrix from all fold train groups
+        fold_train_feat_parts = []
+        for group, i_min, i_max in aug_train_groups:
+            local_feat_cols = [c for c in FEATURE_COLS if c in group.columns]
+            fold_train_feat_parts.append(group[local_feat_cols].values.astype(np.float32))
+
+        if fold_train_feat_parts:
+            fold_train_feat_matrix = np.concatenate(fold_train_feat_parts, axis=0)
+            fold_scaler.fit(fold_train_feat_matrix)
+            log(f"  [v11 OOF Scaler] Fit on {len(fold_train_feat_matrix):,} rows "
+                f"({fold_train_feat_matrix.shape[1]} features)")
+        else:
+            log(f"  [v11 OOF Scaler] WARNING: No train rows for fold {fold_k+1}, using identity scaler.")
+
+        fold_scalers.append(fold_scaler)
+
+        # Create datasets with fold-local scaler
+        fold_train_ds = DroughtDataset(aug_train_groups, scaler=fold_scaler)
+        fold_val_ds   = DroughtDataset(aug_val_groups,   scaler=fold_scaler)
         log(f"  Train seqs: {len(fold_train_ds):,}  |  Val seqs: {len(fold_val_ds):,}")
 
-        try:
-            fold_loader_tr  = _make_loader(fold_train_ds, shuffle=True)
-            fold_loader_val = _make_loader(fold_val_ds,   shuffle=False)
-        except Exception:
-            fold_loader_tr  = DataLoader(fold_train_ds, batch_size=BATCH_SIZE,
-                                         shuffle=True,  num_workers=0, pin_memory=USE_AMP)
-            fold_loader_val = DataLoader(fold_val_ds,   batch_size=BATCH_SIZE,
-                                         shuffle=False, num_workers=0, pin_memory=USE_AMP)
-
         # ---- Tensor Shape Verification (fold 0 only) ------------------------
-        if fold_k == 0:
-            first_X, first_y = next(iter(fold_loader_tr))
-            log(f"\n  [Tensor Shape Verification] First Batch (Fold 1):")
-            log(f"    X shape : {tuple(first_X.shape)}"
-                f"  ->  (Batch={first_X.shape[0]}, Seq={first_X.shape[1]}, Features={first_X.shape[2]})")
-            log(f"    y shape : {tuple(first_y.shape)}"
-                f"  ->  (Batch={first_y.shape[0]}, Horizon={first_y.shape[1]})")
-            log(f"    Expected: Features={input_size}  "
-                f"(11 weather + 2 cyclic + 9 rolling + 8 lag + 5 drought + 2 TE = 37)")
-            assert first_X.shape[1] == WINDOW_SIZE, \
-                f"Seq mismatch: got {first_X.shape[1]}, expected {WINDOW_SIZE}"
-            assert first_X.shape[2] == input_size, \
-                f"Feature mismatch: got {first_X.shape[2]}, expected {input_size}"
-            assert first_y.shape[1] == HORIZON, \
-                f"Horizon mismatch: got {first_y.shape[1]}, expected {HORIZON}"
-            log(f"    v Shape assertion PASSED.\n")
-            del first_X, first_y
-
         fold_model = make_model(input_size)
         fold_ckpt  = os.path.join(MODELS_DIR, f"fold_{fold_k}_best.pt")
         fold_ckpt_paths.append(fold_ckpt)
 
-        best_fold_mae, best_fold_epoch, _ = train_model(
-            fold_model,
-            fold_loader_tr,
-            fold_loader_val,
-            num_epochs=NUM_EPOCHS,
-            patience=PATIENCE,
-            ckpt_path=fold_ckpt,
-            log=log,
-            show_header=True,
-        )
+        # ---- v11: OOM-Protected Training ------------------------------------
+        # Start with BATCH_SIZE=512; if CUDA OOM is caught, flush cache,
+        # fall back to BATCH_SIZE=256, and restart training for this fold.
+        batch_size_to_use = BATCH_SIZE
+
+        def _run_fold_training(bs):
+            """Helper: build loaders + optionally verify shapes + train."""
+            try:
+                loader_tr  = _make_loader(fold_train_ds, shuffle=True,  batch_size=bs)
+                loader_val = _make_loader(fold_val_ds,   shuffle=False, batch_size=bs)
+            except Exception:
+                loader_tr  = DataLoader(fold_train_ds, batch_size=bs,
+                                        shuffle=True,  num_workers=0, pin_memory=USE_AMP)
+                loader_val = DataLoader(fold_val_ds,   batch_size=bs,
+                                        shuffle=False, num_workers=0, pin_memory=USE_AMP)
+
+            # Tensor shape verification (fold 0 only)
+            if fold_k == 0:
+                first_X, first_y = next(iter(loader_tr))
+                log(f"\n  [Tensor Shape Verification] First Batch (Fold 1):")
+                log(f"    X shape : {tuple(first_X.shape)}"
+                    f"  ->  (Batch={first_X.shape[0]}, Seq={first_X.shape[1]}, Features={first_X.shape[2]})")
+                log(f"    y shape : {tuple(first_y.shape)}"
+                    f"  ->  (Batch={first_y.shape[0]}, Horizon={first_y.shape[1]})")
+                log(f"    Expected: Features={input_size}  "
+                    f"(11 weather + 2 cyclic + 9 rolling + 8 lag + 5 drought + 2 TE = 37)")
+                log(f"    Window : {WINDOW_SIZE} weeks  [v11: was 13]")
+                assert first_X.shape[1] == WINDOW_SIZE, \
+                    f"Seq mismatch: got {first_X.shape[1]}, expected {WINDOW_SIZE}"
+                assert first_X.shape[2] == input_size, \
+                    f"Feature mismatch: got {first_X.shape[2]}, expected {input_size}"
+                assert first_y.shape[1] == HORIZON, \
+                    f"Horizon mismatch: got {first_y.shape[1]}, expected {HORIZON}"
+                log(f"    v Shape assertion PASSED.\n")
+                del first_X, first_y
+
+            mae, epoch, hist = train_model(
+                fold_model, loader_tr, loader_val,
+                num_epochs=NUM_EPOCHS,
+                patience=PATIENCE,
+                ckpt_path=fold_ckpt,
+                log=log,
+                show_header=True,
+            )
+            return mae, epoch, hist, loader_tr, loader_val
+
+        try:
+            best_fold_mae, best_fold_epoch, _, fold_loader_tr, fold_loader_val = \
+                _run_fold_training(batch_size_to_use)
+
+        except RuntimeError as oom_err:
+            if "out of memory" in str(oom_err).lower():
+                log(f"\n  [v11 OOM] CUDA out-of-memory at batch_size={batch_size_to_use}.")
+                log(f"  [v11 OOM] Flushing CUDA cache and retrying with batch_size=256 ...")
+                torch.cuda.empty_cache()
+
+                # Re-instantiate model to clear any partially-allocated weights
+                fold_model = make_model(input_size)
+                batch_size_to_use = 256
+
+                best_fold_mae, best_fold_epoch, _, fold_loader_tr, fold_loader_val = \
+                    _run_fold_training(batch_size_to_use)
+            else:
+                raise  # Re-raise non-OOM RuntimeErrors immediately
 
         fold_maes.append(best_fold_mae)
         fold_best_epochs.append(best_fold_epoch)
@@ -786,7 +850,7 @@ def main():
     avg_val_mae     = float(np.mean(fold_maes))
     mean_best_epoch = float(np.mean(fold_best_epochs))
 
-    log(f"\n{'='*68}")
+    log(f"\n{'='*75}")
     log(f"Fold MAEs          : {[f'{m:.4f}' for m in fold_maes]}")
     log(f"Average_Val_MAE    : {avg_val_mae:.4f}")
     log(f"Fold Best Epochs   : {fold_best_epochs}")
@@ -799,23 +863,39 @@ def main():
                 f"p95={p.get('p95',float('nan')):.3f}  "
                 f"p99={p.get('p99',float('nan')):.3f}  "
                 f"max={p.get('max',float('nan')):.3f}")
-    log(f"{'='*68}")
+    log(f"{'='*75}")
 
-    # -- 8. Prepare test_df with full-train TE for inference ------------------
+    # -- 8. Fit FINAL Test Scaler on ENTIRE training set ----------------------
+    # v11: The test scaler is separate from any fold scaler.
+    # It is fitted on the full 1.7M training set to maximize coverage of the
+    # feature distribution before transforming the test set.
+    log(f"\n[v11] Fitting final Test StandardScaler on FULL training set ...")
+    test_scaler = StandardScaler()
+    full_train_feat_matrix = train_df[feat_cols].values.astype(np.float32)
+    test_scaler.fit(full_train_feat_matrix)
+    log(f"  Test scaler fit on {len(full_train_feat_matrix):,} rows  "
+        f"({full_train_feat_matrix.shape[1]} features)")
+
+    with open(os.path.join(MODELS_DIR, "scaler.pkl"), "wb") as f:
+        pickle.dump(test_scaler, f)
+    log(f"  Test scaler saved -> {os.path.join(MODELS_DIR, 'scaler.pkl')}")
+
+    # -- 8b. Prepare test_df with full-train TE for inference -----------------
     log(f"\n[v9] Preparing test_df with full-train Target Encoding ...")
     test_df = _merge_te_to_df(test_df, te_map_full, global_mean_te, global_zero_prob_te)
     log(f"  test_df after TE injection: {test_df.shape}")
     log(f"  v region_mean_score, region_zero_prob added to test_df (full-train stats)")
 
     # -- 9. Fold Ensemble Inference on Test Set -------------------------------
-    log(f"\n{'='*68}")
+    log(f"\n{'='*75}")
     log(f"Fold Ensemble Inference  (v8/v9 -- Average Blending)")
     log(f"  Blending {len(fold_ckpt_paths)} fold checkpoints:")
     for p in fold_ckpt_paths:
         log(f"    {p}")
+    log(f"  Scaler used for inference: FINAL TEST SCALER (fit on full train set)  [v11]")
     log(f"  final_pred = mean(pred_0, pred_1, pred_2)")
     log(f"  Safety clip: np.clip(final_pred, 0.0, 5.0)")
-    log(f"{'='*68}")
+    log(f"{'='*75}")
 
     # Print architecture summary using a temporary model
     _tmp_model = make_model(input_size)
@@ -834,7 +914,8 @@ def main():
         fold_model.load_state_dict(torch.load(ckpt_path, map_location=DEVICE))
         fold_model.eval()
 
-        fold_pred_dict = predict_test_set(fold_model, test_df, feat_cols, scaler, log)
+        # v11: Use test_scaler (fit on full train) for test inference
+        fold_pred_dict = predict_test_set(fold_model, test_df, feat_cols, test_scaler, log)
         all_fold_pred_dicts.append(fold_pred_dict)
         log(f"  [Fold {fold_k+1}] Inference complete. Regions predicted: {len(fold_pred_dict)}")
 
@@ -915,7 +996,7 @@ def main():
 
     # Save full training log
     log(f"\nTotal elapsed: {(time.time() - t0):.1f}s")
-    log_path = os.path.join(ROOT, "_training_log_10th.txt")
+    log_path = os.path.join(ROOT, "_training_log_11th.txt")
     with open(log_path, "w") as f:
         f.write("\n".join(log_lines))
     print(f"\nTraining log saved -> {log_path}")
