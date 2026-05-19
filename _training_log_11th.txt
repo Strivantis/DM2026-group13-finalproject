@@ -1,24 +1,24 @@
 ===========================================================================
-Drought Forecasting Pipeline  v11
-BiLSTM + Scale-Up + Learnable Horizon Embedding + Gap-Aware CV + OOF Scaling
+Drought Forecasting Pipeline  v12
+Bottleneck Relief + Batch=2048 + Peak LR=2e-3 (Linear Scaling Rule)
 ===========================================================================
-Architecture : Two-Stage BiLSTM MTL + Learnable Horizon Embedding  [v11]
-  BiLSTM     : hidden_size=256/dir -> 512 effective  [v11: was 64]
-  Layers     : 3  [v11: was 2]
-  context_vector (B,512) -> expand (B,5,512)
+Architecture : Two-Stage BiLSTM MTL + Learnable Horizon Embedding  [v11/v12]
+  BiLSTM     : hidden_size=128/dir -> 256 effective  [v11]
+  Layers     : 3  [v11]
+  context_vector (B,256) -> expand (B,5,256)
   horizon_ids [0-4] -> Embedding(5,32) -> (B,5,32)  [v11: learnable]
-  encoded_state (B,5,544)  [v11: replaces linspace scalar]
-  Branch A   : Linear(544->32) -> GELU -> Linear(32->1) -> (B,5)
+  encoded_state (B,5,288)  [v11: replaces linspace scalar]
+  Branch A   : Linear(288->128) -> GELU -> Dropout(0.2) -> Linear(128->1) -> (B,5)  [v12]
                P(drought) logits -- sigmoid() inline in forward()
-  Branch B   : Linear(544->32) -> GELU -> Linear(32->1) -> (B,5)
+  Branch B   : Linear(288->128) -> GELU -> Dropout(0.2) -> Linear(128->1) -> (B,5)  [v12]
                Severity >= 0  via Softplus()
   Output     : final = sigmoid(logits_A) x Branch_B  (Expected Severity)
-Loss         : [v10/v11] Dynamic Burn-in Schedule
+Loss         : [v12] Dynamic Burn-in Schedule
   Epoch 1-20 : Loss = Loss_B ONLY  (regression burn-in)
   Epoch 21+  : Loss = Loss_B + 0.1 * Loss_A  (BCE introduced lightly)
   Loss_B     : Continuous Smooth L1  W_i = 1.0 + (y_i/5)^2 * 3.0
   Loss_A     : BCEWithLogitsLoss(logits_output, binary_target)
-LR Schedule  : [v10/v11] Manual Warm-up Epochs 1-5: 1e-5 -> 1e-3 (linear)
+LR Schedule  : [v12] Manual Warm-up Epochs 1-5: 1e-5 -> 2e-3 (linear, 4x scaled)
                Epoch 6+: ReduceLROnPlateau (factor=0.5, patience=10)
 Early Stop   : pure L1Loss(final_output, y)  [Kaggle MAE aligned]
 Pooling      : Temporal Attention  [v8: retained; v11: updated for hidden*2]
@@ -31,11 +31,11 @@ CV Strategy  : Gap-Aware Walk-Forward  [v11: GAP_WEEKS=4]
   GAP_WEEKS  : 4 weeks  [v11: train cutoff = val_start - 4]
 OOF Scaling  : Fold-local StandardScaler (NO global pre-fit)  [v11]
 Test Scaler  : Final StandardScaler fit on full 1.7M train set  [v11]
-OOM Guard    : try-except RuntimeError -> fallback BATCH_SIZE=256  [v11]
+OOM Guard    : try-except RuntimeError -> fallback BATCH_SIZE=1024  [v12]
 Strategy     : Fold Ensembling  (3 folds x 5 weeks, avg test predictions)
 Epochs       : 200  |  Patience: 35
 Seed         : 42  (cuDNN deterministic=True)
-BatchSize    : 512  (OOM fallback: 256)
+BatchSize    : 512  (OOM fallback: 1024)  [v12: 4x scale-up]
 
 Loading processed data ...
   train raw: (1789408, 41)  |  test raw: (30199, 38)
@@ -82,7 +82,7 @@ TE strategy : fold-specific (train rows only) -> leakage-free
 Scaler      : OOF (new StandardScaler per fold, fit on fold train features)
 Checkpoints : fold_0_best.pt / fold_1_best.pt / fold_2_best.pt
 Strategy    : Fold Ensembling  (v8 retained)
-AMP : True  |  batch_size=512 (OOM fallback: 256)  |  num_workers=8
+AMP : True  |  batch_size=512 (OOM fallback: 1024)  |  num_workers=8  [v12]
 ===========================================================================
 
 -- Fold 1/3 --
@@ -101,70 +101,72 @@ AMP : True  |  batch_size=512 (OOM fallback: 256)  |  num_workers=8
 =================================================================
  Epoch   TrainLoss     ValMAE         LR
 =================================================================
-     1       0.6213      0.3531    1.00e-05 *
-     2       0.3763      0.2822    2.58e-04 *
-     3       0.2377      0.2809    5.05e-04 *
-     4       0.1620      0.2831    7.53e-04
-     5       0.1299      0.2605    1.00e-03 *
-     6       0.1057      0.2675    1.00e-03
-     7       0.0919      0.2770    1.00e-03
-     8       0.0826      0.2600    1.00e-03 *
-     9       0.0766      0.2831    1.00e-03
-    10       0.0711      0.2863    1.00e-03
-    11       0.0674      0.2766    1.00e-03
-    12       0.0641      0.2692    1.00e-03
-    13       0.0615      0.2657    1.00e-03
-    14       0.0592      0.2767    1.00e-03
-    15       0.0567      0.2803    1.00e-03
-    16       0.0554      0.2636    1.00e-03
-    17       0.0537      0.2700    1.00e-03
-    18       0.0525      0.2721    1.00e-03
-    19       0.0510      0.2477    1.00e-03 *
-    20       0.0500      0.2677    1.00e-03
-    21       0.0620      0.2583    1.00e-03
-    22       0.0589      0.2603    1.00e-03
-    23       0.0572      0.2712    1.00e-03
-    24       0.0560      0.2625    1.00e-03
-    25       0.0549      0.2524    1.00e-03
-    26       0.0541      0.2648    1.00e-03
-    27       0.0530      0.2490    1.00e-03
-    28       0.0522      0.2520    1.00e-03
-    29       0.0514      0.2570    1.00e-03
-    30       0.0507      0.2661    5.00e-04
-    31       0.0434      0.2518    5.00e-04
-    32       0.0414      0.2571    5.00e-04
-    33       0.0404      0.2630    5.00e-04
-    34       0.0395      0.2685    5.00e-04
-    35       0.0388      0.2641    5.00e-04
-    36       0.0381      0.2582    5.00e-04
-    37       0.0377      0.2592    5.00e-04
-    38       0.0371      0.2579    5.00e-04
-    39       0.0366      0.2572    5.00e-04
-    40       0.0361      0.2542    5.00e-04
-    41       0.0357      0.2596    2.50e-04
-    42       0.0324      0.2595    2.50e-04
-    43       0.0314      0.2578    2.50e-04
-    44       0.0309      0.2590    2.50e-04
-    45       0.0305      0.2586    2.50e-04
-    46       0.0301      0.2545    2.50e-04
-    47       0.0298      0.2570    2.50e-04
-    48       0.0295      0.2559    2.50e-04
-    49       0.0292      0.2572    2.50e-04
-    50       0.0289      0.2553    2.50e-04
-    51       0.0286      0.2614    2.50e-04
-    52       0.0284      0.2575    1.25e-04
-    53       0.0268      0.2577    1.25e-04
-    54       0.0264      0.2543    1.25e-04
+     1       0.6766      0.3862    1.00e-05 *
+     2       0.3931      0.3182    2.58e-04 *
+     3       0.2772      0.2897    5.05e-04 *
+     4       0.2035      0.2812    7.53e-04 *
+     5       0.1638      0.2685    1.00e-03 *
+     6       0.1370      0.3050    1.00e-03
+     7       0.1215      0.3026    1.00e-03
+     8       0.1111      0.2765    1.00e-03
+     9       0.1034      0.2802    1.00e-03
+    10       0.0978      0.3005    1.00e-03
+    11       0.0933      0.2737    1.00e-03
+    12       0.0893      0.2841    1.00e-03
+    13       0.0861      0.2931    1.00e-03
+    14       0.0835      0.2680    1.00e-03 *
+    15       0.0813      0.2800    1.00e-03
+    16       0.0789      0.2804    1.00e-03
+    17       0.0772      0.2722    1.00e-03
+    18       0.0756      0.2926    1.00e-03
+    19       0.0741      0.2844    1.00e-03
+    20       0.0728      0.2927    1.00e-03
+    21       0.0895      0.2669    1.00e-03 *
+    22       0.0867      0.2856    1.00e-03
+    23       0.0850      0.2865    1.00e-03
+    24       0.0838      0.2965    1.00e-03
+    25       0.0824      0.2868    1.00e-03
+    26       0.0817      0.2787    1.00e-03
+    27       0.0804      0.2823    1.00e-03
+    28       0.0797      0.2869    1.00e-03
+    29       0.0790      0.2816    1.00e-03
+    30       0.0780      0.2849    1.00e-03
+    31       0.0778      0.2857    1.00e-03
+    32       0.0766      0.2753    5.00e-04
+    33       0.0680      0.2870    5.00e-04
+    34       0.0665      0.2813    5.00e-04
+    35       0.0655      0.2831    5.00e-04
+    36       0.0648      0.2746    5.00e-04
+    37       0.0643      0.2726    5.00e-04
+    38       0.0638      0.2841    5.00e-04
+    39       0.0635      0.2825    5.00e-04
+    40       0.0630      0.2758    5.00e-04
+    41       0.0628      0.2777    5.00e-04
+    42       0.0624      0.2717    5.00e-04
+    43       0.0621      0.2721    2.50e-04
+    44       0.0577      0.2761    2.50e-04
+    45       0.0568      0.2688    2.50e-04
+    46       0.0564      0.2772    2.50e-04
+    47       0.0561      0.2804    2.50e-04
+    48       0.0557      0.2726    2.50e-04
+    49       0.0556      0.2757    2.50e-04
+    50       0.0553      0.2741    2.50e-04
+    51       0.0551      0.2797    2.50e-04
+    52       0.0549      0.2785    2.50e-04
+    53       0.0548      0.2736    2.50e-04
+    54       0.0546      0.2789    1.25e-04
+    55       0.0523      0.2780    1.25e-04
+    56       0.0519      0.2776    1.25e-04
 
-  Early stopping at epoch 54 (no MAE improvement for 35 epochs).
+  Early stopping at epoch 56 (no MAE improvement for 35 epochs).
 =================================================================
-  Best Val MAE: 0.2477  (epoch 19)
-  Fold 1 Best Val MAE: 0.2477  |  Best Epoch: 19
+  Best Val MAE: 0.2669  (epoch 21)
+  Fold 1 Best Val MAE: 0.2669  |  Best Epoch: 21
   Checkpoint saved -> /home/sean/文件/NYCU/114-2/Data Mining/FinalProject/models/fold_0_best.pt
 
   [Fold 1 Prediction Percentiles -- best checkpoint]
   [Prediction Diagnostics] n=11,240
-    p50=0.0003  p90=0.8935  p95=1.2482  p99=2.0299  max=3.3982
+    p50=0.0006  p90=0.9948  p95=1.6131  p99=2.4713  max=4.9563
     v p99 >= 2.0 -- model is predicting away from the mean.
 
 -- Fold 2/3 --
@@ -175,62 +177,59 @@ AMP : True  |  batch_size=512 (OOM fallback: 256)  |  num_workers=8
 =================================================================
  Epoch   TrainLoss     ValMAE         LR
 =================================================================
-     1       0.6261      0.4413    1.00e-05 *
-     2       0.3720      0.3957    2.58e-04 *
-     3       0.2368      0.3612    5.05e-04 *
-     4       0.1630      0.3150    7.53e-04 *
-     5       0.1308      0.2871    1.00e-03 *
-     6       0.1056      0.2966    1.00e-03
-     7       0.0919      0.3358    1.00e-03
-     8       0.0827      0.3003    1.00e-03
-     9       0.0762      0.3032    1.00e-03
-    10       0.0705      0.3320    1.00e-03
-    11       0.0669      0.2777    1.00e-03 *
-    12       0.0639      0.3195    1.00e-03
-    13       0.0608      0.2853    1.00e-03
-    14       0.0586      0.2889    1.00e-03
-    15       0.0565      0.3076    1.00e-03
-    16       0.0548      0.2969    1.00e-03
-    17       0.0534      0.3111    1.00e-03
-    18       0.0519      0.3072    1.00e-03
-    19       0.0507      0.3029    1.00e-03
-    20       0.0494      0.3042    1.00e-03
-    21       0.0613      0.3038    1.00e-03
-    22       0.0581      0.2871    5.00e-04
-    23       0.0495      0.2965    5.00e-04
-    24       0.0470      0.2961    5.00e-04
-    25       0.0456      0.2955    5.00e-04
-    26       0.0443      0.2899    5.00e-04
-    27       0.0434      0.2835    5.00e-04
-    28       0.0425      0.2962    5.00e-04
-    29       0.0418      0.2950    5.00e-04
-    30       0.0411      0.2880    5.00e-04
-    31       0.0403      0.2867    5.00e-04
-    32       0.0399      0.3125    5.00e-04
-    33       0.0392      0.2883    2.50e-04
-    34       0.0355      0.2908    2.50e-04
-    35       0.0344      0.2887    2.50e-04
-    36       0.0338      0.2942    2.50e-04
-    37       0.0334      0.2863    2.50e-04
-    38       0.0329      0.2911    2.50e-04
-    39       0.0325      0.2911    2.50e-04
-    40       0.0321      0.2942    2.50e-04
-    41       0.0318      0.2928    2.50e-04
-    42       0.0314      0.2936    2.50e-04
-    43       0.0311      0.2930    2.50e-04
-    44       0.0309      0.2942    1.25e-04
-    45       0.0291      0.2944    1.25e-04
-    46       0.0285      0.2979    1.25e-04
+     1       0.6756      0.4537    1.00e-05 *
+     2       0.3954      0.4076    2.58e-04 *
+     3       0.2748      0.3159    5.05e-04 *
+     4       0.2032      0.3278    7.53e-04
+     5       0.1640      0.3310    1.00e-03
+     6       0.1375      0.3051    1.00e-03 *
+     7       0.1220      0.3327    1.00e-03
+     8       0.1117      0.3007    1.00e-03 *
+     9       0.1042      0.3659    1.00e-03
+    10       0.0983      0.3263    1.00e-03
+    11       0.0936      0.3376    1.00e-03
+    12       0.0897      0.3454    1.00e-03
+    13       0.0868      0.3457    1.00e-03
+    14       0.0838      0.3213    1.00e-03
+    15       0.0817      0.3227    1.00e-03
+    16       0.0795      0.3420    1.00e-03
+    17       0.0779      0.3451    1.00e-03
+    18       0.0763      0.3297    1.00e-03
+    19       0.0748      0.3274    5.00e-04
+    20       0.0657      0.3216    5.00e-04
+    21       0.0817      0.3416    5.00e-04
+    22       0.0786      0.3217    5.00e-04
+    23       0.0770      0.3300    5.00e-04
+    24       0.0761      0.3284    5.00e-04
+    25       0.0751      0.3295    5.00e-04
+    26       0.0741      0.3358    5.00e-04
+    27       0.0733      0.3224    5.00e-04
+    28       0.0725      0.3133    5.00e-04
+    29       0.0721      0.3129    5.00e-04
+    30       0.0713      0.3116    2.50e-04
+    31       0.0663      0.3227    2.50e-04
+    32       0.0652      0.3247    2.50e-04
+    33       0.0647      0.3308    2.50e-04
+    34       0.0641      0.3156    2.50e-04
+    35       0.0638      0.3252    2.50e-04
+    36       0.0635      0.3192    2.50e-04
+    37       0.0630      0.3357    2.50e-04
+    38       0.0627      0.3264    2.50e-04
+    39       0.0625      0.3208    2.50e-04
+    40       0.0622      0.3322    2.50e-04
+    41       0.0618      0.3321    1.25e-04
+    42       0.0593      0.3288    1.25e-04
+    43       0.0587      0.3315    1.25e-04
 
-  Early stopping at epoch 46 (no MAE improvement for 35 epochs).
+  Early stopping at epoch 43 (no MAE improvement for 35 epochs).
 =================================================================
-  Best Val MAE: 0.2777  (epoch 11)
-  Fold 2 Best Val MAE: 0.2777  |  Best Epoch: 11
+  Best Val MAE: 0.3007  (epoch 8)
+  Fold 2 Best Val MAE: 0.3007  |  Best Epoch: 8
   Checkpoint saved -> /home/sean/文件/NYCU/114-2/Data Mining/FinalProject/models/fold_1_best.pt
 
   [Fold 2 Prediction Percentiles -- best checkpoint]
   [Prediction Diagnostics] n=11,240
-    p50=0.0104  p90=1.1929  p95=1.9474  p99=2.9002  max=4.9757
+    p50=0.0166  p90=1.3017  p95=1.8993  p99=2.9522  max=3.8688
     v p99 >= 2.0 -- model is predicting away from the mean.
 
 -- Fold 3/3 --
@@ -241,103 +240,79 @@ AMP : True  |  batch_size=512 (OOM fallback: 256)  |  num_workers=8
 =================================================================
  Epoch   TrainLoss     ValMAE         LR
 =================================================================
-     1       0.6260      0.6887    1.00e-05 *
-     2       0.3735      0.4685    2.58e-04 *
-     3       0.2306      0.5309    5.05e-04
-     4       0.1591      0.5034    7.53e-04
-     5       0.1284      0.4289    1.00e-03 *
-     6       0.1050      0.4906    1.00e-03
-     7       0.0911      0.4571    1.00e-03
-     8       0.0816      0.4643    1.00e-03
-     9       0.0755      0.4759    1.00e-03
-    10       0.0700      0.4646    1.00e-03
-    11       0.0661      0.4665    1.00e-03
-    12       0.0628      0.4647    1.00e-03
-    13       0.0600      0.4411    1.00e-03
-    14       0.0580      0.4531    1.00e-03
-    15       0.0558      0.4370    1.00e-03
-    16       0.0542      0.4476    1.00e-03
-    17       0.0527      0.4618    1.00e-03
-    18       0.0511      0.4379    1.00e-03
-    19       0.0499      0.4497    1.00e-03
-    20       0.0487      0.4682    1.00e-03
-    21       0.0607      0.4344    1.00e-03
-    22       0.0576      0.4314    1.00e-03
-    23       0.0560      0.4422    1.00e-03
-    24       0.0548      0.4612    1.00e-03
-    25       0.0538      0.4386    1.00e-03
-    26       0.0526      0.4419    1.00e-03
-    27       0.0518      0.4567    1.00e-03
-    28       0.0510      0.4596    1.00e-03
-    29       0.0502      0.4488    1.00e-03
-    30       0.0495      0.4693    1.00e-03
-    31       0.0487      0.4478    1.00e-03
-    32       0.0482      0.4378    1.00e-03
-    33       0.0474      0.4280    1.00e-03 *
-    34       0.0469      0.4595    1.00e-03
-    35       0.0464      0.4343    1.00e-03
-    36       0.0461      0.4367    1.00e-03
-    37       0.0453      0.4483    1.00e-03
-    38       0.0450      0.4339    1.00e-03
-    39       0.0444      0.4277    1.00e-03 *
-    40       0.0442      0.4489    1.00e-03
-    41       0.0435      0.4488    1.00e-03
-    42       0.0433      0.4538    1.00e-03
-    43       0.0429      0.4422    1.00e-03
-    44       0.0424      0.4513    1.00e-03
-    45       0.0418      0.4588    1.00e-03
-    46       0.0418      0.4578    1.00e-03
-    47       0.0414      0.4430    1.00e-03
-    48       0.0411      0.4467    1.00e-03
-    49       0.0408      0.4534    1.00e-03
-    50       0.0404      0.4761    5.00e-04
-    51       0.0345      0.4505    5.00e-04
-    52       0.0327      0.4562    5.00e-04
-    53       0.0319      0.4416    5.00e-04
-    54       0.0313      0.4527    5.00e-04
-    55       0.0308      0.4476    5.00e-04
-    56       0.0304      0.4440    5.00e-04
-    57       0.0300      0.4543    5.00e-04
-    58       0.0297      0.4542    5.00e-04
-    59       0.0293      0.4487    5.00e-04
-    60       0.0289      0.4575    5.00e-04
-    61       0.0288      0.4568    2.50e-04
-    62       0.0261      0.4538    2.50e-04
-    63       0.0252      0.4516    2.50e-04
-    64       0.0249      0.4482    2.50e-04
-    65       0.0245      0.4564    2.50e-04
-    66       0.0242      0.4567    2.50e-04
-    67       0.0240      0.4471    2.50e-04
-    68       0.0238      0.4589    2.50e-04
-    69       0.0236      0.4507    2.50e-04
-    70       0.0234      0.4550    2.50e-04
-    71       0.0232      0.4546    2.50e-04
-    72       0.0230      0.4571    1.25e-04
-    73       0.0217      0.4518    1.25e-04
-    74       0.0213      0.4548    1.25e-04
+     1       0.6776      0.6688    1.00e-05 *
+     2       0.3958      0.5658    2.58e-04 *
+     3       0.2798      0.4919    5.05e-04 *
+     4       0.2063      0.4567    7.53e-04 *
+     5       0.1658      0.4646    1.00e-03
+     6       0.1379      0.4655    1.00e-03
+     7       0.1223      0.4630    1.00e-03
+     8       0.1115      0.4558    1.00e-03 *
+     9       0.1036      0.4707    1.00e-03
+    10       0.0980      0.4596    1.00e-03
+    11       0.0929      0.4786    1.00e-03
+    12       0.0890      0.4712    1.00e-03
+    13       0.0862      0.4469    1.00e-03 *
+    14       0.0832      0.4568    1.00e-03
+    15       0.0814      0.4383    1.00e-03 *
+    16       0.0791      0.4705    1.00e-03
+    17       0.0775      0.4411    1.00e-03
+    18       0.0757      0.4528    1.00e-03
+    19       0.0744      0.4769    1.00e-03
+    20       0.0733      0.4794    1.00e-03
+    21       0.0900      0.4705    1.00e-03
+    22       0.0868      0.4473    1.00e-03
+    23       0.0856      0.4704    1.00e-03
+    24       0.0845      0.4629    1.00e-03
+    25       0.0832      0.4626    1.00e-03
+    26       0.0822      0.4626    5.00e-04
+    27       0.0730      0.4672    5.00e-04
+    28       0.0712      0.4696    5.00e-04
+    29       0.0702      0.4832    5.00e-04
+    30       0.0694      0.4972    5.00e-04
+    31       0.0687      0.4428    5.00e-04
+    32       0.0682      0.4702    5.00e-04
+    33       0.0676      0.4809    5.00e-04
+    34       0.0672      0.4896    5.00e-04
+    35       0.0666      0.4632    5.00e-04
+    36       0.0663      0.4822    5.00e-04
+    37       0.0658      0.4614    2.50e-04
+    38       0.0613      0.4611    2.50e-04
+    39       0.0604      0.4590    2.50e-04
+    40       0.0601      0.4909    2.50e-04
+    41       0.0596      0.4599    2.50e-04
+    42       0.0593      0.4540    2.50e-04
+    43       0.0589      0.4748    2.50e-04
+    44       0.0587      0.4590    2.50e-04
+    45       0.0585      0.4685    2.50e-04
+    46       0.0583      0.4715    2.50e-04
+    47       0.0581      0.4802    2.50e-04
+    48       0.0578      0.4796    1.25e-04
+    49       0.0554      0.4757    1.25e-04
+    50       0.0550      0.4716    1.25e-04
 
-  Early stopping at epoch 74 (no MAE improvement for 35 epochs).
+  Early stopping at epoch 50 (no MAE improvement for 35 epochs).
 =================================================================
-  Best Val MAE: 0.4277  (epoch 39)
-  Fold 3 Best Val MAE: 0.4277  |  Best Epoch: 39
+  Best Val MAE: 0.4383  (epoch 15)
+  Fold 3 Best Val MAE: 0.4383  |  Best Epoch: 15
   Checkpoint saved -> /home/sean/文件/NYCU/114-2/Data Mining/FinalProject/models/fold_2_best.pt
 
   [Fold 3 Prediction Percentiles -- best checkpoint]
   [Prediction Diagnostics] n=11,240
-    p50=0.0227  p90=2.0401  p95=2.7426  p99=3.0908  max=4.5845
+    p50=0.0513  p90=1.9680  p95=2.4676  p99=3.0406  max=4.0565
     v p99 >= 2.0 -- model is predicting away from the mean.
 
 ===========================================================================
-Fold MAEs          : ['0.2477', '0.2777', '0.4277']
-Average_Val_MAE    : 0.3177
-Fold Best Epochs   : [19, 11, 39]
-Mean Best Epoch    : 23.0
+Fold MAEs          : ['0.2669', '0.3007', '0.4383']
+Average_Val_MAE    : 0.3353
+Fold Best Epochs   : [21, 8, 15]
+Mean Best Epoch    : 14.7
 Strategy (v8/v9)   : Fold Ensembling (NO blind retraining)
 
 Fold Prediction Percentiles Summary:
-  Fold 1: p50=0.000  p95=1.248  p99=2.030  max=3.398
-  Fold 2: p50=0.010  p95=1.947  p99=2.900  max=4.976
-  Fold 3: p50=0.023  p95=2.743  p99=3.091  max=4.584
+  Fold 1: p50=0.001  p95=1.613  p99=2.471  max=4.956
+  Fold 2: p50=0.017  p95=1.899  p99=2.952  max=3.869
+  Fold 3: p50=0.051  p95=2.468  p99=3.041  max=4.057
 ===========================================================================
 
 [v11] Fitting final Test StandardScaler on FULL training set ...
@@ -359,39 +334,39 @@ Fold Ensemble Inference  (v8/v9 -- Average Blending)
   Safety clip: np.clip(final_pred, 0.0, 5.0)
 ===========================================================================
 
-DroughtLSTM Architecture (v11 – BiLSTM + Scale-Up + Learnable Horizon Embedding)
+DroughtLSTM Architecture (v12 – Bottleneck Relief + Dropout Heads)
 =====================================================================================
   Input size   : 37  (features per week, 37 total)
   LayerNorm    : LayerNorm(37)  [v7: concept-drift stabiliser]
   LSTM layers  : 3  (BiLSTM, bidirectional=True)  [v11]
-  Hidden size  : 256 per direction  ->  512 effective  [v11]
+  Hidden size  : 128 per direction  ->  256 effective  [v11]
   Dropout      : 0.4
   Pooling      : Temporal Attention  [v8: retained, v11: updated to hidden*2]
-                 attention = Linear(512->1); softmax over time; weighted sum
+                 attention = Linear(256->1); softmax over time; weighted sum
   [v11] Learnable Horizon Embedding:
-     context_vector (B, 512) -> expand (B, 5, 512)
+     context_vector (B, 256) -> expand (B, 5, 256)
      horizon_ids [0,1,2,3,4] -> Embedding(5,32) -> (B, 5, 32)
-     cat(dim=-1) -> encoded_state (B, 5, 544)
-  Branch A     : Linear(544->32) -> GELU -> Linear(32->1) [per step, NO Sigmoid]
+     cat(dim=-1) -> encoded_state (B, 5, 288)
+  Branch A     : Linear(288->128) -> GELU -> Dropout(0.2) -> Linear(128->1) [per step, NO Sigmoid]  [v12]
                  squeeze(-1) -> (B,5);  sigmoid() applied inline in forward()
-  Branch B     : Linear(544->32) -> GELU -> Linear(32->1) -> Softplus()
+  Branch B     : Linear(288->128) -> GELU -> Dropout(0.2) -> Linear(128->1) -> Softplus()  [v12]
                  squeeze(-1) -> (B,5) >= 0  -- Severity of Drought
   Final Output : sigmoid(logits_A) x Branch_B  (Expected Severity)
   Returns      : (final_output, logits_output) -- two tensors
   Inference    : np.clip(final_output, 0, 5) applied in train.py
 -------------------------------------------------------------------------------------
-  [v10/v11] Dynamic Loss Weighting (Burn-in):
+  [v12] Dynamic Loss Weighting (Burn-in):
      Epochs  1-20 : Loss = Loss_B  ONLY  (regression burn-in)
      Epoch  21+   : Loss = Loss_B + 0.1 * Loss_A  (BCE introduced)
-  [v10/v11] Manual LR Warm-up:
-     Epochs  1-5  : LR linearly ramps 1e-5 -> 1e-3
+  [v12] Manual LR Warm-up (Batch=2048, Peak LR=2e-3):
+     Epochs  1-5  : LR linearly ramps 1e-5 -> 2e-3  [v12: scaled 4x]
      Epoch   6+   : ReduceLROnPlateau takes over
   Loss_A       : BCEWithLogitsLoss(logits_output, binary_target)
                  (AMP-safe: fused sigmoid+BCE avoids float16 underflow)
   Loss_B       : Continuous Smooth L1(final_output, y)   [weight 1.0]
   Early Stop   : pure L1Loss(final_output, y)  [Kaggle MAE aligned]
 -------------------------------------------------------------------------------------
-  Total params : 3,793,773
+  Total params : 1,036,269
 
   [Fold 1] Loading checkpoint: /home/sean/文件/NYCU/114-2/Data Mining/FinalProject/models/fold_0_best.pt
   [Fold 1] Inference complete. Regions predicted: 2248
@@ -405,10 +380,10 @@ DroughtLSTM Architecture (v11 – BiLSTM + Scale-Up + Learnable Horizon Embeddin
   Blending 3 fold predictions via simple average ...
 
 [Submission Prediction Diagnostics]
-  n=11,240  mean=1.5711  std=1.1529
-  p50=1.3545  p90=3.2392  p95=3.6399  p99=4.5810  max=4.9540
+  n=11,240  mean=1.5969  std=1.1791
+  p50=1.3495  p90=3.3906  p95=3.7896  p99=4.2912  max=4.9385
   v Submission p99 >= 2.0 -- model collapse is BROKEN.
-  Fraction of near-zero predictions (<0.05): 4.72%
+  Fraction of near-zero predictions (<0.05): 4.39%
 
 Formatting submission.csv ...
   v Submission assertion passed: 2248 rows, 6 columns.
@@ -419,10 +394,10 @@ Formatting submission.csv ...
 
   Preview:
 region_id  pred_week1  pred_week2  pred_week3  pred_week4  pred_week5
-       R1    1.046080    0.950088    0.854096    0.831763    0.806101
-    R1001    2.729430    2.611645    2.498363    2.285581    2.017991
-    R1002    2.674231    2.553489    2.457239    2.278168    1.917066
-    R1005    1.339811    1.443695    1.606792    1.776150    1.992865
-    R1006    1.977439    1.872819    1.897100    1.993964    2.102291
+       R1    1.621514    1.335758    1.022156    0.761143    0.554977
+    R1001    1.054603    0.951251    0.850683    0.762822    0.695745
+    R1002    2.358258    2.266955    2.162294    2.060425    1.928986
+    R1005    1.557199    1.223667    0.929895    0.765335    0.658602
+    R1006    1.860946    1.620005    1.259292    0.928157    0.724784
 
-Total elapsed: 9859.1s
+Total elapsed: 3580.0s

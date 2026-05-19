@@ -40,12 +40,12 @@ Architecture Detail
           -> Concatenate along dim=-1 -> encoded_state: (B, 5, 512+32) = (B, 5, 544)
 
           -> Branch A (Drought Probability Logits) [NO Sigmoid layer]:
-               Linear(544, 32) -> GELU -> Linear(32, 1)  [per horizon step]
+               Linear(544, 128) -> GELU -> Dropout(0.2) -> Linear(128, 1)  [per horizon step]
                Squeeze last dim -> (B, 5)  raw logits (unbounded)
                torch.sigmoid() applied inline in forward() only
 
           -> Branch B (Severity of Drought):
-               Linear(544, 32) -> GELU -> Linear(32, 1) -> Softplus()
+               Linear(544, 128) -> GELU -> Dropout(0.2) -> Linear(128, 1) -> Softplus()
                Squeeze last dim -> (B, 5)  non-negative values
 
   Forward Pass Outputs:
@@ -158,18 +158,22 @@ class DroughtLSTM(nn.Module):
         # Outputs raw logits so BCEWithLogitsLoss in train.py can operate
         # in a numerically stable, AMP-safe fused kernel.
         # torch.sigmoid() is applied inline during forward() for final_output.
+        # v12: Widened 32->128; Dropout(0.2) inserted after GELU (anti-overfitting).
         self.head_prob = nn.Sequential(
-            nn.Linear(branch_in, 32),
+            nn.Linear(branch_in, 128),
             nn.GELU(),
-            nn.Linear(32, 1),       # 1 output per horizon step
+            nn.Dropout(0.2),
+            nn.Linear(128, 1),      # 1 output per horizon step
         )
 
         # --- Branch B: Severity of Drought (per future step) ---
         # Output non-negative via Softplus; represents magnitude if drought occurs
+        # v12: Widened 32->128; Dropout(0.2) inserted after GELU (anti-overfitting).
         self.head_severity = nn.Sequential(
-            nn.Linear(branch_in, 32),
+            nn.Linear(branch_in, 128),
             nn.GELU(),
-            nn.Linear(32, 1),       # 1 output per horizon step
+            nn.Dropout(0.2),
+            nn.Linear(128, 1),      # 1 output per horizon step
         )
         self.softplus = nn.Softplus(beta=1)
 
@@ -247,9 +251,9 @@ class DroughtLSTM(nn.Module):
         # train.py receives raw logits for numerically stable AMP-safe training.
         final_output = torch.sigmoid(logits_output) * severity        # (B, H)
 
-        # v11: Shape debug – print once on first forward call
+        # v12: Shape debug – print once on first forward call
         if not self._printed_shape:
-            print(f"  [v11 Shape Debug] lstm_out: {tuple(lstm_out.shape)}  "
+            print(f"  [v12 Shape Debug] lstm_out: {tuple(lstm_out.shape)}  "
                   f"|  encoded_state: {tuple(encoded_state.shape)}  "
                   f"|  final_output: {tuple(final_output.shape)}")
             self._printed_shape = True
@@ -264,7 +268,7 @@ class DroughtLSTM(nn.Module):
         lstm_out_size = self.hidden_size * 2
         branch_in     = lstm_out_size + 32
         lines = [
-            "DroughtLSTM Architecture (v11 – BiLSTM + Scale-Up + Learnable Horizon Embedding)",
+            "DroughtLSTM Architecture (v12 – Bottleneck Relief + Dropout Heads)",
             "=" * 85,
             f"  Input size   : {input_size}  (features per week, 37 total)",
             f"  LayerNorm    : LayerNorm({input_size})  [v7: concept-drift stabiliser]",
@@ -277,19 +281,19 @@ class DroughtLSTM(nn.Module):
             f"     context_vector (B, {lstm_out_size}) -> expand (B, 5, {lstm_out_size})",
             "     horizon_ids [0,1,2,3,4] -> Embedding(5,32) -> (B, 5, 32)",
             f"     cat(dim=-1) -> encoded_state (B, 5, {branch_in})",
-            f"  Branch A     : Linear({branch_in}->32) -> GELU -> Linear(32->1) [per step, NO Sigmoid]",
+            f"  Branch A     : Linear({branch_in}->128) -> GELU -> Dropout(0.2) -> Linear(128->1) [per step, NO Sigmoid]  [v12]",
             "                 squeeze(-1) -> (B,5);  sigmoid() applied inline in forward()",
-            f"  Branch B     : Linear({branch_in}->32) -> GELU -> Linear(32->1) -> Softplus()",
+            f"  Branch B     : Linear({branch_in}->128) -> GELU -> Dropout(0.2) -> Linear(128->1) -> Softplus()  [v12]",
             "                 squeeze(-1) -> (B,5) >= 0  -- Severity of Drought",
             "  Final Output : sigmoid(logits_A) x Branch_B  (Expected Severity)",
             "  Returns      : (final_output, logits_output) -- two tensors",
             "  Inference    : np.clip(final_output, 0, 5) applied in train.py",
             "-" * 85,
-            "  [v10/v11] Dynamic Loss Weighting (Burn-in):",
+            "  [v12] Dynamic Loss Weighting (Burn-in):",
             "     Epochs  1-20 : Loss = Loss_B  ONLY  (regression burn-in)",
             "     Epoch  21+   : Loss = Loss_B + 0.1 * Loss_A  (BCE introduced)",
-            "  [v10/v11] Manual LR Warm-up:",
-            "     Epochs  1-5  : LR linearly ramps 1e-5 -> 1e-3",
+            "  [v12] Manual LR Warm-up (Batch=2048, Peak LR=2e-3):",
+            "     Epochs  1-5  : LR linearly ramps 1e-5 -> 2e-3  [v12: scaled 4x]",
             "     Epoch   6+   : ReduceLROnPlateau takes over",
             "  Loss_A       : BCEWithLogitsLoss(logits_output, binary_target)",
             "                 (AMP-safe: fused sigmoid+BCE avoids float16 underflow)",

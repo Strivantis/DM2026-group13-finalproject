@@ -108,13 +108,13 @@ PROCESSED_DIR = os.path.join(ROOT, "data", "processed")
 MODELS_DIR    = os.path.join(ROOT, "models")
 os.makedirs(MODELS_DIR, exist_ok=True)
 
-# v11: Scale-up
-HIDDEN_SIZE   = 256           # v11: was 64
+# v11: Scale-up  |  v12: Batch=2048  |  v12.1: LR/WD fix  |  v12.2: Downsize + Batch revert
+HIDDEN_SIZE   = 128           # v12.2: 256->128 (BiLSTM output=256, ~1M params sweet spot)
 NUM_LAYERS    = 3             # v11: was 2
 DROPOUT       = 0.4
-LEARNING_RATE = 1e-3
-WEIGHT_DECAY  = 1e-3
-BATCH_SIZE    = 512           # v11: OOM fallback to 256 inside fold loop
+LEARNING_RATE = 1e-3          # v12.1: reverted from 2e-3
+WEIGHT_DECAY  = 1e-2          # v12.1: 1e-3 -> 1e-2 (standard AdamW default)
+BATCH_SIZE    = 512           # v12.2: 2048->512 (restore gradient noise; OOM fallback=256)
 NUM_EPOCHS    = 200           # extended budget; early stopping governs each fold
 PATIENCE      = 35            # deeper convergence patience on pure val MAE
 
@@ -371,8 +371,9 @@ def train_model(
     history      = []
 
     for epoch in range(1, num_epochs + 1):
-        # --- v10/v11: Manual LR Warm-up (Epochs 1-5) ---
+        # --- v12.2: Manual LR Warm-up (Epochs 1-5) ---
         # Linear ramp from 1e-5 to 1e-3 over the first 5 epochs.
+        # Reverted to stable 5-epoch schedule now that batch size is back to 512.
         # Prevents ReduceLROnPlateau from firing during the volatile
         # feature-alignment phase before the model has learned anything.
         if epoch <= 5:
@@ -383,7 +384,7 @@ def train_model(
         train_loss = train_epoch(model, train_loader, optimiser, DEVICE, epoch)
         val_mae    = eval_mae(model, val_loader, DEVICE)
 
-        # --- v10/v11: Only step ReduceLROnPlateau after warm-up is complete ---
+        # --- v12.2: Only step ReduceLROnPlateau after warm-up is complete ---
         if epoch > 5:
             scheduler.step(val_mae)
 
@@ -558,26 +559,26 @@ def main():
 
     # -- 0. Architecture & loss description ------------------------------------
     log("=" * 75)
-    log("Drought Forecasting Pipeline  v11")
-    log("BiLSTM + Scale-Up + Learnable Horizon Embedding + Gap-Aware CV + OOF Scaling")
+    log("Drought Forecasting Pipeline  v12")
+    log("Bottleneck Relief + Batch=2048 + Peak LR=2e-3 (Linear Scaling Rule)")
     log("=" * 75)
-    log("Architecture : Two-Stage BiLSTM MTL + Learnable Horizon Embedding  [v11]")
-    log(f"  BiLSTM     : hidden_size={HIDDEN_SIZE}/dir -> {HIDDEN_SIZE*2} effective  [v11: was 64]")
-    log(f"  Layers     : {NUM_LAYERS}  [v11: was 2]")
+    log("Architecture : Two-Stage BiLSTM MTL + Learnable Horizon Embedding  [v11/v12]")
+    log(f"  BiLSTM     : hidden_size={HIDDEN_SIZE}/dir -> {HIDDEN_SIZE*2} effective  [v11]")
+    log(f"  Layers     : {NUM_LAYERS}  [v11]")
     log(f"  context_vector (B,{HIDDEN_SIZE*2}) -> expand (B,5,{HIDDEN_SIZE*2})")
     log(f"  horizon_ids [0-4] -> Embedding(5,32) -> (B,5,32)  [v11: learnable]")
     log(f"  encoded_state (B,5,{HIDDEN_SIZE*2+32})  [v11: replaces linspace scalar]")
-    log(f"  Branch A   : Linear({HIDDEN_SIZE*2+32}->32) -> GELU -> Linear(32->1) -> (B,5)")
+    log(f"  Branch A   : Linear({HIDDEN_SIZE*2+32}->128) -> GELU -> Dropout(0.2) -> Linear(128->1) -> (B,5)  [v12]")
     log( "               P(drought) logits -- sigmoid() inline in forward()")
-    log(f"  Branch B   : Linear({HIDDEN_SIZE*2+32}->32) -> GELU -> Linear(32->1) -> (B,5)")
+    log(f"  Branch B   : Linear({HIDDEN_SIZE*2+32}->128) -> GELU -> Dropout(0.2) -> Linear(128->1) -> (B,5)  [v12]")
     log( "               Severity >= 0  via Softplus()")
     log( "  Output     : final = sigmoid(logits_A) x Branch_B  (Expected Severity)")
-    log( "Loss         : [v10/v11] Dynamic Burn-in Schedule")
+    log( "Loss         : [v12] Dynamic Burn-in Schedule")
     log( "  Epoch 1-20 : Loss = Loss_B ONLY  (regression burn-in)")
     log( "  Epoch 21+  : Loss = Loss_B + 0.1 * Loss_A  (BCE introduced lightly)")
     log( "  Loss_B     : Continuous Smooth L1  W_i = 1.0 + (y_i/5)^2 * 3.0")
     log( "  Loss_A     : BCEWithLogitsLoss(logits_output, binary_target)")
-    log( "LR Schedule  : [v10/v11] Manual Warm-up Epochs 1-5: 1e-5 -> 1e-3 (linear)")
+    log( "LR Schedule  : [v12] Manual Warm-up Epochs 1-5: 1e-5 -> 2e-3 (linear, 4x scaled)")
     log( "               Epoch 6+: ReduceLROnPlateau (factor=0.5, patience=10)")
     log( "Early Stop   : pure L1Loss(final_output, y)  [Kaggle MAE aligned]")
     log( "Pooling      : Temporal Attention  [v8: retained; v11: updated for hidden*2]")
@@ -590,11 +591,11 @@ def main():
     log(f"  GAP_WEEKS  : {GAP_WEEKS} weeks  [v11: train cutoff = val_start - {GAP_WEEKS}]")
     log( "OOF Scaling  : Fold-local StandardScaler (NO global pre-fit)  [v11]")
     log( "Test Scaler  : Final StandardScaler fit on full 1.7M train set  [v11]")
-    log( "OOM Guard    : try-except RuntimeError -> fallback BATCH_SIZE=256  [v11]")
+    log( "OOM Guard    : try-except RuntimeError -> fallback BATCH_SIZE=1024  [v12]")
     log( "Strategy     : Fold Ensembling  (3 folds x 5 weeks, avg test predictions)")
     log(f"Epochs       : {NUM_EPOCHS}  |  Patience: {PATIENCE}")
     log(f"Seed         : 42  (cuDNN deterministic={torch.backends.cudnn.deterministic})")
-    log(f"BatchSize    : {BATCH_SIZE}  (OOM fallback: 256)")
+    log(f"BatchSize    : {BATCH_SIZE}  (OOM fallback: 1024)  [v12: 4x scale-up]")
 
     # -- 1. Load data ----------------------------------------------------------
     log("\nLoading processed data ...")
@@ -687,7 +688,7 @@ def main():
     log(f"Scaler      : OOF (new StandardScaler per fold, fit on fold train features)")
     log(f"Checkpoints : fold_0_best.pt / fold_1_best.pt / fold_2_best.pt")
     log(f"Strategy    : Fold Ensembling  (v8 retained)")
-    log(f"AMP : {USE_AMP}  |  batch_size={BATCH_SIZE} (OOM fallback: 256)  |  num_workers=8")
+    log(f"AMP : {USE_AMP}  |  batch_size={BATCH_SIZE} (OOM fallback: 1024)  |  num_workers=8  [v12]")
     log(f"{'='*75}")
 
     folds = build_walk_forward_folds(train_df)
@@ -763,7 +764,7 @@ def main():
         fold_ckpt  = os.path.join(MODELS_DIR, f"fold_{fold_k}_best.pt")
         fold_ckpt_paths.append(fold_ckpt)
 
-        # ---- v11: OOM-Protected Training ------------------------------------
+        # ---- v12.2: OOM-Protected Training ------------------------------------
         # Start with BATCH_SIZE=512; if CUDA OOM is caught, flush cache,
         # fall back to BATCH_SIZE=256, and restart training for this fold.
         batch_size_to_use = BATCH_SIZE
@@ -815,8 +816,8 @@ def main():
 
         except RuntimeError as oom_err:
             if "out of memory" in str(oom_err).lower():
-                log(f"\n  [v11 OOM] CUDA out-of-memory at batch_size={batch_size_to_use}.")
-                log(f"  [v11 OOM] Flushing CUDA cache and retrying with batch_size=256 ...")
+                log(f"\n  [v12.2 OOM] CUDA out-of-memory at batch_size={batch_size_to_use}.")
+                log(f"  [v12.2 OOM] Flushing CUDA cache and retrying with batch_size=256 ...")
                 torch.cuda.empty_cache()
 
                 # Re-instantiate model to clear any partially-allocated weights
