@@ -1,6 +1,6 @@
 """
-train.py -- Drought Score Forecasting Pipeline (v17 – Hurdle Model + Exponential Gap-Gating + 5-Fold Region Group CV)
-=====================================================================================================================
+train.py -- Drought Score Forecasting Pipeline (v18 – Hard Thresholding + StratifiedGroupKFold + Loss Re-weighting)
+====================================================================================================================
 Usage:
     python src/train.py
 
@@ -8,37 +8,41 @@ Outputs:
     submission.csv                  -- Kaggle submission (2248 rows + header, 5-fold ensemble average)
     models/fold_{k}_best.pt         -- Best weights per fold (k=0..4)
     models/scaler_fold_{k}.pkl      -- StandardScaler per fold (fit on fold's train regions only)
-    _training_log_17th.txt          -- Full console log
+    _training_log_18th.txt          -- Full console log
 
-Key improvements (v17)
+Key improvements (v18)
 -----------------------
-  1. 5-Fold Region Group CV (dataset.py build_region_group_cv_folds):
-       - GroupKFold(n_splits=5) grouped strictly by region_id.
-       - 20% of geographical regions entirely withheld per fold.
-       - Breaks global macro-climate memorisation.
-       - OOF Scaler: StandardScaler fit ONLY on 4-fold train regions per fold.
-       - OOF TE: region_mean_score / region_zero_prob computed ONLY from
-         4-fold train regions per fold (no validation leakage).
-       - submission.csv averages predictions across all 5 fold models.
+  1. StratifiedGroupKFold CV (dataset.py build_region_group_cv_folds):
+       - REPLACES GroupKFold with StratifiedGroupKFold(n_splits=5).
+       - Stratification: 10 quantile bins of per-region historical mean score.
+         pd.qcut(region_means, q=10, labels=False, duplicates='drop')
+       - Every fold now contains an identical proportion of "perpetual desert"
+         vs "frequent rainy" regions, eliminating the Fold 2 outlier variance.
+       - groups=region_id unchanged (no cross-region leakage).
+       - OOF Scaler/TE alignment fully preserved from v17.
 
-  2. Exponential Decay Gap-Gating (model.py):
-       - gap_lambda = nn.Parameter(tensor(5.0))  (learnable scalar)
-       - G = exp(-max(eps, |gap_lambda|) * gap_size)  strictly monotone
-       - Replaces the anti-physics Linear+Sigmoid gate from v16.
+  2. Inference Hard Thresholding Gate (model.py forward):
+       - final_output now uses: torch.where(prob < 0.5, 0.0, prob * severity)
+       - Completely terminates fractional noise (e.g., 0.3) for regions that
+         should predict absolute zero, matching the 59.64% zero-inflation ceiling.
+       - Raw loss branches (logits_output, severity_output) are UNAFFECTED;
+         backward pass uses only hurdle_loss(logits, severity, y).
+       - eval_mae() and early stopping now directly optimise for the
+         hard-thresholded final_output -- fully Kaggle-metric aligned.
 
-  3. Decoupled Hurdle Model Loss (hurdle_loss):
-       - Branch A: FocalLoss(gamma=2.0) across ALL samples, weight=1.0
-       - Branch B: Weighted Smooth L1 STRICTLY on target > 0, weight=1.0
-       - No burn-in schedule. Loss_A and Loss_B are always active.
-       - Total = Loss_A + Loss_B  (mathematically isolated gradients)
-       - Model forward now returns (final_output, logits_output, severity_output).
+  3. Focal Loss Weight Re-calibration (hurdle_loss):
+       - Total = 2.0 * Loss_A (FocalLoss) + 1.0 * Loss_B (Smooth L1)
+       - Increased from 1.0 to 2.0 because the inference layer now relies on
+         the classification head as a hard switch; minimising classification
+         errors is paramount.
 
-  4. Preserved Hyperparameters:
+  4. Preserved Hyperparameters (from v17):
        - BATCH_SIZE=512 (OOM fallback to 256)
        - Peak LR=1e-3, Manual Warm-up Epochs 1-5
        - ReduceLROnPlateau after Epoch 5
        - NUM_EPOCHS=200, PATIENCE=35
        - WEIGHT_DECAY=1e-2
+       - BiLSTM + Dilated TCN architecture unchanged
 
 Hardware note
 -------------
@@ -103,7 +107,7 @@ PROCESSED_DIR = os.path.join(ROOT, "data", "processed")
 MODELS_DIR    = os.path.join(ROOT, "models")
 os.makedirs(MODELS_DIR, exist_ok=True)
 
-N_FOLDS       = 5             # v17: 5-Fold Region Group CV
+N_FOLDS       = 5             # v18: 5-Fold Stratified Region Group CV
 HIDDEN_SIZE   = 128           # v16: BiLSTM hidden per direction (was 256 in v15)
                                # Effective output = HIDDEN_SIZE * 2 = 256
 NUM_LAYERS    = 3
@@ -130,7 +134,7 @@ _l1_criterion = nn.L1Loss()
 
 
 # ---------------------------------------------------------------------------
-# Focal Loss  (v16/v17 – Branch A classification loss)
+# Focal Loss  (v16/v17/v18 – Branch A classification loss)
 # ---------------------------------------------------------------------------
 def focal_loss(
     logits: torch.Tensor,
@@ -160,7 +164,7 @@ def focal_loss(
 
 
 # ---------------------------------------------------------------------------
-# Decoupled Hurdle Model Loss  (v17 – replaces joint_loss / masked burn-in)
+# Decoupled Hurdle Model Loss  (v18 – Loss_A weight increased to 2.0)
 # ---------------------------------------------------------------------------
 def hurdle_loss(
     logits_output: torch.Tensor,
@@ -168,12 +172,13 @@ def hurdle_loss(
     target: torch.Tensor,
 ) -> torch.Tensor:
     """
-    v17 Decoupled Hurdle Model Loss.
+    v18 Decoupled Hurdle Model Loss.
 
     Branch A (Classification Head):
         FocalLoss(gamma=2.0) computed across ALL samples in the batch.
         binary_target = (target > 0.0).float()
-        Loss weight: 1.0
+        Loss weight: 2.0  [v18: increased from 1.0 -- classification is now a
+                           hard switch in inference; errors are paramount]
 
     Branch B (Regression Head):
         Continuous weighted Smooth L1 Loss computed STRICTLY on samples
@@ -184,7 +189,7 @@ def hurdle_loss(
         If all targets == 0: loss_b = 0.0
         Loss weight: 1.0
 
-    Total Loss = Loss_A + Loss_B
+    Total Loss = 2.0 * Loss_A + 1.0 * Loss_B  [v18: was 1.0+1.0 in v17]
 
     This allows Branch B to specialise strictly in drought severity scales,
     while Branch A masters the zero-inflation boundary classification.
@@ -206,7 +211,8 @@ def hurdle_loss(
         # Degenerate batch: all zeros -- return zero loss that still allows backward
         loss_b = torch.tensor(0.0, device=target.device, requires_grad=True)
 
-    return loss_a + loss_b
+    # v18: classification loss weighted 2x to stabilise the hard-threshold gate
+    return 2.0 * loss_a + 1.0 * loss_b
 
 
 # ---------------------------------------------------------------------------
@@ -215,7 +221,7 @@ def hurdle_loss(
 
 def train_epoch(model, loader, optimizer, device):
     """
-    One training epoch -- v17: unpack (X, y, target_time, gap_size) from loader.
+    One training epoch -- v17/v18: unpack (X, y, target_time, gap_size) from loader.
     Uses decoupled hurdle_loss(logits_output, severity_output, y).
     """
     model.train()
@@ -246,7 +252,8 @@ def train_epoch(model, loader, optimizer, device):
 def eval_mae(model, loader, device) -> float:
     """
     Evaluate pure (unweighted) MAE on final_output -- used for early stopping.
-    v17: unpack (X, y, target_time, gap_size), model returns 3 tensors.
+    v18: final_output uses Hard Thresholding Gate (prob < 0.5 => 0.0), so
+    early stopping now directly optimises for the thresholded output.
     """
     model.eval()
     total_mae, n = 0.0, 0
@@ -265,7 +272,7 @@ def eval_mae(model, loader, device) -> float:
 def eval_prediction_percentiles(model, loader, device, log) -> dict:
     """
     Diagnostic hook: collect all final_output predictions and log percentile stats.
-    v17: model returns (final_output, logits_output, severity_output).
+    v17/v18: model returns (final_output, logits_output, severity_output).
     """
     model.eval()
     all_preds = []
@@ -348,12 +355,13 @@ def train_model(
     """
     Train model with early stopping on pure (unweighted) MAE.
 
-    v17 Training:
+    v18 Training:
       - Manual LR warm-up epochs 1-5: linear ramp 1e-5 -> 1e-3.
       - ReduceLROnPlateau only active from epoch 6+.
-      - v17 Decoupled Hurdle Loss (always active, no burn-in schedule):
-          Loss = FocalLoss(all) + Weighted_Smooth_L1(target>0 only)
+      - v18 Decoupled Hurdle Loss (always active, no burn-in schedule):
+          Loss = 2.0 * FocalLoss(all) + 1.0 * Weighted_Smooth_L1(target>0 only)
     Early stopping: pure L1Loss(final_output, y) -- strictly Kaggle-metric-aligned.
+    Note: final_output uses Hard Thresholding Gate, so MAE is thresholded-aligned.
 
     Returns best_val_mae, best_epoch, history.
     """
@@ -371,7 +379,7 @@ def train_model(
     history      = []
 
     for epoch in range(1, num_epochs + 1):
-        # --- v17: Manual LR Warm-up (Epochs 1-5) ---
+        # --- v18: Manual LR Warm-up (Epochs 1-5) ---
         # Linear ramp from 1e-5 to 1e-3 over the first 5 epochs.
         if epoch <= 5:
             lr = 1e-5 + (1e-3 - 1e-5) * ((epoch - 1) / 4.0)
@@ -401,7 +409,7 @@ def train_model(
         marker = " *" if improved else ""
         log(
             f"{epoch:>6}  {train_loss:>11.4f}"
-            f"  {val_mae:>10.4f}  {curr_lr:>10.2e}  [HurdleDecoupled]{marker}"
+            f"  {val_mae:>10.4f}  {curr_lr:>10.2e}  [HurdleDecoupled_v18]{marker}"
         )
 
         if no_improve >= patience:
@@ -428,7 +436,7 @@ def _compute_te_stats(df: pd.DataFrame) -> tuple:
     """
     Compute target encoding statistics from a DataFrame with a 'score' column.
 
-    v17: called per-fold on fold's train-region rows only (OOF TE alignment).
+    v17/v18: called per-fold on fold's train-region rows only (OOF TE alignment).
 
     Returns
     -------
@@ -461,7 +469,7 @@ def _augment_groups_with_te(
     Inject target encoding features into each (group_df, i_min, i_max, gap) tuple.
     TE values are CONSTANT within a region (static features).
 
-    v14/v15/v16/v17: handles 4-tuple (group, i_min, i_max, actual_gap).
+    v14/v15/v16/v17/v18: handles 4-tuple (group, i_min, i_max, actual_gap).
     """
     result = []
     for entry in groups:
@@ -500,16 +508,18 @@ def _merge_te_to_df(
 
 
 # ---------------------------------------------------------------------------
-# Inference helper  (v17: per-fold model + per-fold scaler + per-fold TE)
+# Inference helper  (v18: per-fold model + per-fold scaler + per-fold TE)
 # ---------------------------------------------------------------------------
 @torch.no_grad()
 def predict_test_set(model, test_df, feat_cols, scaler, actual_gaps, log) -> dict:
     """
     Run inference for every region in test_df using the given model.
 
-    v17: called once per fold. Predictions are averaged across all 5 folds
+    v18: called once per fold. Predictions are averaged across all 5 folds
     in main() to produce the final submission.
-    Submission clipped to [0, 5].
+    Hard Thresholding Gate is applied inside model.forward() -- predictions
+    where P(drought) < 0.5 are already set to 0.0 before reaching here.
+    Submission additionally clipped to [0, 5].
 
     Returns
     -------
@@ -558,7 +568,8 @@ def predict_test_set(model, test_df, feat_cols, scaler, actual_gaps, log) -> dic
         # (1, 1)
 
         with autocast(device_type=DEVICE.type, enabled=USE_AMP):
-            # v17: model returns (final_output, logits_output, severity_output)
+            # v18: model returns (final_output, logits_output, severity_output)
+            # final_output already has Hard Thresholding applied inside forward()
             final_output, _, _ = model(X_tensor, target_time_tensor, gap_tensor)
 
         pred = final_output.squeeze(0).cpu().float().numpy()
@@ -581,9 +592,9 @@ def main():
 
     # -- 0. Architecture & loss description ------------------------------------
     log("=" * 85)
-    log("Drought Forecasting Pipeline  v17")
-    log("Dilated TCN + Exponential Decay Gap-Gating + Decoupled Hurdle Model")
-    log("5-Fold Region Group CV  (GroupKFold by region_id)")
+    log("Drought Forecasting Pipeline  v18")
+    log("Dilated TCN + Exponential Decay Gap-Gating + Hard Thresholding + Decoupled Hurdle Model")
+    log("5-Fold Stratified Region Group CV  (StratifiedGroupKFold by region_id)")
     log("=" * 85)
     log("Architecture : Dual-Stream Dilated TCN + BiLSTM MTL  [v16, retained]")
     log(f"  == LSTM Stream ==")
@@ -591,7 +602,7 @@ def main():
     log(f"  Layers     : {NUM_LAYERS}")
     log(f"  lstm_context (B,{HIDDEN_SIZE*2})  x  G  ->  gated (B,{HIDDEN_SIZE*2}) "
         f"-> expand (B,5,{HIDDEN_SIZE*2})")
-    log(f"  == Dilated TCN Stream (v16 – retained) ==")
+    log(f"  == Dilated TCN Stream (v16 - retained) ==")
     log(f"  Input      : (B, 29, 13)  [features x window]")
     log(f"  TCN Layer 1: Conv1d(29->128, k=3, d=1, pad=1) + GELU -> (B,128,13)")
     log(f"  TCN Layer 2: Conv1d(128->128, k=3, d=2, pad=2) + GELU -> (B,128,13)")
@@ -599,11 +610,10 @@ def main():
     log(f"  Receptive field: 29 weeks (full window coverage)")
     log(f"  GlobalPool : AdaptiveAvgPool1d(1) -> squeeze -> (B,128)")
     log(f"  tcn_context (B,128)  x  G  ->  gated (B,128) -> expand (B,5,128)")
-    log(f"  == Exponential Decay Gap-Gating (v17 NEW) ==")
+    log(f"  == Exponential Decay Gap-Gating (v17, retained) ==")
     log(f"  gap_lambda : nn.Parameter (learnable scalar, init=5.0)")
     log(f"  G = exp(-max(eps,|gap_lambda|)*gap_size)  (B,1)  in (0, 1]")
     log(f"  Physics constraint: G->1 at gap=0, G->0 as gap->inf (strictly monotone)")
-    log(f"  Replaces anti-physics Linear+Sigmoid gate from v16")
     log(f"  == Fusion ==")
     log(f"  horizon_ids [0-4] -> Embedding(5,32) -> (B,5,32)")
     log(f"  target_time (B,5,2) -- week_sin/cos of 5 future target weeks")
@@ -613,34 +623,38 @@ def main():
     log( "               P(drought) logits -- sigmoid() inline in forward()")
     log(f"  Branch B   : Linear(434->128) -> GELU -> Dropout(0.2) -> Linear(128->1)")
     log( "               Severity >= 0  via Softplus()")
-    log( "  Output     : final = sigmoid(logits_A) x Branch_B  (Expected Severity)")
+    log( "  Output     : [v18 NEW] Hard Thresholding Gate:")
+    log( "               prob = sigmoid(logits_A)")
+    log( "               final = where(prob < 0.5, 0.0, prob * Branch_B)")
     log( "  Returns    : (final_output, logits_output, severity_output)  [v17: 3 tensors]")
-    log( "CV Strategy  : [v17] 5-Fold Region Group CV  (GroupKFold by region_id)")
+    log( "CV Strategy  : [v18] 5-Fold Stratified Region Group CV  (StratifiedGroupKFold)")
     log(f"  N_FOLDS    : {N_FOLDS}")
     log(f"  WINDOW_SIZE: {WINDOW_SIZE} weeks")
+    log( "  Stratify   : 10-quantile bins of per-region mean score (pd.qcut q=10)")
     log( "  Val regions: 20% of geographical regions entirely withheld per fold")
     log( "  Train      : ALL sliding windows for 80% of regions")
     log( "  Val        : last 5 weeks for 20% of regions (gap-replay windowing)")
     log( "  OOF Scaler : StandardScaler fit ONLY on 4-fold train regions per fold")
     log( "  OOF TE     : region_mean/zero_prob from 4-fold train regions ONLY")
     log( "  Submission : average predictions across all 5 fold models")
-    log( "Loss         : [v17] Decoupled Hurdle Model Loss (always active, no burn-in)")
-    log( "  Loss_A     : FocalLoss(gamma=2.0) across ALL samples, weight=1.0")
+    log( "Loss         : [v18] Decoupled Hurdle Model Loss + Loss Re-weighting")
+    log( "  Loss_A     : FocalLoss(gamma=2.0) across ALL samples, weight=2.0  [v18: 1.0->2.0]")
     log( "  Loss_B     : Weighted Smooth L1 on target>0 ONLY, weight=1.0")
     log( "               w_i = 1.0 + (y_i/5)^2 * 3.0")
-    log( "  Total      : Loss_A + Loss_B  (mathematically isolated gradient flows)")
+    log( "  Total      : 2.0*Loss_A + 1.0*Loss_B  (classification head prioritised)")
     log(f"LR Schedule  : Manual Warm-up Epochs 1-5: 1e-5 -> 1e-3 (linear)")
     log( "               Epoch 6+: ReduceLROnPlateau (factor=0.5, patience=10)")
     log( "Early Stop   : pure L1Loss(final_output, y)  [Kaggle MAE aligned]")
+    log( "               v18: final_output is Hard-Thresholded -- MAE is gate-aligned")
     log( "Pooling      : Temporal Attention [v8: retained]")
     log( "LayerNorm    : LayerNorm(input_size) before LSTM  [v7: retained]")
     log( "Features     : 29  (11 weather + 2 cyclic + 3 rolling-4w + 4 lag1 "
          "+ 4 lag2 + 3 drought-4w + 2 TE)  [v16: removed 8w/13w]")
     log( "  Cyclic     : week_sin, week_cos")
-    log( "  TE         : region_mean_score, region_zero_prob  [OOF per fold in v17]")
+    log( "  TE         : region_mean_score, region_zero_prob  [OOF per fold in v17/v18]")
     log( "Scaler       : OOF StandardScaler per fold  [v17: replaces single scaler]")
-    log( "Checkpoint   : fold_{k}_best.pt  [v17: one per fold, 5 total]")
-    log( "Inference    : 5-fold ensemble average  [v17: replaces single model]")
+    log( "Checkpoint   : fold_{k}_best.pt  [one per fold, 5 total]")
+    log( "Inference    : 5-fold ensemble average")
     log( "OOM Guard    : try-except RuntimeError -> fallback BATCH_SIZE=256")
     log(f"Epochs       : {NUM_EPOCHS}  |  Patience: {PATIENCE}")
     log(f"Seed         : 42  (cuDNN deterministic={torch.backends.cudnn.deterministic})")
@@ -658,8 +672,8 @@ def main():
     assert n_train_regions == 2248, f"Expected 2248 train regions, got {n_train_regions}"
     assert n_test_regions  == 2248, f"Expected 2248 test regions,  got {n_test_regions}"
 
-    # -- 1b. Validate v16/v17 features in processed CSV ------------------------
-    log("\n[v17 Feature Validation]")
+    # -- 1b. Validate v16/v17/v18 features in processed CSV -------------------
+    log("\n[v18 Feature Validation]")
     assert "week_sin" in train_raw.columns, "week_sin missing -- run preprocess.py first"
     assert "week_cos" in train_raw.columns, "week_cos missing -- run preprocess.py first"
     assert "month" not in train_raw.columns, "month still present -- should be dropped by preprocess"
@@ -702,14 +716,14 @@ def main():
     zero_frac  = (all_scores == 0.0).mean()
     log(f"  mean={all_scores.mean():.4f}  std={all_scores.std():.4f}  "
         f"min={all_scores.min():.2f}  max={all_scores.max():.2f}")
-    log(f"  [v17] Zero-inflation: {zero_frac:.2%} of training scores == 0.0")
-    log(f"  [v17] Hurdle Loss_B targets {1 - zero_frac:.2%} active samples (target>0)")
+    log(f"  [v18] Zero-inflation: {zero_frac:.2%} of training scores == 0.0")
+    log(f"  [v18] Hurdle Loss_B targets {1 - zero_frac:.2%} active samples (target>0)")
     for thresh in [1.0, 2.0, 3.0, 4.0]:
         frac = (all_scores > thresh).mean() * 100
         log(f"  score > {thresh:.1f}: {frac:.2f}%  [{int((all_scores > thresh).sum()):,} samples]")
 
     # -- 4b. Compute per-region actual deployment gap --------------------------
-    log("\n[v17] Computing per-region actual deployment gaps ...")
+    log("\n[v18] Computing per-region actual deployment gaps ...")
     actual_gaps = compute_actual_gaps(train_raw, test_raw)
     gap_values  = np.array(list(actual_gaps.values()))
     log(f"  Regions with gap computed : {len(actual_gaps)}")
@@ -723,10 +737,10 @@ def main():
     gap_counter = Counter(gap_values.astype(int).tolist())
     top5 = gap_counter.most_common(5)
     log(f"  Top-5 most common gaps: {top5}")
-    log(f"  [v17] Exponential Decay Gate: G = exp(-|gap_lambda| * gap_size)")
+    log(f"  [v18] Exponential Decay Gate: G = exp(-|gap_lambda| * gap_size)")
 
     # -- 5. Determine feature columns and input_size ---------------------------
-    log("\n[v17] Determining feature columns ...")
+    log("\n[v18] Determining feature columns ...")
     # Need a temp TE-augmented df just to resolve feat_cols
     # (TE will be added per-fold; here just identify which base cols are present)
     feat_cols  = [c for c in FEATURE_COLS if c in train_df.columns
@@ -741,14 +755,14 @@ def main():
 
     assert input_size == 29, (
         f"Expected 29 features (27 base + 2 TE), got {input_size}. "
-        f"v16/v17: removed all 8w/13w rolling features."
+        f"v16/v17/v18: removed all 8w/13w rolling features."
     )
     log(f"  input_size = {input_size}  (29 confirmed)")
 
-    # -- 6. Build 5-Fold Region Group CV splits --------------------------------
+    # -- 6. Build 5-Fold Stratified Region Group CV splits ---------------------
     log(f"\n{'='*85}")
-    log(f"5-Fold Region Group CV  [v17]")
-    log(f"  GroupKFold(n_splits={N_FOLDS}) grouped by region_id")
+    log(f"5-Fold Stratified Region Group CV  [v18]")
+    log(f"  StratifiedGroupKFold(n_splits={N_FOLDS}) grouped by region_id, stratified by 10 score bins")
     log(f"  Each fold: 20% of regions withheld entirely for validation")
     log(f"  Train groups: ALL sliding windows for 80% train-fold regions")
     log(f"  Val groups  : Last {HORIZON} weeks for 20% val-fold regions (gap-replay)")
@@ -770,7 +784,7 @@ def main():
     for fold_k, (raw_train_groups, raw_val_groups) in enumerate(folds):
 
         log(f"\n{'='*85}")
-        log(f"FOLD {fold_k + 1} / {N_FOLDS}  [v17 Region Group CV]")
+        log(f"FOLD {fold_k + 1} / {N_FOLDS}  [v18 Stratified Region Group CV]")
         log(f"  train_groups: {len(raw_train_groups):,}  |  "
             f"val_groups: {len(raw_val_groups):,}")
         log(f"{'='*85}")
@@ -846,7 +860,7 @@ def main():
             # Tensor shape verification (first fold only)
             if fold_k == 0:
                 first_X, first_y, first_tt, first_gs = next(iter(loader_tr))
-                log(f"\n  [v17 Tensor Shape Verification] First Batch (Fold 0):")
+                log(f"\n  [v18 Tensor Shape Verification] First Batch (Fold 0):")
                 log(f"    X shape          : {tuple(first_X.shape)}"
                     f"  ->  (Batch, Seq={first_X.shape[1]}, Features={first_X.shape[2]})")
                 log(f"    y shape          : {tuple(first_y.shape)}"
@@ -931,7 +945,7 @@ def main():
 
     # -- 8. Cross-fold summary -------------------------------------------------
     log(f"\n{'='*85}")
-    log(f"5-Fold Cross-Validation Summary  [v17]")
+    log(f"5-Fold Cross-Validation Summary  [v18]")
     log(f"{'='*85}")
     mae_values = [r[1] for r in fold_results]
     for fold_k, best_mae, best_epoch in fold_results:
@@ -941,7 +955,7 @@ def main():
         f"(MAE={min(mae_values):.4f})")
 
     # -- 9. Ensemble: average predictions across all 5 folds -------------------
-    log(f"\n[v17] Ensembling {N_FOLDS}-fold test predictions (simple average) ...")
+    log(f"\n[v18] Ensembling {N_FOLDS}-fold test predictions (simple average) ...")
     # All folds predict for all 2248 regions
     all_region_ids = sorted(fold_test_preds[0].keys())
     final_predictions = {}
@@ -968,6 +982,7 @@ def main():
 
     zero_pred_frac = (all_sub_preds < 0.05).mean()
     log(f"  Fraction of near-zero predictions (<0.05): {zero_pred_frac:.2%}")
+    log(f"  [v18] Hard Thresholding active: predictions where P(drought)<0.5 forced to 0.0")
 
     # -- 11. Format & save submission.csv -------------------------------------
     log("\nFormatting submission.csv ...")
@@ -1016,14 +1031,14 @@ def main():
     log(f"\n  Preview:\n{submission.head(5).to_string(index=False)}")
 
     # -- 13. Print architecture summary (using last fold's checkpoint) --------
-    log(f"\n[v17 Architecture Summary]")
+    log(f"\n[v18 Architecture Summary]")
     _tmp_model = make_model(input_size)
     log("\n" + _tmp_model.architecture_summary(input_size))
     del _tmp_model
 
     # Save full training log
     log(f"\nTotal elapsed: {(time.time() - t0):.1f}s")
-    log_path = os.path.join(ROOT, "_training_log_17th.txt")
+    log_path = os.path.join(ROOT, "_training_log_18th.txt")
     with open(log_path, "w") as f:
         f.write("\n".join(log_lines))
     print(f"\nTraining log saved -> {log_path}")

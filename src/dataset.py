@@ -510,7 +510,7 @@ def build_walk_forward_folds(df: pd.DataFrame):
 
 
 # ---------------------------------------------------------------------------
-# v17: 5-Fold Region Group CV builder (GroupKFold by region_id)
+# v18: 5-Fold Stratified Region Group CV builder (StratifiedGroupKFold)
 # ---------------------------------------------------------------------------
 def build_region_group_cv_folds(
     df: pd.DataFrame,
@@ -518,11 +518,21 @@ def build_region_group_cv_folds(
     n_splits: int = 5,
 ):
     """
-    v17: 5-Fold Region Group CV.
+    v18: 5-Fold Stratified Region Group CV.
 
-    Uses sklearn GroupKFold(n_splits=5) grouped strictly by region_id.
-    For each fold, 20% of geographical regions are withheld entirely for
-    validation, preventing global macro-climate memorisation.
+    Uses sklearn StratifiedGroupKFold(n_splits=5) grouped strictly by
+    region_id and stratified by 10-quantile bins of each region's historical
+    mean drought score.
+
+    Stratification Logic (v18 NEW):
+        1. Compute per-region mean score from the training DataFrame.
+        2. Map those means into 10 quantile bins via pd.qcut(q=10,
+           duplicates='drop') to ensure each fold has an identical proportion
+           of "perpetual desert regions" vs "frequent rainy regions".
+        3. Pass bins as `y` to StratifiedGroupKFold while keeping
+           `groups=region_ids` to prevent cross-region data leakage.
+        This eliminates the Fold 2 outlier variance seen in v17 caused by
+        GroupKFold's purely positional splitting of the region_id array.
 
     Train groups: ALL sliding windows for each training-fold region
                   (same logic as build_full_train_groups).
@@ -546,17 +556,34 @@ def build_region_group_cv_folds(
         train_groups : list of (group_df, i_min, i_max, effective_gap)
         val_groups   : list of (group_df, val_i, val_i, effective_gap)
     """
-    from sklearn.model_selection import GroupKFold
+    from sklearn.model_selection import StratifiedGroupKFold
 
     region_ids = df["region_id"].unique()
     n_regions  = len(region_ids)
 
-    gkf      = GroupKFold(n_splits=n_splits)
-    dummy_X  = np.zeros((n_regions, 1))
+    # ------------------------------------------------------------------
+    # v18: Build stratification labels -- 10-quantile bins of per-region
+    # mean score so every fold mirrors the full drought-severity spectrum.
+    # pd.qcut with duplicates='drop' gracefully handles ties in the tails
+    # (common in zero-inflated distributions with many desert regions).
+    # ------------------------------------------------------------------
+    region_mean_series = df.groupby("region_id")["score"].mean()
+    region_means_arr   = np.array(
+        [float(region_mean_series.get(rid, 0.0)) for rid in region_ids],
+        dtype=np.float64,
+    )
+    strat_bins = pd.qcut(
+        region_means_arr, q=10, labels=False, duplicates="drop"
+    ).astype(int)
+
+    sgkf    = StratifiedGroupKFold(n_splits=n_splits)
+    dummy_X = np.zeros((n_regions, 1))
 
     folds = []
 
-    for train_reg_idx, val_reg_idx in gkf.split(dummy_X, groups=region_ids):
+    for train_reg_idx, val_reg_idx in sgkf.split(
+        dummy_X, y=strat_bins, groups=region_ids
+    ):
         train_region_set = set(region_ids[train_reg_idx])
         val_region_set   = set(region_ids[val_reg_idx])
 

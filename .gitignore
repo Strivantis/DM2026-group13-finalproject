@@ -2,3 +2,6 @@
 /data/*
 /plots/*
 *.csv
+/models/*
+*.pt
+*.pkl

@@ -354,13 +354,24 @@ class DroughtLSTM(nn.Module):
             self.head_severity(encoded_state).squeeze(-1)
         )                                                              # (B, 5)
 
-        # Expected Severity = sigmoid(logitsA) x SeverityB
-        final_output = torch.sigmoid(logits_output) * severity_output  # (B, 5)
+        # v18 Hard Thresholding Gate:
+        # If P(drought) < 0.5, forcefully crush severity to absolute 0.0.
+        # This eliminates fractional noise (e.g., 0.3) where the true target
+        # is an absolute zero, accurately replicating the 59.64% zero-inflation
+        # ceiling. The raw loss branches (logits_output, severity_output) are
+        # returned separately and are UNAFFECTED by this gate -- backward pass
+        # uses only hurdle_loss(logits_output, severity_output, y) in train.py.
+        prob         = torch.sigmoid(logits_output)                    # (B, 5)
+        final_output = torch.where(
+            prob < 0.5,
+            torch.zeros_like(severity_output),
+            prob * severity_output,
+        )                                                              # (B, 5)
 
         # Shape debug – print once on first forward call
         if not self._printed_shape:
             print(
-                f"  [v17 Shape Debug] x: {tuple(x.shape)}  "
+                f"  [v18 Shape Debug] x: {tuple(x.shape)}  "
                 f"| lstm_context (gated): {tuple(lstm_context.shape)}  "
                 f"| tcn_context (gated): {tuple(tcn_context.shape)}  "
                 f"| G: {tuple(G.shape)}  "
@@ -370,7 +381,8 @@ class DroughtLSTM(nn.Module):
             )
             self._printed_shape = True
 
-        # v17: return severity_output separately for decoupled Hurdle Model loss
+        # v18: return severity_output separately for decoupled Hurdle Model loss
+        # final_output now uses Hard Thresholding Gate (prob < 0.5 => 0.0)
         return final_output, logits_output, severity_output
 
     # -----------------------------------------------------------------------
