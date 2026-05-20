@@ -3,82 +3,78 @@ DroughtLSTM
 ===========
 Multi-output dual-stream model for direct 5-step drought score forecasting.
 
-Architecture (v16 – v15 Dual-Stream with 13-week / 29-feature inputs)
-----------------------------------------------------------------------
-  v16 changes (dataset/preprocessing overhaul only):
-    - Input window  : 26 → 13  (hard cap at test-set horizon)
-    - Input features: 37 → 29  (8w and 13w rolling features removed)
-    - No changes to the network topology or training dynamics.
-    - branch_in remains 690 (depends on hidden/CNN dims, not input_size).
+Architecture (v16 – Dilated TCN + Confidence Gap-Gating)
+---------------------------------------------------------
+  Problem (v15): The single-layer CNN stream only captures local 3-week patterns.
+    With WINDOW_SIZE=13 there are macro-climate patterns spanning 4-13 weeks
+    that require wider receptive fields.  The original fixed-gap embedding
+    cannot reliably signal reliability when the deployment gap varies widely
+    (observed range: 1–70+ weeks across the 2248 regions).
 
-  Architecture (v15 – Parallel Dual-Stream CNN+BiLSTM + Single-Fold Paradigm)
-  ----------------------------------------------------------------------------
-  Problem (v14): Relying solely on BiLSTM forces the model to focus on
-    sequential transitions, missing macro-climate patterns detectable via
-    receptive-field convolutions across the horizon.
-    Additionally, 3-Fold Walk-Forward CV on localized temporal splits
-    imposed Data Starvation for regions with large actual_gaps.
+  Solution (v16) – three new components:
 
-  Solution (v15):
-    1. Parallel Dual-Stream Architecture:
-       - LSTM Stream: BiLSTM (Hidden=256, Layers=3) + Temporal Attention
-         ->  lstm_context  (B, 512)
-       - CNN Stream:  Conv1d(F→128, k=3, pad=1) + GELU + AdaptiveAvgPool1d(1)
-         ->  cnn_context   (B, 128)
-       - Both streams receive the same input x (B, 13, 29).
-         CNN operates on the transposed view (B, 29, 13).
-    2. Feature Fusion:
-       Concatenate along last dim (per horizon step):
-         [lstm_context(512) + cnn_context(128) + horizon_embed(32) +
-          target_time(2) + gap_embedded(16)] = 690 dim
-       encoded_state shape: (B, 5, 690)
-    3. Single-Fold Paradigm (train.py):
-       100% of regions use only their latest 5 weeks as Val_Y.
-       Train set = ALL available historical sliding windows (data-maximizing).
+  1. LSTM hidden downsized (256 → 128 per direction):
+     Reduces parameter count, lessens overfitting on the smaller 13-week window.
+     Effective BiLSTM output: 128 × 2 = 256.
 
-  Retained from v14:
-    4. BiLSTM: bidirectional=True. Hidden=256, Layers=3 -> 512 effective.
-    5. Learnable Horizon Embedding: nn.Embedding(5, 32).
-    6. Temporal Attention: Linear(512->1) softmax over time dim.
-    7. Learnable Gap Embedding: Linear(1, 16).
-    8. Target-Time Injection: (B, 5, 2) week_sin/cos of future targets.
-    9. Branch A (prob logits) + Branch B (severity), Dropout(0.2) heads.
-   10. Dynamic Loss Weighting (Burn-in), Manual LR Warm-up (train.py).
+  2. 1D Dilated TCN Stream (replaces single Conv1d):
+     Three dilated 1D convolutions with doubling dilation (d=1, 2, 4).
+     Each layer uses kernel_size=3 and padding = dilation*(kernel_size-1)//2
+     to keep the sequence length fixed at 13.
+     Receptive field of the full stack: 1 + 2*(3-1) + 4*(3-1) + 8*(3-1) = 29 weeks
+     (larger than the window, ensuring all 13 steps are contextualised).
+     → tcn_context (B, 128) after AdaptiveAvgPool1d(1).
+
+  3. Confidence Gap-Gating:
+     gap_size (B,1) → Linear(1,1) → Sigmoid → G ∈ [0,1] scalar.
+     Both lstm_context and tcn_context are multiplied by G BEFORE expansion.
+     When G is small (large/uncertain gap), both streams are suppressed,
+     pushing the model towards a conservative (near-zero) forecast.
+     The gap_embed (Linear(1,16)) is kept separately in the fusion layer
+     to provide a learnable positional signal about the gap magnitude.
 
 Architecture Detail (v16: input_size=29, window=13)
 ----------------------------------------------------
   Input x (B, 13, 29)
 
   == LSTM Stream ==
-    -> LayerNorm(29)                              (B, 13, 29)
-    -> BiLSTM (hidden=256, layers=3, dropout=0.4) (B, 13, 512)
-    -> Temporal Attention (Linear(512->1) softmax over time dim=13)
-       lstm_context = weighted sum                 (B, 512)
+    -> LayerNorm(29)                               (B, 13, 29)
+    -> BiLSTM (hidden=128, layers=3, dropout=0.4)  (B, 13, 256)
+    -> Temporal Attention (Linear(256->1) softmax over time dim=13)
+       lstm_context = weighted sum                  (B, 256)
     -> Dropout(0.4)
-    -> expand to                                  (B, 5, 512)
+    -> Gating: lstm_context = lstm_context * G      (B, 256)   [v16 NEW]
+    -> expand to                                   (B, 5, 256)
 
-  == CNN Stream ==
-    -> x.permute(0,2,1)                           (B, 29, 13)
-    -> Conv1d(29->128, k=3, pad=1) + GELU          (B, 128, 13)
-    -> AdaptiveAvgPool1d(1)                        (B, 128, 1)
-    -> squeeze(-1)   cnn_context                  (B, 128)
-    -> expand to                                  (B, 5, 128)
+  == Dilated TCN Stream (v16) ==
+    -> x.permute(0,2,1)                            (B, 29, 13)
+    -> Conv1d(29->128, k=3, d=1, pad=1) + GELU     (B, 128, 13)
+    -> Conv1d(128->128, k=3, d=2, pad=2) + GELU    (B, 128, 13)
+    -> Conv1d(128->128, k=3, d=4, pad=4) + GELU    (B, 128, 13)
+    -> AdaptiveAvgPool1d(1)                         (B, 128, 1)
+    -> squeeze(-1)   tcn_context                   (B, 128)
+    -> Gating: tcn_context = tcn_context * G        (B, 128)   [v16 NEW]
+    -> expand to                                   (B, 5, 128)
+
+  == Confidence Gap-Gating (v16 NEW) ==
+    -> gap_size (B,1) -> Linear(1,1) -> Sigmoid -> G (B,1)
+       G multiplies both lstm_context and tcn_context (before expansion)
 
   == Horizon / Time / Gap embeddings ==
     -> horizon_ids [0..4] -> Embedding(5,32) -> expand (B, 5, 32)
-    -> target_time input                          (B, 5, 2)
-    -> gap_size -> Linear(1,16) -> expand          (B, 5, 16)
+    -> target_time input                           (B, 5, 2)
+    -> gap_size -> Linear(1,16) -> expand           (B, 5, 16)
 
   == Fusion ==
-    -> cat([lstm(512), cnn(128), h_emb(32), tt(2), gap(16)], dim=-1)
-       encoded_state                              (B, 5, 690)
+    -> cat([lstm(256), tcn(128), h_emb(32), tt(2), gap(16)], dim=-1)
+       encoded_state                               (B, 5, 434)
 
   == Branch A (Probability Logits) ==
-    Linear(690->128) -> GELU -> Dropout(0.2) -> Linear(128->1)
+    Linear(434->128) -> GELU -> Dropout(0.2) -> Linear(128->1)
     squeeze(-1) -> (B,5)  raw logits (sigmoid inline in forward)
 
   == Branch B (Severity) ==
-    Linear(690->128) -> GELU -> Dropout(0.2) -> Linear(128->1) -> Softplus
+    Linear(434->128) -> GELU -> Dropout(0.2) -> Linear(128->1) -> Softplus
     squeeze(-1) -> (B,5) >= 0
 
   Final: sigmoid(logitsA) x severityB  (Expected Severity)
@@ -88,26 +84,27 @@ Architecture Detail (v16: input_size=29, window=13)
 
   Forward Outputs:
     1. final_output  = sigmoid(logits_output) * severity  (B, 5)
-    2. logits_output = Branch_A raw logits (B, 5) -> BCEWithLogitsLoss
+    2. logits_output = Branch_A raw logits (B, 5) -> FocalLoss in train.py
 
   AMP Fix (retained from v9):
     BCELoss + Sigmoid is UNSAFE under torch.autocast (float16 underflow / NaN).
-    Solution: Return raw logits from Branch A; use BCEWithLogitsLoss in train.py.
+    Solution: Return raw logits from Branch A; use FocalLoss in train.py.
 
-  Joint Loss (defined in train.py):
-    Epochs  1-20 (Burn-in): Loss = Loss_B only
-    Epoch  21+:             Loss = Loss_B + 0.1 * Loss_A
-    Loss_A = BCEWithLogitsLoss(logits_output, binary_target)
-    Loss_B = Continuous Smooth L1 (final_output, target)
+  Joint Loss (defined in train.py v16):
+    Epochs  1-20 (Burn-in): Loss = Masked Regression (B, active samples only)
+    Epoch  21+:             Loss = Loss_B (full) + 0.1 * Loss_A (FocalLoss)
+    Loss_A = FocalLoss(γ=2.0)(logits_output, binary_target)
+    Loss_B = Continuous Smooth L1  W = 1.0 + (y/5)^2 * 3.0
+    Early Stopping: monitors pure L1Loss(final_output, target) -> Kaggle-aligned
 
-  Early Stopping: monitors pure L1Loss(final_output, target) -> Kaggle-aligned
-
-Changes from v15 (this file only – docstring update for v16 input dims)
-------------------------------------------------------------------------
-  - WINDOW_SIZE 26 -> 13: input shape (B, 26, F) -> (B, 13, F)
-  - input_size  37 -> 29: 8w and 13w rolling features removed
-  - branch_in unchanged (690): depends on hidden dims, not input_size
-  - All functional code unchanged (fully parameter-driven).
+Changes from v15
+----------------
+  [v16] LSTM hidden_size: 256 → 128 (effective output: 512 → 256)
+  [v16] CNN stream replaced by Dilated TCN (d=1,2,4; keeps seq_len=13)
+  [v16] Confidence Gap-Gating: G = Sigmoid(Linear(gap_size,1,1))
+         applied to lstm_context and tcn_context before fusion
+  [v16] branch_in: 690 → 434  (256+128+32+2+16)
+  [v16] Branch heads updated: Linear(434→128) for both A and B
 """
 
 import torch
@@ -120,8 +117,8 @@ class DroughtLSTM(nn.Module):
     Parameters
     ----------
     input_size  : number of features per time step (F = 29 in v16)
-    hidden_size : LSTM hidden dimensionality per direction (default 256)
-                  Effective LSTM output width = hidden_size * 2 (BiLSTM)
+    hidden_size : LSTM hidden dimensionality per direction (default 128)
+                  Effective LSTM output width = hidden_size * 2 = 256 (BiLSTM)
     num_layers  : number of stacked LSTM layers (default 3)
     dropout     : dropout probability (applied between LSTM layers and before head)
     horizon     : number of future weeks to forecast simultaneously
@@ -130,7 +127,7 @@ class DroughtLSTM(nn.Module):
     def __init__(
         self,
         input_size: int,
-        hidden_size: int = 256,
+        hidden_size: int = 128,   # v16: 256 → 128 (effective output unchanged formula)
         num_layers: int = 3,
         dropout: float = 0.4,
         horizon: int = 5,
@@ -142,7 +139,7 @@ class DroughtLSTM(nn.Module):
         self.input_size  = input_size
 
         # Effective output dimension from BiLSTM (forward + backward)
-        lstm_out_size = hidden_size * 2  # 512
+        lstm_out_size = hidden_size * 2  # 256  (v16: 128*2)
 
         # ----------------------------------------------------------------
         # LSTM Stream
@@ -167,16 +164,34 @@ class DroughtLSTM(nn.Module):
         self.dropout = nn.Dropout(p=dropout)
 
         # ----------------------------------------------------------------
-        # CNN Stream  (v15)
-        # Input to Conv1d: (B, in_channels=input_size, seq_len=window)
-        # Output:          (B, 128, window)
+        # Dilated TCN Stream  (v16 – replaces single Conv1d CNN)
+        #
+        # Input: (B, input_size, 13)
+        # Each dilated conv keeps seq_len = 13 via symmetric padding:
+        #   padding = dilation * (kernel_size - 1) // 2
+        # Dilation  1: padding = 1*(3-1)//2 = 1
+        # Dilation  2: padding = 2*(3-1)//2 = 2
+        # Dilation  4: padding = 4*(3-1)//2 = 4
+        # Receptive field = 1 + 2*(3-1) + 4*(3-1) + 8*(3-1) = 29 (spans full window)
+        # Output: (B, 128, 13)  -> AdaptiveAvgPool1d(1) -> (B, 128)
         # ----------------------------------------------------------------
-        self.cnn_stream = nn.Sequential(
-            nn.Conv1d(in_channels=input_size, out_channels=128, kernel_size=3, padding=1),
+        self.tcn_stream = nn.Sequential(
+            nn.Conv1d(input_size, 128, kernel_size=3, padding=1, dilation=1),
+            nn.GELU(),
+            nn.Conv1d(128, 128, kernel_size=3, padding=2, dilation=2),
+            nn.GELU(),
+            nn.Conv1d(128, 128, kernel_size=3, padding=4, dilation=4),
             nn.GELU(),
         )
-        # Global average pool: (B, 128, window) -> (B, 128, 1)
+        # Global average pool: (B, 128, 13) -> (B, 128, 1)
         self.global_pool = nn.AdaptiveAvgPool1d(1)
+
+        # ----------------------------------------------------------------
+        # Confidence Gap-Gating  (v16 NEW)
+        # gap_size (B,1) → Linear(1,1) → Sigmoid → G ∈ [0,1]
+        # G multiplies both lstm_context and tcn_context
+        # ----------------------------------------------------------------
+        self.gap_gate = nn.Linear(1, 1)
 
         # ----------------------------------------------------------------
         # Horizon / Time / Gap Embeddings  (retained from v14)
@@ -185,20 +200,20 @@ class DroughtLSTM(nn.Module):
         # Learnable Horizon Embedding
         self.horizon_embed = nn.Embedding(num_embeddings=5, embedding_dim=32)
 
-        # Learnable Gap Embedding
+        # Learnable Gap Embedding  (positional signal, separate from gate)
         self.gap_embed = nn.Linear(1, 16)
 
         # ----------------------------------------------------------------
-        # Branch Heads
+        # Branch Heads  (v16 updated)
         # ----------------------------------------------------------------
         # After concatenating:
-        #   lstm_context (512) + cnn_context (128)
+        #   lstm_context (256) + tcn_context (128)
         #   + horizon_embed (32)
         #   + target_time (2)    [week_sin/cos of target weeks]
         #   + gap_embedded (16)  [learnable gap embedding]
-        # branch_in = 512 + 128 + 32 + 2 + 16 = 690
+        # branch_in = 256 + 128 + 32 + 2 + 16 = 434
         # NOTE: branch_in does NOT depend on input_size or window length.
-        branch_in = lstm_out_size + 128 + 32 + 2 + 16  # = 690
+        branch_in = lstm_out_size + 128 + 32 + 2 + 16  # = 434
 
         # Branch A: Drought Probability Logits (NO Sigmoid layer)
         self.head_prob = nn.Sequential(
@@ -244,37 +259,49 @@ class DroughtLSTM(nn.Module):
 
         logits_output : (B, 5)
             Raw logits of Branch A (pre-sigmoid).
-            Passed to BCEWithLogitsLoss in train.py.
+            Passed to FocalLoss (γ=2.0) in train.py.
         """
         B = x.size(0)
 
         # ----------------------------------------------------------------
+        # Confidence Gap Gate  (v16 NEW – computed first, used in both streams)
+        # G (B, 1)  ∈ [0, 1]
+        # ----------------------------------------------------------------
+        G = torch.sigmoid(self.gap_gate(gap_size))    # (B, 1)
+
+        # ----------------------------------------------------------------
         # LSTM Stream
         # ----------------------------------------------------------------
-        x_norm = self.input_norm(x)                           # (B, W, F)
-        lstm_out, _ = self.lstm(x_norm)                       # (B, W, 512)
+        x_norm = self.input_norm(x)                            # (B, W, F)
+        lstm_out, _ = self.lstm(x_norm)                        # (B, W, 256)
 
         # Temporal Attention
-        attn_weights = self.attention(lstm_out)               # (B, W, 1)
-        attn_weights = torch.softmax(attn_weights, dim=1)     # softmax over time
-        context_vector = torch.sum(attn_weights * lstm_out, dim=1)   # (B, 512)
+        attn_weights = self.attention(lstm_out)                # (B, W, 1)
+        attn_weights = torch.softmax(attn_weights, dim=1)      # softmax over time
+        context_vector = torch.sum(attn_weights * lstm_out, dim=1)   # (B, 256)
 
-        dropped = self.dropout(context_vector)                # (B, 512)
+        dropped = self.dropout(context_vector)                 # (B, 256)
+
+        # Apply Confidence Gap Gate
+        lstm_context = dropped * G                             # (B, 256)
 
         # Expand across horizon steps
-        lstm_out_size = self.hidden_size * 2
-        lstm_expanded = dropped.unsqueeze(1).expand(B, self.horizon, lstm_out_size)
-        # (B, 5, 512)
+        lstm_out_size = self.hidden_size * 2                   # 256
+        lstm_expanded = lstm_context.unsqueeze(1).expand(B, self.horizon, lstm_out_size)
+        # (B, 5, 256)
 
         # ----------------------------------------------------------------
-        # CNN Stream  (v15)
+        # Dilated TCN Stream  (v16)
         # ----------------------------------------------------------------
-        x_cnn = x.permute(0, 2, 1)                           # (B, F, W)
-        cnn_feat = self.cnn_stream(x_cnn)                    # (B, 128, W)
-        cnn_pooled = self.global_pool(cnn_feat)              # (B, 128, 1)
-        cnn_context = cnn_pooled.squeeze(-1)                 # (B, 128)
+        x_tcn = x.permute(0, 2, 1)                            # (B, F, W) = (B, 29, 13)
+        tcn_feat = self.tcn_stream(x_tcn)                     # (B, 128, 13)
+        tcn_pooled = self.global_pool(tcn_feat)               # (B, 128, 1)
+        tcn_raw = tcn_pooled.squeeze(-1)                      # (B, 128)
 
-        cnn_expanded = cnn_context.unsqueeze(1).expand(B, self.horizon, 128)
+        # Apply Confidence Gap Gate
+        tcn_context = tcn_raw * G                             # (B, 128)
+
+        tcn_expanded = tcn_context.unsqueeze(1).expand(B, self.horizon, 128)
         # (B, 5, 128)
 
         # ----------------------------------------------------------------
@@ -282,7 +309,7 @@ class DroughtLSTM(nn.Module):
         # ----------------------------------------------------------------
         horizon_ids = torch.arange(self.horizon, device=x.device, dtype=torch.long)
         h_emb = self.horizon_embed(horizon_ids)               # (5, 32)
-        h_emb = h_emb.unsqueeze(0).expand(B, self.horizon, 32)   # (B, 5, 32)
+        h_emb = h_emb.unsqueeze(0).expand(B, self.horizon, 32)    # (B, 5, 32)
 
         gap_embedded = self.gap_embed(gap_size)               # (B, 16)
         gap_expanded = gap_embedded.unsqueeze(1).expand(B, self.horizon, 16)
@@ -291,14 +318,14 @@ class DroughtLSTM(nn.Module):
         # target_time is already (B, 5, 2)
 
         # ----------------------------------------------------------------
-        # Feature Fusion  (v15)
+        # Feature Fusion  (v16)
         # ----------------------------------------------------------------
-        # [lstm(512) + cnn(128) + h_emb(32) + target_time(2) + gap(16)] = 690
+        # [lstm(256) + tcn(128) + h_emb(32) + target_time(2) + gap(16)] = 434
         encoded_state = torch.cat(
-            [lstm_expanded, cnn_expanded, h_emb, target_time, gap_expanded],
+            [lstm_expanded, tcn_expanded, h_emb, target_time, gap_expanded],
             dim=-1,
         )
-        # (B, 5, 690)
+        # (B, 5, 434)
 
         # ----------------------------------------------------------------
         # Branch A: raw logits for drought probability
@@ -319,8 +346,9 @@ class DroughtLSTM(nn.Module):
         if not self._printed_shape:
             print(
                 f"  [v16 Shape Debug] x: {tuple(x.shape)}  "
-                f"| lstm_out: {tuple(lstm_out.shape)}  "
-                f"| cnn_context: {tuple(cnn_context.shape)}  "
+                f"| lstm_context (gated): {tuple(lstm_context.shape)}  "
+                f"| tcn_context (gated): {tuple(tcn_context.shape)}  "
+                f"| G: {tuple(G.shape)}  "
                 f"| encoded_state: {tuple(encoded_state.shape)}  "
                 f"| final_output: {tuple(final_output.shape)}"
             )
@@ -333,10 +361,10 @@ class DroughtLSTM(nn.Module):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
     def architecture_summary(self, input_size: int) -> str:
-        lstm_out_size = self.hidden_size * 2
-        branch_in     = lstm_out_size + 128 + 32 + 2 + 16   # 690
+        lstm_out_size = self.hidden_size * 2    # 256
+        branch_in     = lstm_out_size + 128 + 32 + 2 + 16   # 434
         lines = [
-            "DroughtLSTM Architecture (v16 – Dual-Stream CNN+BiLSTM, 13w/29f inputs)",
+            "DroughtLSTM Architecture (v16 – Dilated TCN + Confidence Gap-Gating)",
             "=" * 90,
             f"  Input size   : {input_size}  (features per week; v16: 29)",
             f"  Window size  : 13 weeks  (v16: capped at test-set horizon)",
@@ -344,16 +372,27 @@ class DroughtLSTM(nn.Module):
             "  == LSTM Stream ==",
             f"  LayerNorm    : LayerNorm({input_size})",
             f"  BiLSTM       : hidden={self.hidden_size}/dir -> {lstm_out_size} effective  "
-            f"(layers={self.num_layers}, bidirectional=True)",
+            f"(layers={self.num_layers}, bidirectional=True)  [v16: hidden 256→128]",
             f"  Dropout      : {self.dropout.p}",
             f"  Attn         : Linear({lstm_out_size}->1); softmax over time; weighted sum",
-            f"  lstm_context : (B, {lstm_out_size}) -> expand (B, 5, {lstm_out_size})",
+            f"  lstm_context : (B, {lstm_out_size})  [BEFORE gap gate]",
+            f"  Gap Gate G   : Sigmoid(Linear(1,1)(gap_size))  ->  G (B,1)  [v16 NEW]",
+            f"  gated_lstm   : lstm_context * G  (B, {lstm_out_size})  "
+            f"-> expand (B, 5, {lstm_out_size})",
             "",
-            "  == CNN Stream (v15) ==",
+            "  == Dilated TCN Stream (v16 NEW – replaces single Conv1d) ==",
             f"  Transpose    : (B, 13, {input_size}) -> (B, {input_size}, 13)",
-            f"  Conv1d       : Conv1d({input_size}->128, k=3, pad=1) + GELU -> (B, 128, 13)",
+            f"  TCN Layer 1  : Conv1d({input_size}->128, k=3, d=1, pad=1) + GELU -> (B, 128, 13)",
+            "  TCN Layer 2  : Conv1d(128->128, k=3, d=2, pad=2) + GELU -> (B, 128, 13)",
+            "  TCN Layer 3  : Conv1d(128->128, k=3, d=4, pad=4) + GELU -> (B, 128, 13)",
+            "  Receptive field: 1+2*(3-1)+4*(3-1)+8*(3-1) = 29 weeks",
             "  GlobalPool   : AdaptiveAvgPool1d(1) -> (B, 128, 1) -> squeeze -> (B, 128)",
-            "  cnn_context  : (B, 128) -> expand (B, 5, 128)",
+            "  Gap Gate G   : tcn_context * G  (B, 128) -> expand (B, 5, 128)  [v16 NEW]",
+            "",
+            "  == Confidence Gap-Gating (v16 NEW) ==",
+            "  gap_size (B,1) -> Linear(1,1) -> Sigmoid -> G (B,1)",
+            "  G suppresses both streams when deployment gap is large/uncertain",
+            "  (gap_embed Linear(1,16) is SEPARATE: provides positional signal in fusion)",
             "",
             "  == Embeddings ==",
             "  Learnable Horizon Embedding:",
@@ -364,8 +403,8 @@ class DroughtLSTM(nn.Module):
             "     gap_size input (B, 1)  -- normalised actual_gap / 100.0",
             "     gap_embed = Linear(1, 16) -> (B, 16) -> expand (B, 5, 16)",
             "",
-            "  == Feature Fusion (v15) ==",
-            f"  Concat: [lstm({lstm_out_size}) + cnn(128) + h_emb(32) + tt(2) + gap(16)]",
+            "  == Feature Fusion (v16) ==",
+            f"  Concat: [lstm({lstm_out_size}) + tcn(128) + h_emb(32) + tt(2) + gap(16)]",
             f"     -> encoded_state (B, 5, {branch_in})",
             "",
             f"  Branch A : Linear({branch_in}->128) -> GELU -> Dropout(0.2) -> Linear(128->1)  [NO Sigmoid]",
@@ -376,21 +415,21 @@ class DroughtLSTM(nn.Module):
             "  Returns  : (final_output, logits_output) -- two tensors",
             "  Inference: np.clip(final_output, 0, 5) applied in train.py",
             "-" * 90,
-            "  [v16] Input overhaul:",
-            "     WINDOW_SIZE: 26 -> 13  (capped at test-set horizon)",
-            "     input_size:  37 -> 29  (8w/13w rolling features removed)",
-            "     branch_in unchanged: 690 (depends on hidden dims, not input_size)",
+            "  [v16] LSTM hidden_size: 256 → 128  (effective: 512 → 256)",
+            "  [v16] CNN stream → Dilated TCN (d=1,2,4); receptive field = 29 weeks",
+            "  [v16] Confidence Gap-Gating: G = Sigmoid(Linear(1,1)(gap_size))",
+            f"  [v16] branch_in: 690 → {branch_in}  (256+128+32+2+16)",
             "  [v15] Single-Fold Paradigm:",
             "     Val_Y = last 5 weeks of each region (100% regions, fixed)",
             "     Train = ALL available historical sliding windows (data-maximizing)",
-            "  [v14/v15] Dynamic Loss Weighting (Burn-in):",
-            "     Epochs  1-20 : Loss = Loss_B ONLY  (regression burn-in)",
-            "     Epoch  21+   : Loss = Loss_B + 0.1 * Loss_A  (BCE introduced)",
-            "  [v14/v15] Manual LR Warm-up (Peak LR=1e-3):",
+            "  [v16] Zero-Inflation Suppression (train.py):",
+            "     Epoch 1-20 (Burn-in) : Loss_B = Masked Regression (active samples only)",
+            "     Epoch 21+            : Loss_B (full) + 0.1 * FocalLoss(γ=2.0)",
+            "  [v14/15] Manual LR Warm-up (Peak LR=1e-3):",
             "     Epochs  1-5  : LR linearly ramps 1e-5 -> 1e-3",
             "     Epoch   6+   : ReduceLROnPlateau takes over",
-            "  Loss_A       : BCEWithLogitsLoss(logits_output, binary_target)",
-            "  Loss_B       : Continuous Smooth L1  W = 1.0 + (y/5)^2 * 3.0",
+            f"  [v16] Loss_A : FocalLoss(γ=2.0)  (was BCEWithLogitsLoss in v15)",
+            "  [v14-16] Loss_B : Continuous Smooth L1  W = 1.0 + (y/5)^2 * 3.0",
             "  Early Stop   : pure L1Loss(final_output, y)  [Kaggle MAE aligned]",
             "  Checkpoint   : single_fold_best.pt",
             "-" * 90,

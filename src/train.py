@@ -1,6 +1,6 @@
 """
-train.py -- Drought Score Forecasting Pipeline (v15 – Dual-Stream CNN+BiLSTM + Single-Fold)
-============================================================================================
+train.py -- Drought Score Forecasting Pipeline (v16 – Dilated TCN + Gap-Gating + Zero-Suppression)
+===================================================================================================
 Usage:
     python src/train.py
 
@@ -8,34 +8,39 @@ Outputs:
     submission.csv                  -- Kaggle submission (2248 rows + header)
     models/single_fold_best.pt      -- Best weights for the single fold
     models/scaler.pkl               -- StandardScaler (fit on full single-fold train set)
-    _training_log_15th.txt          -- Full console log
+    _training_log_16th.txt          -- Full console log
 
-Key improvements (v15 – Dual-Stream + Single-Fold)
----------------------------------------------------
-  1. Single-Fold Data-Maximizing Paradigm (dataset.py)
-       - Abolishes 3-Fold Walk-Forward CV loop entirely.
-       - Val_Y = last 5 weeks of EVERY region (100% regions, no rotation).
-       - Train set = ALL available historical sliding windows ending strictly
-         before Val_Y (zero data wasted to folding).
-       - StandardScaler .fit() on the ENTIRE maximized training split.
+Key improvements (v16)
+-----------------------
+  1. Dilated TCN Stream + Confidence Gap-Gating (model.py):
+       - CNN replaced by 1D Dilated TCN (d=1,2,4; receptive field=29 weeks).
+       - Confidence Gap-Gate: G = Sigmoid(Linear(1,1)(gap)) applied to
+         lstm_context and tcn_context, suppressing both when gap is large.
+       - BiLSTM hidden downsized 256 → 128 (effective output 512 → 256).
+       - branch_in: 690 → 434 (256+128+32+2+16).
 
-  2. Parallel Dual-Stream Architecture (model.py)
-       - LSTM Stream: BiLSTM (hidden=256, layers=3) + Temporal Attention
-         → lstm_context (B, 512)
-       - CNN Stream: Conv1d(37→128, k=3, pad=1) + GELU + AdaptiveAvgPool1d(1)
-         → cnn_context (B, 128)
-       - Fusion: [lstm(512) + cnn(128) + h_emb(32) + tt(2) + gap(16)] = 690 dim
-       - encoded_state shape: (B, 5, 690)
-       - Branch heads: Linear(690→128) for both prob and severity.
+  2. Focal Loss (Branch A):
+       - BCEWithLogitsLoss replaced by custom Focal Loss (γ=2.0).
+       - Forces the model to focus on hard active-drought boundary samples
+         rather than trivially classifying the zero-majority class.
 
-  3. Inference: single model (single_fold_best.pt) — no fold ensembling.
+  3. Masked Regression Burn-in (Branch B, epochs 1–20):
+       - During the initial 20-epoch burn-in, Loss_B is computed ONLY on
+         samples where target > 0.0  (active drought timesteps).
+       - Zero-target samples contribute 0 gradient to the regression head,
+         preventing the model from optimising towards zero as an easy attractor.
+       - After epoch 20, full unmasked regression loss is restored.
 
-  4. Maintained V14 Training Dynamics:
+  4. Maintained V15 Training Dynamics:
        - BATCH_SIZE=512  (OOM fallback to 256)
        - Peak LR=1e-3, Manual Warm-up Epochs 1-5
-       - Loss Burn-in: epochs <=20 uses Loss_B only
        - ReduceLROnPlateau after Epoch 5
        - NUM_EPOCHS=200, PATIENCE=35
+       - SingleFold Data-Maximizing CV
+
+  5. Feature count updated: 37 → 29
+       - All 8w and 13w rolling features removed (domain-shift mitigation).
+       - Input assertion updated to expect 29 features.
 
 Hardware note
 -------------
@@ -77,7 +82,7 @@ from src.dataset import (
 from src.model import DroughtLSTM
 
 # ---------------------------------------------------------------------------
-# Reproducibility  (v7+: must be called before ANY torch/numpy/random usage)
+# Reproducibility
 # ---------------------------------------------------------------------------
 def set_seed(seed: int = 42) -> None:
     """Seed all RNG sources for full reproducibility."""
@@ -99,7 +104,8 @@ PROCESSED_DIR = os.path.join(ROOT, "data", "processed")
 MODELS_DIR    = os.path.join(ROOT, "models")
 os.makedirs(MODELS_DIR, exist_ok=True)
 
-HIDDEN_SIZE   = 256           # BiLSTM output = 512
+HIDDEN_SIZE   = 128           # v16: BiLSTM hidden per direction (was 256 in v15)
+                               # Effective output = HIDDEN_SIZE * 2 = 256
 NUM_LAYERS    = 3
 DROPOUT       = 0.4
 LEARNING_RATE = 1e-3          # peak LR
@@ -118,19 +124,83 @@ USE_AMP = DEVICE.type == "cuda"
 _scaler = GradScaler(device="cuda", enabled=USE_AMP)
 
 # ---------------------------------------------------------------------------
-# Loss Criteria (module-level for reuse)
+# Loss Criteria
 # ---------------------------------------------------------------------------
-_l1_criterion  = nn.L1Loss()
-_bce_criterion = nn.BCEWithLogitsLoss()
+_l1_criterion = nn.L1Loss()
 
 
 # ---------------------------------------------------------------------------
-# Continuous Smooth Loss  (v7 – retained in v9/v10/v11/v14/v15)
+# Focal Loss  (v16 – replaces BCEWithLogitsLoss for Branch A)
+# ---------------------------------------------------------------------------
+def focal_loss(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    gamma: float = 2.0,
+) -> torch.Tensor:
+    """
+    Binary Focal Loss with logits.
+
+    FL(p_t) = -(1 - p_t)^gamma * log(p_t)
+
+    where p_t = sigmoid(logit) when target=1, and p_t = 1 - sigmoid(logit) when
+    target=0.
+
+    γ=2.0 down-weights easy negatives (zero-drought weeks) and concentrates
+    gradient mass on hard active-drought boundary samples.
+
+    References
+    ----------
+    Lin et al., "Focal Loss for Dense Object Detection", ICCV 2017.
+    """
+    # Numerically stable via F.binary_cross_entropy_with_logits
+    bce_loss  = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+    p_t       = torch.exp(-bce_loss)                   # exp(-BCE) = p_t
+    focal_wgt = (1.0 - p_t) ** gamma                   # (B, H)
+    return (focal_wgt * bce_loss).mean()
+
+
+# ---------------------------------------------------------------------------
+# Masked Regression Loss  (v16 Burn-in – Branch B, epochs 1-20)
+# ---------------------------------------------------------------------------
+def masked_regression_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Zero-Inflation Masked Regression Loss (v16 burn-in).
+
+    Computes the weighted Smooth L1 loss ONLY on samples where target > 0.
+    Zero-target samples have their loss masked to 0.0.
+
+    During the burn-in phase (epochs 1-20), this forces the regression head to
+    learn droughts exclusively from active-drought samples, avoiding the
+    trivial zero-attractor solution.
+
+    Returns 0-tensor (requires_grad=True to allow backward()) when no active
+    samples exist in the batch.
+    """
+    active_mask = target > 0.0    # (B, H) boolean
+    n_active    = active_mask.sum().item()
+
+    if n_active == 0:
+        # Degenerate batch: all zeros — return a zero loss that still backprops
+        return torch.tensor(0.0, device=pred.device, requires_grad=True)
+
+    pred_active   = pred[active_mask]      # (n_active,)
+    target_active = target[active_mask]    # (n_active,)
+
+    element_loss = F.smooth_l1_loss(pred_active, target_active, reduction="none")
+    weight = 1.0 + (target_active / 5.0) ** 2 * 3.0
+    return (weight * element_loss).mean()
+
+
+# ---------------------------------------------------------------------------
+# Full Continuous Smooth Loss  (v7 – retained, used post burn-in)
 # ---------------------------------------------------------------------------
 def continuous_smooth_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     """
-    Loss_B: Continuous quadratically-weighted Smooth L1 / Huber loss.
-    Applied to final_output (= P x Severity).
+    Loss_B (post burn-in): Continuous quadratically-weighted Smooth L1 / Huber loss.
+    Applied to the full target tensor (including zeros).
     """
     element_loss = F.smooth_l1_loss(pred, target, reduction="none")  # (B, H)
     weight = 1.0 + (target / 5.0) ** 2 * 3.0                        # (B, H)
@@ -144,18 +214,26 @@ def joint_loss(
     epoch: int,
 ) -> torch.Tensor:
     """
-    v10/v15 Dynamic Joint Loss (Burn-in Schedule)
+    v16 Zero-Inflation Suppression Loss Schedule.
 
-    Burn-in Phase  (epoch <= 20): Loss = Loss_B ONLY
-    Post Burn-in   (epoch > 20) : Loss = Loss_B + 0.1 * Loss_A
+    Burn-in Phase  (epoch <= 20):
+        Loss = Masked Regression Loss  (Branch B, active samples ONLY)
+        Regression is computed ONLY where target > 0.0.
+        Zero-target samples are masked out (loss contribution = 0).
+        Branch A (Focal Loss) is NOT included during burn-in.
+
+    Post Burn-in   (epoch > 20):
+        Loss = continuous_smooth_loss(full) + 0.1 * focal_loss(γ=2.0)
+        Full unmasked regression is restored.
+        Focal Loss replaces BCEWithLogitsLoss for sharper boundary learning.
     """
-    binary_target = (target > 0.0).float()
-    loss_b = continuous_smooth_loss(final_output, target)
-
     if epoch <= 20:
-        return loss_b
+        # Burn-in: masked regression on active drought samples only
+        return masked_regression_loss(final_output, target)
     else:
-        loss_a = _bce_criterion(logits_output, binary_target)
+        binary_target = (target > 0.0).float()
+        loss_b = continuous_smooth_loss(final_output, target)
+        loss_a = focal_loss(logits_output, binary_target, gamma=2.0)
         return loss_b + 0.1 * loss_a
 
 
@@ -165,7 +243,7 @@ def joint_loss(
 
 def train_epoch(model, loader, optimizer, device, epoch: int):
     """
-    One training epoch -- v15: unpack (X, y, target_time, gap_size) from loader.
+    One training epoch -- v16: unpack (X, y, target_time, gap_size) from loader.
     """
     model.train()
     total_loss, n = 0.0, 0
@@ -195,7 +273,7 @@ def train_epoch(model, loader, optimizer, device, epoch: int):
 def eval_mae(model, loader, device) -> float:
     """
     Evaluate pure (unweighted) MAE on final_output -- used for early stopping.
-    v15: unpack (X, y, target_time, gap_size) from loader.
+    v16: unpack (X, y, target_time, gap_size) from loader.
     """
     model.eval()
     total_mae, n = 0.0, 0
@@ -214,7 +292,7 @@ def eval_mae(model, loader, device) -> float:
 def eval_prediction_percentiles(model, loader, device, log) -> dict:
     """
     Diagnostic hook: collect all final_output predictions and log percentile stats.
-    v15: unpack (X, y, target_time, gap_size) from loader.
+    v16: unpack (X, y, target_time, gap_size) from loader.
     """
     model.eval()
     all_preds = []
@@ -239,9 +317,9 @@ def eval_prediction_percentiles(model, loader, device, log) -> dict:
     log(f"  [Prediction Diagnostics] n={len(preds_flat):,}")
     log(f"    p50={p50:.4f}  p90={p90:.4f}  p95={p95:.4f}  p99={p99:.4f}  max={pmax:.4f}")
     if p99 < 2.0:
-        log("    *** WARNING: p99 < 2.0 -- model is still evading extremes (collapse not fixed)! ***")
+        log("    *** WARNING: p99 < 2.0 -- model is still evading extremes (zero-collapse)! ***")
     else:
-        log("    v p99 >= 2.0 -- model is predicting away from the mean.")
+        log("    v p99 >= 2.0 -- model is predicting away from zero-collapse.")
 
     return {"p50": p50, "p90": p90, "p95": p95, "p99": p99, "max": pmax}
 
@@ -249,7 +327,7 @@ def eval_prediction_percentiles(model, loader, device, log) -> dict:
 def make_model(input_size: int) -> DroughtLSTM:
     return DroughtLSTM(
         input_size=input_size,
-        hidden_size=HIDDEN_SIZE,
+        hidden_size=HIDDEN_SIZE,    # v16: 128 (was 256)
         num_layers=NUM_LAYERS,
         dropout=DROPOUT,
         horizon=HORIZON,
@@ -297,11 +375,12 @@ def train_model(
     """
     Train model with early stopping on pure (unweighted) MAE.
 
-    v15 Training:
+    v16 Training:
       - Manual LR warm-up epochs 1-5: linear ramp 1e-5 -> 1e-3.
       - ReduceLROnPlateau only active from epoch 6+.
-      - Dynamic joint loss: regression-only burn-in epochs 1-20,
-        then Loss_B + 0.1*Loss_A from epoch 21+.
+      - v16 Zero-Inflation Loss Schedule:
+          Epochs 1-20 (burn-in): Masked Regression (active samples only).
+          Epochs 21+:  continuous_smooth_loss(full) + 0.1 * FocalLoss(γ=2.0).
     Early stopping: pure L1Loss(final_output, y) -- strictly Kaggle-metric-aligned.
 
     Returns best_val_mae, best_epoch, history.
@@ -320,7 +399,7 @@ def train_model(
     history      = []
 
     for epoch in range(1, num_epochs + 1):
-        # --- v15: Manual LR Warm-up (Epochs 1-5) ---
+        # --- v15/v16: Manual LR Warm-up (Epochs 1-5) ---
         # Linear ramp from 1e-5 to 1e-3 over the first 5 epochs.
         if epoch <= 5:
             lr = 1e-5 + (1e-3 - 1e-5) * ((epoch - 1) / 4.0)
@@ -347,10 +426,12 @@ def train_model(
         else:
             no_improve += 1
 
-        marker = " *" if improved else ""
+        # Loss mode annotation for logging
+        loss_mode = "MaskedReg" if epoch <= 20 else "Full+Focal"
+        marker    = " *" if improved else ""
         log(
             f"{epoch:>6}  {train_loss:>11.4f}"
-            f"  {val_mae:>10.4f}  {curr_lr:>10.2e}{marker}"
+            f"  {val_mae:>10.4f}  {curr_lr:>10.2e}  [{loss_mode}]{marker}"
         )
 
         if no_improve >= patience:
@@ -408,7 +489,7 @@ def _augment_groups_with_te(
     Inject target encoding features into each (group_df, i_min, i_max, gap) tuple.
     TE values are CONSTANT within a region (static features).
 
-    v14/v15: handles 4-tuple (group, i_min, i_max, actual_gap).
+    v14/v15/v16: handles 4-tuple (group, i_min, i_max, actual_gap).
     """
     result = []
     for entry in groups:
@@ -447,15 +528,16 @@ def _merge_te_to_df(
 
 
 # ---------------------------------------------------------------------------
-# Inference helper  (v15: single model, no fold ensembling)
+# Inference helper  (v15/v16: single model, no fold ensembling)
 # ---------------------------------------------------------------------------
 @torch.no_grad()
 def predict_test_set(model, test_df, feat_cols, scaler, actual_gaps, log) -> dict:
     """
     Run inference for every region in test_df using the given model.
 
-    v15: single model (single_fold_best.pt), no ensembling.
+    v16: single model (single_fold_best.pt), no ensembling.
     Retained v14 target_time + gap_size construction.
+    Submission clipped to [0, 5].
 
     Returns
     -------
@@ -526,46 +608,60 @@ def main():
 
     # -- 0. Architecture & loss description ------------------------------------
     log("=" * 80)
-    log("Drought Forecasting Pipeline  v15")
-    log("Parallel Dual-Stream (CNN+BiLSTM) + Single-Fold Data-Maximizing Paradigm")
+    log("Drought Forecasting Pipeline  v16")
+    log("Dilated TCN + Confidence Gap-Gating + Zero-Inflation Loss Suppression")
     log("=" * 80)
-    log("Architecture : Parallel Dual-Stream CNN+BiLSTM MTL  [v15]")
+    log("Architecture : Dual-Stream Dilated TCN + BiLSTM MTL  [v16]")
     log(f"  == LSTM Stream ==")
-    log(f"  BiLSTM     : hidden_size={HIDDEN_SIZE}/dir -> {HIDDEN_SIZE*2} effective  [v11]")
-    log(f"  Layers     : {NUM_LAYERS}  [v11]")
-    log(f"  lstm_context (B,{HIDDEN_SIZE*2}) -> expand (B,5,{HIDDEN_SIZE*2})")
-    log(f"  == CNN Stream (v15: NEW) ==")
-    log(f"  Conv1d     : Conv1d(37->128, k=3, pad=1) + GELU -> (B,128,26)")
-    log(f"  GlobalPool : AdaptiveAvgPool1d(1) -> (B,128,1) -> squeeze -> (B,128)")
-    log(f"  cnn_context (B,128) -> expand (B,5,128)")
+    log(f"  BiLSTM     : hidden_size={HIDDEN_SIZE}/dir -> {HIDDEN_SIZE*2} effective  "
+        f"[v16: hidden 256→128]")
+    log(f"  Layers     : {NUM_LAYERS}")
+    log(f"  lstm_context (B,{HIDDEN_SIZE*2})  ×  G  ->  gated (B,{HIDDEN_SIZE*2}) "
+        f"-> expand (B,5,{HIDDEN_SIZE*2})")
+    log(f"  == Dilated TCN Stream (v16 NEW) ==")
+    log(f"  Input      : (B, 29, 13)  [features × window]")
+    log(f"  TCN Layer 1: Conv1d(29→128, k=3, d=1, pad=1) + GELU -> (B,128,13)")
+    log(f"  TCN Layer 2: Conv1d(128→128, k=3, d=2, pad=2) + GELU -> (B,128,13)")
+    log(f"  TCN Layer 3: Conv1d(128→128, k=3, d=4, pad=4) + GELU -> (B,128,13)")
+    log(f"  Receptive field: 29 weeks (full window coverage)")
+    log(f"  GlobalPool : AdaptiveAvgPool1d(1) -> squeeze -> (B,128)")
+    log(f"  tcn_context (B,128)  ×  G  ->  gated (B,128) -> expand (B,5,128)")
+    log(f"  == Confidence Gap-Gating (v16 NEW) ==")
+    log(f"  G = Sigmoid(Linear(1,1)(gap_size))  ->  scalar ∈ [0,1]  (B,1)")
+    log(f"  Suppresses both streams proportionally to deployment gap uncertainty")
     log(f"  == Fusion ==")
     log(f"  horizon_ids [0-4] -> Embedding(5,32) -> (B,5,32)  [v11: learnable]")
     log(f"  target_time (B,5,2) -- week_sin/cos of 5 future target weeks  [v14]")
     log(f"  gap_size (B,1) -> Linear(1,16) -> (B,16) -> expand (B,5,16)  [v14]")
-    log(f"  encoded_state (B,5,{HIDDEN_SIZE*2+128+32+2+16})  [v15: 512+128+32+2+16=690]")
-    log(f"  Branch A   : Linear({HIDDEN_SIZE*2+128+32+2+16}->128) -> GELU -> Dropout(0.2) -> Linear(128->1)  [v15]")
+    log(f"  encoded_state (B,5,{HIDDEN_SIZE*2+128+32+2+16})  "
+        f"[v16: 256+128+32+2+16=434]")
+    log(f"  Branch A   : Linear({HIDDEN_SIZE*2+128+32+2+16}->128) -> GELU -> "
+        f"Dropout(0.2) -> Linear(128->1)  [v16]")
     log( "               P(drought) logits -- sigmoid() inline in forward()")
-    log(f"  Branch B   : Linear({HIDDEN_SIZE*2+128+32+2+16}->128) -> GELU -> Dropout(0.2) -> Linear(128->1)  [v15]")
+    log(f"  Branch B   : Linear({HIDDEN_SIZE*2+128+32+2+16}->128) -> GELU -> "
+        f"Dropout(0.2) -> Linear(128->1)  [v16]")
     log( "               Severity >= 0  via Softplus()")
     log( "  Output     : final = sigmoid(logits_A) x Branch_B  (Expected Severity)")
     log( "CV Strategy  : [v15] Single-Fold Data-Maximizing (100% regions, last 5 wks as Val_Y)")
-    log(f"  WINDOW_SIZE: {WINDOW_SIZE} weeks  [v11: was 13]")
+    log(f"  WINDOW_SIZE: {WINDOW_SIZE} weeks  [v16: 13w cap at test-set horizon]")
     log( "  actual_gap : computed from real calendar distance (train last -> test first)")
     log( "  Val_Y      : last 5 rows per region (fixed, no rotation)")
     log( "  Train      : ALL historical sliding windows ending before Val_Y (data max)")
     log( "  Scaler     : StandardScaler fit on entire maximized training split  [v15]")
     log( "  Fallback   : ZeroDataWaste (shrink gap if history too short)")
-    log( "Loss         : [v15] Dynamic Burn-in Schedule (unchanged from v14)")
-    log( "  Epoch 1-20 : Loss = Loss_B ONLY  (regression burn-in)")
-    log( "  Epoch 21+  : Loss = Loss_B + 0.1 * Loss_A  (BCE introduced lightly)")
+    log( "Loss         : [v16] Zero-Inflation Suppression Schedule")
+    log( "  Epoch 1-20 : Loss = Masked Regression ONLY  (active samples, target > 0)")
+    log( "               Zero-target samples receive 0 gradient in Branch B")
+    log( "  Epoch 21+  : Loss = Full Smooth L1 + 0.1 * FocalLoss(γ=2.0)")
     log( "  Loss_B     : Continuous Smooth L1  W_i = 1.0 + (y_i/5)^2 * 3.0")
-    log( "  Loss_A     : BCEWithLogitsLoss(logits_output, binary_target)")
+    log( "  Loss_A     : FocalLoss(γ=2.0)  [v16: replaces BCEWithLogitsLoss]")
     log(f"LR Schedule  : [v15] Manual Warm-up Epochs 1-5: 1e-5 -> 1e-3 (linear)")
     log( "               Epoch 6+: ReduceLROnPlateau (factor=0.5, patience=10)")
     log( "Early Stop   : pure L1Loss(final_output, y)  [Kaggle MAE aligned]")
-    log( "Pooling      : Temporal Attention  [v8: retained; v11: updated for hidden*2]")
+    log( "Pooling      : Temporal Attention [v8: retained; v16: hidden=128]")
     log( "LayerNorm    : LayerNorm(input_size) before LSTM  [v7: retained]")
-    log( "Features     : 37  (11 weather + 2 cyclic + 9 rolling + 8 lag + 5 drought + 2 TE)")
+    log( "Features     : 29  (11 weather + 2 cyclic + 3 rolling-4w + 4 lag1 "
+         "+ 4 lag2 + 3 drought-4w + 2 TE)  [v16: removed 8w/13w]")
     log( "  Cyclic     : week_sin, week_cos  [v9: retained]")
     log( "  TE         : region_mean_score, region_zero_prob  [v9: retained]")
     log( "Scaler       : Single StandardScaler fit on maximized train split  [v15]")
@@ -588,13 +684,20 @@ def main():
     assert n_train_regions == 2248, f"Expected 2248 train regions, got {n_train_regions}"
     assert n_test_regions  == 2248, f"Expected 2248 test regions,  got {n_test_regions}"
 
-    # -- 1b. Validate v9 features in processed CSV ----------------------------
-    log("\n[v9 Feature Validation]")
-    assert "week_sin" in train_raw.columns, "week_sin missing -- run eda.py first"
-    assert "week_cos" in train_raw.columns, "week_cos missing -- run eda.py first"
+    # -- 1b. Validate v16 features in processed CSV ----------------------------
+    log("\n[v16 Feature Validation]")
+    assert "week_sin" in train_raw.columns, "week_sin missing -- run preprocess.py first"
+    assert "week_cos" in train_raw.columns, "week_cos missing -- run preprocess.py first"
     assert "month" not in train_raw.columns, "month still present -- should be dropped by preprocess"
     assert "week_of_year" not in train_raw.columns, "week_of_year still present -- should be dropped"
     log("  v week_sin, week_cos present  |  month, week_of_year correctly absent.")
+
+    # Verify no 8w/13w domain-shift features
+    bad_cols = [c for c in train_raw.columns if ("8w" in c or "13w" in c)]
+    if bad_cols:
+        log(f"  *** WARNING: 8w/13w features found: {bad_cols}")
+    else:
+        log("  v No 8w/13w rolling features (domain-shift columns absent).")
 
     # -- 1c. Data Leakage Check ------------------------------------------------
     log("\n[Data Leakage Check]")
@@ -625,13 +728,14 @@ def main():
     zero_frac  = (all_scores == 0.0).mean()
     log(f"  mean={all_scores.mean():.4f}  std={all_scores.std():.4f}  "
         f"min={all_scores.min():.2f}  max={all_scores.max():.2f}")
-    log(f"  [v9] Zero-inflation: {zero_frac:.2%} of training scores == 0.0")
+    log(f"  [v16] Zero-inflation: {zero_frac:.2%} of training scores == 0.0")
+    log(f"  [v16] Masked Regression (burn-in) targets {1 - zero_frac:.2%} active samples")
     for thresh in [1.0, 2.0, 3.0, 4.0]:
         frac = (all_scores > thresh).mean() * 100
         log(f"  score > {thresh:.1f}: {frac:.2f}%  [{int((all_scores > thresh).sum()):,} samples]")
 
-    # -- 4b. [v14/v15] Compute per-region actual deployment gap ---------------
-    log("\n[v15] Computing per-region actual deployment gaps ...")
+    # -- 4b. [v14/v15/v16] Compute per-region actual deployment gap ---------------
+    log("\n[v16] Computing per-region actual deployment gaps ...")
     actual_gaps = compute_actual_gaps(train_raw, test_raw)
     gap_values  = np.array(list(actual_gaps.values()))
     log(f"  Regions with gap computed : {len(actual_gaps)}")
@@ -645,6 +749,7 @@ def main():
     gap_counter = Counter(gap_values.astype(int).tolist())
     top5 = gap_counter.most_common(5)
     log(f"  Top-5 most common gaps: {top5}")
+    log(f"  [v16] Confidence Gap-Gate will learn G=Sigmoid(Linear(normalized_gap))")
 
     # -- 5. Full-train Target Encoding (for scaler fitting + test inference) --
     log("\n[v9] Computing full-train Target Encoding statistics ...")
@@ -658,37 +763,38 @@ def main():
     log("  v region_mean_score, region_zero_prob added to train_df (full-train stats)")
 
     # -- 6. Determine feature columns and input_size ---------------------------
-    log("\n[v15] Determining feature columns ...")
+    log("\n[v16] Determining feature columns ...")
     feat_cols  = [c for c in FEATURE_COLS if c in train_df.columns]
     input_size = len(feat_cols)
     log(f"  Input features ({input_size}): {feat_cols}")
 
-    assert input_size == 37, (
-        f"Expected 37 features (35 base + 2 TE), got {input_size}. "
-        f"Check that preprocess.py was run (eda.py) and TE cols are present."
+    assert input_size == 29, (
+        f"Expected 29 features (27 base + 2 TE), got {input_size}. "
+        f"v16 removed all 8w/13w rolling features — check that preprocess.py "
+        f"was run and TE cols are present."
     )
 
-    # -- 7. [v15] Single-Fold Data-Maximizing Split ---------------------------
+    # -- 7. [v15/v16] Single-Fold Data-Maximizing Split -----------------------
     log(f"\n{'='*80}")
-    log(f"Single-Fold Data-Maximizing Training  [v15]")
-    log(f"[v15] Strategy: 100% of regions → Val_Y = last 5 weeks (fixed)")
-    log(f"[v15] Train    : ALL historical sliding windows before Val_Y (data-maximizing)")
-    log(f"[v15] Relative Gap-Replay: actual_gap replaces fixed GAP_WEEKS={GAP_WEEKS}")
-    log(f"[v15] Window Size: {WINDOW_SIZE} weeks")
-    log(f"Train loss  : v15 Burn-in: epochs 1-20 = Smooth L1 only; 21+ = Smooth L1 + 0.1*BCE")
+    log(f"Single-Fold Data-Maximizing Training  [v15/v16]")
+    log(f"[v16] Strategy: 100% of regions  →  Val_Y = last 5 weeks (fixed)")
+    log(f"[v16] Train    : ALL historical sliding windows before Val_Y (data-maximizing)")
+    log(f"[v16] Gap-Replay: actual_gap replaces fixed GAP_WEEKS={GAP_WEEKS}")
+    log(f"[v16] Window Size: {WINDOW_SIZE} weeks")
+    log(f"Train loss  : v16 Zero-Suppression: Masked Reg (ep 1-20) | Full + Focal (ep 21+)")
     log(f"Val metric  : pure MAE  (unweighted, Kaggle-aligned)")
     log(f"TE strategy : full-train stats (leakage-free TE inserted before split)")
     log(f"Scaler      : Single StandardScaler fit on maximized train features  [v15]")
-    log(f"Checkpoint  : single_fold_best.pt  [v15: replaces fold_k_best.pt]")
+    log(f"Checkpoint  : single_fold_best.pt")
     log(f"AMP : {USE_AMP}  |  batch_size={BATCH_SIZE} (OOM fallback: 256)  |  num_workers=8")
     log(f"{'='*80}")
 
     # Build single fold
     raw_train_groups, raw_val_groups = build_single_fold(train_df, actual_gaps)
-    log(f"\n  [v15 Single-Fold] Raw train groups: {len(raw_train_groups)}  "
+    log(f"\n  [v16 Single-Fold] Raw train groups: {len(raw_train_groups)}  "
         f"|  Raw val groups: {len(raw_val_groups)}")
 
-    # Augment both with full-train TE (already embedded in train_df, just pass through)
+    # Augment both with full-train TE
     aug_train_groups = _augment_groups_with_te(
         raw_train_groups, te_map_full, global_mean_te, global_zero_prob_te
     )
@@ -696,8 +802,8 @@ def main():
         raw_val_groups, te_map_full, global_mean_te, global_zero_prob_te
     )
 
-    # -- 7b. [v15] Fit single StandardScaler on maximized train split ----------
-    log(f"\n  [v15 Scaler] Fitting StandardScaler on maximized single-fold train features ...")
+    # -- 7b. [v15/v16] Fit single StandardScaler on maximized train split ------
+    log(f"\n  [v16 Scaler] Fitting StandardScaler on maximized single-fold train features ...")
     single_scaler = StandardScaler()
 
     train_feat_parts = []
@@ -712,10 +818,10 @@ def main():
     if train_feat_parts:
         train_feat_matrix = np.concatenate(train_feat_parts, axis=0)
         single_scaler.fit(train_feat_matrix)
-        log(f"  [v15 Scaler] Fit on {len(train_feat_matrix):,} rows "
+        log(f"  [v16 Scaler] Fit on {len(train_feat_matrix):,} rows "
             f"({train_feat_matrix.shape[1]} features)")
     else:
-        log(f"  [v15 Scaler] WARNING: No train rows found — using identity scaler.")
+        log(f"  [v16 Scaler] WARNING: No train rows found — using identity scaler.")
 
     # Create datasets with the single scaler
     train_ds = DroughtDataset(aug_train_groups, scaler=single_scaler)
@@ -742,7 +848,7 @@ def main():
 
         # Tensor shape verification
         first_X, first_y, first_tt, first_gs = next(iter(loader_tr))
-        log(f"\n  [v15 Tensor Shape Verification] First Batch:")
+        log(f"\n  [v16 Tensor Shape Verification] First Batch:")
         log(f"    X shape          : {tuple(first_X.shape)}"
             f"  ->  (Batch, Seq={first_X.shape[1]}, Features={first_X.shape[2]})")
         log(f"    y shape          : {tuple(first_y.shape)}"
@@ -762,7 +868,7 @@ def main():
             f"target_time mismatch: got {tuple(first_tt.shape)}, expected (B,5,2)"
         assert first_gs.shape[1] == 1, \
             f"gap_size mismatch: got {tuple(first_gs.shape)}, expected (B,1)"
-        log(f"    v Shape assertion PASSED (v15: target_time and gap_size verified).\n")
+        log(f"    v Shape assertion PASSED (v16: target_time and gap_size verified).\n")
         del first_X, first_y, first_tt, first_gs
 
         mae, epoch, hist = train_model(
@@ -781,8 +887,8 @@ def main():
 
     except RuntimeError as oom_err:
         if "out of memory" in str(oom_err).lower():
-            log(f"\n  [v15 OOM] CUDA out-of-memory at batch_size={batch_size_to_use}.")
-            log(f"  [v15 OOM] Flushing CUDA cache and retrying with batch_size=256 ...")
+            log(f"\n  [v16 OOM] CUDA out-of-memory at batch_size={batch_size_to_use}.")
+            log(f"  [v16 OOM] Flushing CUDA cache and retrying with batch_size=256 ...")
             torch.cuda.empty_cache()
 
             # Re-instantiate model to clear partially-allocated weights
@@ -794,12 +900,12 @@ def main():
         else:
             raise
 
-    log(f"\n  [v15 Single-Fold] Best Val MAE : {best_mae:.4f}")
-    log(f"  [v15 Single-Fold] Best Epoch  : {best_epoch_num}")
+    log(f"\n  [v16 Single-Fold] Best Val MAE : {best_mae:.4f}")
+    log(f"  [v16 Single-Fold] Best Epoch  : {best_epoch_num}")
     log(f"  Checkpoint saved -> {ckpt_path}")
 
     # --- Diagnostic Hook: prediction distribution ---
-    log(f"\n  [v15 Single-Fold Prediction Percentiles -- best checkpoint]")
+    log(f"\n  [v16 Single-Fold Prediction Percentiles -- best checkpoint]")
     if os.path.exists(ckpt_path) and best_mae < float("inf"):
         model.load_state_dict(torch.load(ckpt_path, map_location=DEVICE))
         single_fold_pct = eval_prediction_percentiles(model, loader_val, DEVICE, log)
@@ -823,7 +929,7 @@ def main():
     log(f"{'='*80}")
 
     # -- 8. Save single scaler ------------------------------------------------
-    log(f"\n[v15] Saving single StandardScaler (fit on maximized train split) ...")
+    log(f"\n[v16] Saving single StandardScaler (fit on maximized train split) ...")
     with open(os.path.join(MODELS_DIR, "scaler.pkl"), "wb") as f:
         pickle.dump(single_scaler, f)
     log(f"  Scaler saved -> {os.path.join(MODELS_DIR, 'scaler.pkl')}")
@@ -836,11 +942,12 @@ def main():
 
     # -- 9. Single-Model Inference on Test Set --------------------------------
     log(f"\n{'='*80}")
-    log(f"Single-Model Inference  [v15 – single_fold_best.pt]")
+    log(f"Single-Model Inference  [v16 – single_fold_best.pt]")
     log(f"  Checkpoint: {ckpt_path}")
     log(f"  Scaler: single_fold_best scaler (fit on maximized train split)  [v15]")
     log(f"  [v14] target_time: week_sin/cos of 5 test target weeks")
     log(f"  [v14] gap_size: per-region actual_gap / 100.0")
+    log(f"  [v16] Gap-Gating: G = Sigmoid(Linear(gap_size)) applied to both streams")
     log(f"  Safety clip: np.clip(pred, 0.0, 5.0)")
     log(f"{'='*80}")
 
@@ -875,9 +982,9 @@ def main():
     log(f"  n={len(all_sub_preds):,}  mean={all_sub_preds.mean():.4f}  std={all_sub_preds.std():.4f}")
     log(f"  p50={p50:.4f}  p90={p90:.4f}  p95={p95:.4f}  p99={p99:.4f}  max={pmax:.4f}")
     if p99 < 2.0:
-        log("  *** WARNING: Submission p99 < 2.0 -- model collapse still present! ***")
+        log("  *** WARNING: Submission p99 < 2.0 -- model zero-collapse still present! ***")
     else:
-        log("  v Submission p99 >= 2.0 -- model collapse is BROKEN.")
+        log("  v Submission p99 >= 2.0 -- zero-collapse suppression is working.")
 
     zero_pred_frac = (all_sub_preds < 0.05).mean()
     log(f"  Fraction of near-zero predictions (<0.05): {zero_pred_frac:.2%}")
@@ -888,11 +995,11 @@ def main():
     for region_id, preds in sorted(predictions.items()):
         rows.append({
             "region_id":  region_id,
-            "pred_week1": float(preds[0]),
-            "pred_week2": float(preds[1]),
-            "pred_week3": float(preds[2]),
-            "pred_week4": float(preds[3]),
-            "pred_week5": float(preds[4]),
+            "pred_week1": float(np.clip(preds[0], 0, 5)),
+            "pred_week2": float(np.clip(preds[1], 0, 5)),
+            "pred_week3": float(np.clip(preds[2], 0, 5)),
+            "pred_week4": float(np.clip(preds[3], 0, 5)),
+            "pred_week5": float(np.clip(preds[4], 0, 5)),
         })
 
     submission = pd.DataFrame(rows)
@@ -916,6 +1023,13 @@ def main():
     )
     log("  v Train/test regions match (2248).")
 
+    # Values in [0, 5] guaranteed by np.clip in predict_test_set + rows above
+    assert submission[["pred_week1","pred_week2","pred_week3",
+                        "pred_week4","pred_week5"]].max().max() <= 5.0 + 1e-6
+    assert submission[["pred_week1","pred_week2","pred_week3",
+                        "pred_week4","pred_week5"]].min().min() >= 0.0 - 1e-6
+    log("  v All predictions in [0, 5]  (np.clip enforced).")
+
     log(f"  submission.csv -> {sub_path}")
     log(f"  Rows (excl. header): {len(submission)}")
     log(f"  Columns: {list(submission.columns)}")
@@ -923,7 +1037,7 @@ def main():
 
     # Save full training log
     log(f"\nTotal elapsed: {(time.time() - t0):.1f}s")
-    log_path = os.path.join(ROOT, "_training_log_15th.txt")
+    log_path = os.path.join(ROOT, "_training_log_16th.txt")
     with open(log_path, "w") as f:
         f.write("\n".join(log_lines))
     print(f"\nTraining log saved -> {log_path}")
