@@ -3,37 +3,40 @@ DroughtLSTM
 ===========
 Multi-output dual-stream model for direct 5-step drought score forecasting.
 
-Architecture (v16 – Dilated TCN + Confidence Gap-Gating)
----------------------------------------------------------
-  Problem (v15): The single-layer CNN stream only captures local 3-week patterns.
-    With WINDOW_SIZE=13 there are macro-climate patterns spanning 4-13 weeks
-    that require wider receptive fields.  The original fixed-gap embedding
-    cannot reliably signal reliability when the deployment gap varies widely
-    (observed range: 1–70+ weeks across the 2248 regions).
+Architecture (v17 – Dilated TCN + Exponential Decay Gap-Gating + Hurdle Model)
+-------------------------------------------------------------------------------
+  Problem (v16): The linear Sigmoid gap-gate suffered anti-physics inversion:
+    a larger Linear(1,1) weight produced HIGHER G for larger gaps, the exact
+    opposite of the required physics (memory should decay as the gap grows).
+    Additionally, the masked regression burn-in prevented the regression head
+    from learning the baseline zero-drought scale.
 
-  Solution (v16) – three new components:
+  Solution (v17) – three rectifications:
 
-  1. LSTM hidden downsized (256 → 128 per direction):
-     Reduces parameter count, lessens overfitting on the smaller 13-week window.
-     Effective BiLSTM output: 128 × 2 = 256.
+  1. Exponential Decay Gap-Gating (replaces Linear+Sigmoid gate):
+     Learnable decay parameter: self.gap_lambda = nn.Parameter(tensor(5.0))
+     G = exp(-max(eps, |gap_lambda|) * gap_size)   [strictly monotone decay]
+     Both lstm_context and tcn_context are multiplied by G BEFORE expansion.
+     Physics constraint guarantees G → 1 when gap→0, G → 0 when gap→∞.
+     The gap_embed (Linear(1,16)) is kept separately in the fusion layer
+     to provide a learnable positional signal about the gap magnitude.
 
-  2. 1D Dilated TCN Stream (replaces single Conv1d):
+  2. 1D Dilated TCN Stream (retained from v16):
      Three dilated 1D convolutions with doubling dilation (d=1, 2, 4).
      Each layer uses kernel_size=3 and padding = dilation*(kernel_size-1)//2
      to keep the sequence length fixed at 13.
      Receptive field of the full stack: 1 + 2*(3-1) + 4*(3-1) + 8*(3-1) = 29 weeks
-     (larger than the window, ensuring all 13 steps are contextualised).
      → tcn_context (B, 128) after AdaptiveAvgPool1d(1).
 
-  3. Confidence Gap-Gating:
-     gap_size (B,1) → Linear(1,1) → Sigmoid → G ∈ [0,1] scalar.
-     Both lstm_context and tcn_context are multiplied by G BEFORE expansion.
-     When G is small (large/uncertain gap), both streams are suppressed,
-     pushing the model towards a conservative (near-zero) forecast.
-     The gap_embed (Linear(1,16)) is kept separately in the fusion layer
-     to provide a learnable positional signal about the gap magnitude.
+  3. Decoupled Hurdle Model Outputs (v17 NEW):
+     Forward now returns three tensors:
+       final_output    = sigmoid(logits) * severity  (B, 5)
+       logits_output   = Branch A raw logits          (B, 5)
+       severity_output = Branch B softplus output     (B, 5)
+     train.py uses severity_output directly for Loss_B (target>0 only),
+     enabling mathematically isolated loss flows between the two branches.
 
-Architecture Detail (v16: input_size=29, window=13)
+Architecture Detail (v17: input_size=29, window=13)
 ----------------------------------------------------
   Input x (B, 13, 29)
 
@@ -43,21 +46,22 @@ Architecture Detail (v16: input_size=29, window=13)
     -> Temporal Attention (Linear(256->1) softmax over time dim=13)
        lstm_context = weighted sum                  (B, 256)
     -> Dropout(0.4)
-    -> Gating: lstm_context = lstm_context * G      (B, 256)   [v16 NEW]
+    -> Gating: lstm_context = lstm_context * G      (B, 256)
     -> expand to                                   (B, 5, 256)
 
-  == Dilated TCN Stream (v16) ==
+  == Dilated TCN Stream (v16, retained) ==
     -> x.permute(0,2,1)                            (B, 29, 13)
     -> Conv1d(29->128, k=3, d=1, pad=1) + GELU     (B, 128, 13)
     -> Conv1d(128->128, k=3, d=2, pad=2) + GELU    (B, 128, 13)
     -> Conv1d(128->128, k=3, d=4, pad=4) + GELU    (B, 128, 13)
     -> AdaptiveAvgPool1d(1)                         (B, 128, 1)
     -> squeeze(-1)   tcn_context                   (B, 128)
-    -> Gating: tcn_context = tcn_context * G        (B, 128)   [v16 NEW]
+    -> Gating: tcn_context = tcn_context * G        (B, 128)
     -> expand to                                   (B, 5, 128)
 
-  == Confidence Gap-Gating (v16 NEW) ==
-    -> gap_size (B,1) -> Linear(1,1) -> Sigmoid -> G (B,1)
+  == Exponential Decay Gap-Gating (v17 NEW) ==
+    -> gap_lambda (learnable scalar nn.Parameter, init=5.0)
+    -> G = exp(-max(eps, |gap_lambda|) * gap_size)  (B,1) in (0, 1]
        G multiplies both lstm_context and tcn_context (before expansion)
 
   == Horizon / Time / Gap embeddings ==
@@ -82,29 +86,32 @@ Architecture Detail (v16: input_size=29, window=13)
   Forward Signature:
     forward(self, x, target_time, gap_size)
 
-  Forward Outputs:
-    1. final_output  = sigmoid(logits_output) * severity  (B, 5)
-    2. logits_output = Branch_A raw logits (B, 5) -> FocalLoss in train.py
+  Forward Outputs (v17):
+    1. final_output     = sigmoid(logits_output) * severity_output  (B, 5)
+    2. logits_output    = Branch A raw logits (B, 5)  -> FocalLoss in train.py
+    3. severity_output  = Branch B softplus  (B, 5)  -> Hurdle Loss_B in train.py
 
   AMP Fix (retained from v9):
     BCELoss + Sigmoid is UNSAFE under torch.autocast (float16 underflow / NaN).
     Solution: Return raw logits from Branch A; use FocalLoss in train.py.
 
-  Joint Loss (defined in train.py v16):
-    Epochs  1-20 (Burn-in): Loss = Masked Regression (B, active samples only)
-    Epoch  21+:             Loss = Loss_B (full) + 0.1 * Loss_A (FocalLoss)
-    Loss_A = FocalLoss(γ=2.0)(logits_output, binary_target)
-    Loss_B = Continuous Smooth L1  W = 1.0 + (y/5)^2 * 3.0
+  Joint Loss (defined in train.py v17 – Decoupled Hurdle Model):
+    Loss_A = FocalLoss(gamma=2.0)(logits_output, binary_target) [ALL samples, w=1.0]
+    Loss_B = Weighted Smooth L1(severity_output, target)    [target>0 ONLY, w=1.0]
+    Total  = Loss_A + Loss_B
     Early Stopping: monitors pure L1Loss(final_output, target) -> Kaggle-aligned
 
-Changes from v15
+Changes from v16
 ----------------
-  [v16] LSTM hidden_size: 256 → 128 (effective output: 512 → 256)
+  [v17] Exponential Decay Gap-Gating: G = exp(-max(eps,|gap_lambda|)*gap_size)
+         gap_lambda is a learnable scalar nn.Parameter (init=5.0)
+         Replaces the Linear+Sigmoid gate (anti-physics inversion fixed)
+  [v17] Forward returns (final_output, logits_output, severity_output)
+         Decoupled Hurdle Model: severity_output used directly in Loss_B
+  [v16] LSTM hidden_size: 256 -> 128 (effective output: 512 -> 256)
   [v16] CNN stream replaced by Dilated TCN (d=1,2,4; keeps seq_len=13)
-  [v16] Confidence Gap-Gating: G = Sigmoid(Linear(gap_size,1,1))
-         applied to lstm_context and tcn_context before fusion
-  [v16] branch_in: 690 → 434  (256+128+32+2+16)
-  [v16] Branch heads updated: Linear(434→128) for both A and B
+  [v16] branch_in: 690 -> 434  (256+128+32+2+16)
+  [v16] Branch heads updated: Linear(434->128) for both A and B
 """
 
 import torch
@@ -116,7 +123,7 @@ class DroughtLSTM(nn.Module):
     """
     Parameters
     ----------
-    input_size  : number of features per time step (F = 29 in v16)
+    input_size  : number of features per time step (F = 29 in v16/v17)
     hidden_size : LSTM hidden dimensionality per direction (default 128)
                   Effective LSTM output width = hidden_size * 2 = 256 (BiLSTM)
     num_layers  : number of stacked LSTM layers (default 3)
@@ -127,7 +134,7 @@ class DroughtLSTM(nn.Module):
     def __init__(
         self,
         input_size: int,
-        hidden_size: int = 128,   # v16: 256 → 128 (effective output unchanged formula)
+        hidden_size: int = 128,   # v16: 256 -> 128 (effective output = hidden*2 = 256)
         num_layers: int = 3,
         dropout: float = 0.4,
         horizon: int = 5,
@@ -187,11 +194,12 @@ class DroughtLSTM(nn.Module):
         self.global_pool = nn.AdaptiveAvgPool1d(1)
 
         # ----------------------------------------------------------------
-        # Confidence Gap-Gating  (v16 NEW)
-        # gap_size (B,1) → Linear(1,1) → Sigmoid → G ∈ [0,1]
-        # G multiplies both lstm_context and tcn_context
+        # Exponential Decay Gap-Gating  (v17 – replaces Linear+Sigmoid gate)
+        # G = exp(-max(eps, |gap_lambda|) * gap_size)  in (0, 1]
+        # Physics constraint: G=1 at gap=0; G->0 as gap->inf (strictly monotone)
+        # gap_lambda is a learnable scalar initialized at 5.0
         # ----------------------------------------------------------------
-        self.gap_gate = nn.Linear(1, 1)
+        self.gap_lambda = nn.Parameter(torch.tensor(5.0))
 
         # ----------------------------------------------------------------
         # Horizon / Time / Gap Embeddings  (retained from v14)
@@ -204,7 +212,7 @@ class DroughtLSTM(nn.Module):
         self.gap_embed = nn.Linear(1, 16)
 
         # ----------------------------------------------------------------
-        # Branch Heads  (v16 updated)
+        # Branch Heads  (v16 updated, retained in v17)
         # ----------------------------------------------------------------
         # After concatenating:
         #   lstm_context (256) + tcn_context (128)
@@ -246,28 +254,34 @@ class DroughtLSTM(nn.Module):
         Parameters
         ----------
         x           : (B, W, F)  -- input feature window
-                       v16: W=13, F=29
+                       v16/v17: W=13, F=29
         target_time : (B, 5, 2)  -- week_sin/cos of future target weeks
         gap_size    : (B, 1)     -- normalised actual_gap (gap / 100.0)
 
-        Returns
+        Returns  (v17 – three tensors)
         -------
         final_output : (B, 5)
-            Element-wise product of sigmoid(logits_output) x severity_output.
-            Represents Expected Severity = P(drought) x E[severity | drought].
+            sigmoid(logits_output) * severity_output  (Expected Severity).
             Caller should np.clip(out, 0, 5) before writing submission.csv.
 
         logits_output : (B, 5)
             Raw logits of Branch A (pre-sigmoid).
-            Passed to FocalLoss (γ=2.0) in train.py.
+            Passed to FocalLoss (gamma=2.0) -- Branch A of Hurdle Loss.
+
+        severity_output : (B, 5)
+            Branch B softplus output (>= 0).
+            Passed directly to Hurdle Loss_B (computed on target > 0 only).
         """
         B = x.size(0)
 
         # ----------------------------------------------------------------
-        # Confidence Gap Gate  (v16 NEW – computed first, used in both streams)
-        # G (B, 1)  ∈ [0, 1]
+        # Exponential Decay Gap Gate  (v17 – physics-correct monotone decay)
+        # G = exp(-max(eps, |gap_lambda|) * gap_size)
+        # gap_size is already normalised (actual_gap / 100.0)
         # ----------------------------------------------------------------
-        G = torch.sigmoid(self.gap_gate(gap_size))    # (B, 1)
+        eps = 1e-6
+        lam = torch.clamp(torch.abs(self.gap_lambda), min=eps)   # scalar > 0
+        G = torch.exp(-lam * gap_size)                            # (B, 1)
 
         # ----------------------------------------------------------------
         # LSTM Stream
@@ -282,7 +296,7 @@ class DroughtLSTM(nn.Module):
 
         dropped = self.dropout(context_vector)                 # (B, 256)
 
-        # Apply Confidence Gap Gate
+        # Apply Exponential Decay Gap Gate
         lstm_context = dropped * G                             # (B, 256)
 
         # Expand across horizon steps
@@ -291,14 +305,14 @@ class DroughtLSTM(nn.Module):
         # (B, 5, 256)
 
         # ----------------------------------------------------------------
-        # Dilated TCN Stream  (v16)
+        # Dilated TCN Stream  (v16, retained)
         # ----------------------------------------------------------------
         x_tcn = x.permute(0, 2, 1)                            # (B, F, W) = (B, 29, 13)
         tcn_feat = self.tcn_stream(x_tcn)                     # (B, 128, 13)
         tcn_pooled = self.global_pool(tcn_feat)               # (B, 128, 1)
         tcn_raw = tcn_pooled.squeeze(-1)                      # (B, 128)
 
-        # Apply Confidence Gap Gate
+        # Apply Exponential Decay Gap Gate
         tcn_context = tcn_raw * G                             # (B, 128)
 
         tcn_expanded = tcn_context.unsqueeze(1).expand(B, self.horizon, 128)
@@ -318,7 +332,7 @@ class DroughtLSTM(nn.Module):
         # target_time is already (B, 5, 2)
 
         # ----------------------------------------------------------------
-        # Feature Fusion  (v16)
+        # Feature Fusion  (v16, retained)
         # ----------------------------------------------------------------
         # [lstm(256) + tcn(128) + h_emb(32) + target_time(2) + gap(16)] = 434
         encoded_state = torch.cat(
@@ -333,28 +347,31 @@ class DroughtLSTM(nn.Module):
         logits_output = self.head_prob(encoded_state).squeeze(-1)     # (B, 5)
 
         # ----------------------------------------------------------------
-        # Branch B: Severity of Drought (non-negative)
+        # Branch B: Severity of Drought (non-negative via Softplus)
+        # v17: returned separately for decoupled Hurdle Model Loss_B
         # ----------------------------------------------------------------
-        severity = self.softplus(
+        severity_output = self.softplus(
             self.head_severity(encoded_state).squeeze(-1)
         )                                                              # (B, 5)
 
         # Expected Severity = sigmoid(logitsA) x SeverityB
-        final_output = torch.sigmoid(logits_output) * severity        # (B, 5)
+        final_output = torch.sigmoid(logits_output) * severity_output  # (B, 5)
 
         # Shape debug – print once on first forward call
         if not self._printed_shape:
             print(
-                f"  [v16 Shape Debug] x: {tuple(x.shape)}  "
+                f"  [v17 Shape Debug] x: {tuple(x.shape)}  "
                 f"| lstm_context (gated): {tuple(lstm_context.shape)}  "
                 f"| tcn_context (gated): {tuple(tcn_context.shape)}  "
                 f"| G: {tuple(G.shape)}  "
+                f"| gap_lambda: {self.gap_lambda.item():.4f}  "
                 f"| encoded_state: {tuple(encoded_state.shape)}  "
                 f"| final_output: {tuple(final_output.shape)}"
             )
             self._printed_shape = True
 
-        return final_output, logits_output
+        # v17: return severity_output separately for decoupled Hurdle Model loss
+        return final_output, logits_output, severity_output
 
     # -----------------------------------------------------------------------
     def count_parameters(self) -> int:
@@ -364,35 +381,37 @@ class DroughtLSTM(nn.Module):
         lstm_out_size = self.hidden_size * 2    # 256
         branch_in     = lstm_out_size + 128 + 32 + 2 + 16   # 434
         lines = [
-            "DroughtLSTM Architecture (v16 – Dilated TCN + Confidence Gap-Gating)",
-            "=" * 90,
-            f"  Input size   : {input_size}  (features per week; v16: 29)",
+            "DroughtLSTM Architecture (v17 – Dilated TCN + Exponential Decay Gap-Gating + Hurdle Model)",
+            "=" * 95,
+            f"  Input size   : {input_size}  (features per week; v16/v17: 29)",
             f"  Window size  : 13 weeks  (v16: capped at test-set horizon)",
             "",
             "  == LSTM Stream ==",
             f"  LayerNorm    : LayerNorm({input_size})",
             f"  BiLSTM       : hidden={self.hidden_size}/dir -> {lstm_out_size} effective  "
-            f"(layers={self.num_layers}, bidirectional=True)  [v16: hidden 256→128]",
+            f"(layers={self.num_layers}, bidirectional=True)  [v16: hidden 256->128]",
             f"  Dropout      : {self.dropout.p}",
             f"  Attn         : Linear({lstm_out_size}->1); softmax over time; weighted sum",
             f"  lstm_context : (B, {lstm_out_size})  [BEFORE gap gate]",
-            f"  Gap Gate G   : Sigmoid(Linear(1,1)(gap_size))  ->  G (B,1)  [v16 NEW]",
+            f"  Gap Gate G   : exp(-max(eps,|gap_lambda|)*gap_size)  ->  G (B,1)  [v17]",
+            f"  gap_lambda   : nn.Parameter (learnable scalar, init=5.0)  [v17]",
             f"  gated_lstm   : lstm_context * G  (B, {lstm_out_size})  "
             f"-> expand (B, 5, {lstm_out_size})",
             "",
-            "  == Dilated TCN Stream (v16 NEW – replaces single Conv1d) ==",
+            "  == Dilated TCN Stream (v16 – retained) ==",
             f"  Transpose    : (B, 13, {input_size}) -> (B, {input_size}, 13)",
             f"  TCN Layer 1  : Conv1d({input_size}->128, k=3, d=1, pad=1) + GELU -> (B, 128, 13)",
             "  TCN Layer 2  : Conv1d(128->128, k=3, d=2, pad=2) + GELU -> (B, 128, 13)",
             "  TCN Layer 3  : Conv1d(128->128, k=3, d=4, pad=4) + GELU -> (B, 128, 13)",
             "  Receptive field: 1+2*(3-1)+4*(3-1)+8*(3-1) = 29 weeks",
             "  GlobalPool   : AdaptiveAvgPool1d(1) -> (B, 128, 1) -> squeeze -> (B, 128)",
-            "  Gap Gate G   : tcn_context * G  (B, 128) -> expand (B, 5, 128)  [v16 NEW]",
+            "  Gap Gate G   : tcn_context * G  (B, 128) -> expand (B, 5, 128)  [v17]",
             "",
-            "  == Confidence Gap-Gating (v16 NEW) ==",
-            "  gap_size (B,1) -> Linear(1,1) -> Sigmoid -> G (B,1)",
-            "  G suppresses both streams when deployment gap is large/uncertain",
-            "  (gap_embed Linear(1,16) is SEPARATE: provides positional signal in fusion)",
+            "  == Exponential Decay Gap-Gating (v17 NEW) ==",
+            "  gap_lambda : nn.Parameter (learnable scalar, init=5.0)",
+            "  G = exp(-max(eps, |gap_lambda|) * gap_size)  (B,1)  in (0, 1]",
+            "  Physics constraint: G->1 at gap=0, G->0 as gap->inf (strictly monotone)",
+            "  (gap_embed Linear(1,16) is SEPARATE: positional signal only in fusion)",
             "",
             "  == Embeddings ==",
             "  Learnable Horizon Embedding:",
@@ -403,7 +422,7 @@ class DroughtLSTM(nn.Module):
             "     gap_size input (B, 1)  -- normalised actual_gap / 100.0",
             "     gap_embed = Linear(1, 16) -> (B, 16) -> expand (B, 5, 16)",
             "",
-            "  == Feature Fusion (v16) ==",
+            "  == Feature Fusion (v16, retained) ==",
             f"  Concat: [lstm({lstm_out_size}) + tcn(128) + h_emb(32) + tt(2) + gap(16)]",
             f"     -> encoded_state (B, 5, {branch_in})",
             "",
@@ -412,27 +431,25 @@ class DroughtLSTM(nn.Module):
             f"  Branch B : Linear({branch_in}->128) -> GELU -> Dropout(0.2) -> Linear(128->1) -> Softplus",
             "             squeeze(-1) -> (B,5) >= 0  -- Severity of Drought",
             "  Final    : sigmoid(logitsA) x Branch_B  (Expected Severity)",
-            "  Returns  : (final_output, logits_output) -- two tensors",
+            "  Returns  : (final_output, logits_output, severity_output)  [v17: 3 tensors]",
             "  Inference: np.clip(final_output, 0, 5) applied in train.py",
-            "-" * 90,
-            "  [v16] LSTM hidden_size: 256 → 128  (effective: 512 → 256)",
-            "  [v16] CNN stream → Dilated TCN (d=1,2,4); receptive field = 29 weeks",
-            "  [v16] Confidence Gap-Gating: G = Sigmoid(Linear(1,1)(gap_size))",
-            f"  [v16] branch_in: 690 → {branch_in}  (256+128+32+2+16)",
-            "  [v15] Single-Fold Paradigm:",
-            "     Val_Y = last 5 weeks of each region (100% regions, fixed)",
-            "     Train = ALL available historical sliding windows (data-maximizing)",
-            "  [v16] Zero-Inflation Suppression (train.py):",
-            "     Epoch 1-20 (Burn-in) : Loss_B = Masked Regression (active samples only)",
-            "     Epoch 21+            : Loss_B (full) + 0.1 * FocalLoss(γ=2.0)",
-            "  [v14/15] Manual LR Warm-up (Peak LR=1e-3):",
+            "-" * 95,
+            "  [v17] Exponential Decay Gap-Gating: G = exp(-max(eps,|gap_lambda|)*gap_size)",
+            "        gap_lambda is learnable nn.Parameter (init=5.0) -- physics-correct",
+            "  [v17] Decoupled Hurdle Model: returns severity_output for direct Loss_B",
+            "  [v17] 5-Fold Region Group CV in train.py (GroupKFold by region_id)",
+            "  [v17] Hurdle Loss: Loss_A (all samples) + Loss_B (target>0 only)",
+            "  [v16] LSTM hidden_size: 256 -> 128  (effective: 512 -> 256)",
+            "  [v16] CNN stream -> Dilated TCN (d=1,2,4); receptive field = 29 weeks",
+            f"  [v16] branch_in: 690 -> {branch_in}  (256+128+32+2+16)",
+            "  [v17] Manual LR Warm-up (Peak LR=1e-3):",
             "     Epochs  1-5  : LR linearly ramps 1e-5 -> 1e-3",
             "     Epoch   6+   : ReduceLROnPlateau takes over",
-            f"  [v16] Loss_A : FocalLoss(γ=2.0)  (was BCEWithLogitsLoss in v15)",
-            "  [v14-16] Loss_B : Continuous Smooth L1  W = 1.0 + (y/5)^2 * 3.0",
+            "  [v17] Loss_A : FocalLoss(gamma=2.0) on ALL samples, weight=1.0",
+            "  [v17] Loss_B : Weighted Smooth L1 on target>0 ONLY, weight=1.0",
             "  Early Stop   : pure L1Loss(final_output, y)  [Kaggle MAE aligned]",
-            "  Checkpoint   : single_fold_best.pt",
-            "-" * 90,
+            "  Checkpoint   : fold_{k}_best.pt  [v17: one per fold]",
+            "-" * 95,
             f"  Total params : {self.count_parameters():,}",
         ]
         return "\n".join(lines)

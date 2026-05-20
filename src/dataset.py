@@ -510,6 +510,116 @@ def build_walk_forward_folds(df: pd.DataFrame):
 
 
 # ---------------------------------------------------------------------------
+# v17: 5-Fold Region Group CV builder (GroupKFold by region_id)
+# ---------------------------------------------------------------------------
+def build_region_group_cv_folds(
+    df: pd.DataFrame,
+    actual_gaps: dict,
+    n_splits: int = 5,
+):
+    """
+    v17: 5-Fold Region Group CV.
+
+    Uses sklearn GroupKFold(n_splits=5) grouped strictly by region_id.
+    For each fold, 20% of geographical regions are withheld entirely for
+    validation, preventing global macro-climate memorisation.
+
+    Train groups: ALL sliding windows for each training-fold region
+                  (same logic as build_full_train_groups).
+    Val groups  : Last HORIZON rows as Val_Y for each validation-fold region,
+                  with per-region gap-replay using each region's actual_gap
+                  (same windowing logic as build_single_fold).
+
+    NOTE: TE columns (region_mean_score, region_zero_prob) are NOT added here.
+          They are injected per-fold by train.py._augment_groups_with_te()
+          AFTER calling this function, using fold-local TE statistics.
+
+    Parameters
+    ----------
+    df          : pd.DataFrame with refined features (no TE cols required)
+    actual_gaps : dict  region_id -> int (deployment gap in weeks)
+    n_splits    : int   number of CV folds (default 5)
+
+    Returns
+    -------
+    folds : list of (train_groups, val_groups)
+        train_groups : list of (group_df, i_min, i_max, effective_gap)
+        val_groups   : list of (group_df, val_i, val_i, effective_gap)
+    """
+    from sklearn.model_selection import GroupKFold
+
+    region_ids = df["region_id"].unique()
+    n_regions  = len(region_ids)
+
+    gkf      = GroupKFold(n_splits=n_splits)
+    dummy_X  = np.zeros((n_regions, 1))
+
+    folds = []
+
+    for train_reg_idx, val_reg_idx in gkf.split(dummy_X, groups=region_ids):
+        train_region_set = set(region_ids[train_reg_idx])
+        val_region_set   = set(region_ids[val_reg_idx])
+
+        train_df_fold = df[df["region_id"].isin(train_region_set)]
+        val_df_fold   = df[df["region_id"].isin(val_region_set)]
+
+        # ---- Train: ALL sliding windows (data-maximizing) ----
+        train_groups = []
+        for _, group in train_df_fold.groupby("region_id"):
+            group = group.reset_index(drop=True)
+            n   = len(group)
+            rid = group["region_id"].iloc[0]
+
+            actual_gap = actual_gaps.get(rid, GAP_WEEKS)
+            # Zero Data Waste Fallback
+            if n < WINDOW_SIZE + actual_gap + HORIZON:
+                effective_gap = n - WINDOW_SIZE - HORIZON
+                if effective_gap < 1:
+                    continue
+            else:
+                effective_gap = actual_gap
+
+            train_i_max = n - WINDOW_SIZE - effective_gap - HORIZON
+            if train_i_max >= 0:
+                train_groups.append((group, 0, train_i_max, effective_gap))
+
+        # ---- Val: last HORIZON rows as Val_Y, gap-replay windowing ----
+        val_groups = []
+        for _, group in val_df_fold.groupby("region_id"):
+            group = group.reset_index(drop=True)
+            n   = len(group)
+            rid = group["region_id"].iloc[0]
+
+            actual_gap = actual_gaps.get(rid, GAP_WEEKS)
+            # Zero Data Waste Fallback
+            min_required = WINDOW_SIZE + actual_gap + HORIZON
+            if min_required > n:
+                effective_gap = n - WINDOW_SIZE - HORIZON
+                if effective_gap < 1:
+                    continue
+            else:
+                effective_gap = actual_gap
+
+            val_y_start = n - HORIZON
+            val_x_end   = val_y_start - effective_gap
+            val_x_start = val_x_end - WINDOW_SIZE
+
+            if val_x_start < 0 or val_x_end < WINDOW_SIZE:
+                continue
+
+            val_tgt_start = val_x_end + effective_gap   # == val_y_start
+            val_tgt_end   = val_tgt_start + HORIZON
+            if val_tgt_end > n:
+                continue
+
+            val_groups.append((group, val_x_start, val_x_start, effective_gap))
+
+        folds.append((train_groups, val_groups))
+
+    return folds
+
+
+# ---------------------------------------------------------------------------
 # Helper – build full-train group list (train on ALL data for final model)
 # ---------------------------------------------------------------------------
 def build_full_train_groups(df: pd.DataFrame, actual_gaps: dict = None):
