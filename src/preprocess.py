@@ -1,51 +1,70 @@
 """
-preprocess.py – Full Preprocessing Pipeline (v9)
+preprocess.py – Full Preprocessing Pipeline (v10)
 =================================================
 Functions
 ---------
   load_data              : load raw CSV from /data/
-  impute_met_features    : ffill / bfill within region (no dropna)
-  handle_outliers        : Z-score clip (Z=3.5 default)
-  align_labels_strategy_a: weekly aggregation for TRAIN – LEFT join, keeps all 2248 regions
-  aggregate_test_weekly  : weekly aggregation for TEST
-  preprocess_data        : rolling (4/8/13w) + lag (1/2w) features; min_periods=1
+  impute_met_features    : ffill / bfill within region (applied BEFORE aggregation)
+  handle_outliers        : Z-score clip (Z=3.5, applied BEFORE aggregation)
+  align_labels_absolute  : weekly aggregation using ABSOLUTE INDEX grouping (TRAIN+TEST)
+  aggregate_test_weekly  : weekly aggregation for TEST (thin wrapper)
+  preprocess_data        : rolling (4w ONLY) + lag (1/2w) features; min_periods=1
   export_processed       : save to /data/processed/
+  add_drought_index      : PET / deficit 4w rolling features (used by dataset.py)
 
-  add_drought_index      : PET / deficit rolling features (used by dataset.py)
+Catastrophic Flaws Fixed from v9
+---------------------------------
+  FLAW 1 – Synthetic Calendar Grouping ("Ghost Weeks"):
+    v9 used _date_to_components() which computed week_of_year from a 366-day
+    synthetic calendar (53 weeks/year).  Because year boundaries don't align
+    with 7-day multiples in this synthetic calendar, the groupby produced
+    partial weeks at every year-end.  These ghost weeks had NaN scores
+    (no daily row in that partial group was a "day 7") and silently polluted
+    the training labels with ~15 NaN scores per region per year.
 
-Changes from v5
----------------
-  v9: Cyclical Time Features
-    - `week_of_year` converted to cyclic sin/cos representation:
-        week_sin = sin(2π * week_of_year / 53.0)
-        week_cos = cos(2π * week_of_year / 53.0)
-    - Original `month` and `week_of_year` columns DROPPED from output.
-    - Cyclic encoding avoids disruptive linearity (week 1 ≠ week 53 discontinuity).
-    - Output now includes `week_sin`, `week_cos` in place of temporal scalars.
+    Fix: Absolute Index Grouping.  After sorting by (region_id, date), assign
+    week_idx = cumcount // 7.  This is purely positional and guarantees every
+    group contains exactly 7 daily rows.
 
-Root Cause of v4 "Region Extinction Event"
-------------------------------------------
-  The old pipeline used pd.to_datetime(df['date'], errors='coerce') to parse date
-  strings such as "3020-09-18" (year > 2262, beyond pandas ns-datetime limit).
-  ALL dates became NaT → week_key = NaN for every row.  When the weekly weather
-  aggregate was inner-joined against a score table keyed on valid week_keys, only
-  the 133 regions whose NaN-keyed group happened to merge successfully survived.
-  2115 regions were silently dropped.
+  FLAW 2 – Window Size > Test Horizon (Scale Collapse):
+    v9 computed 8-week and 13-week rolling features.  The test set has only
+    13 weeks of data.  For the 8-week and 13-week features at inference time
+    (weeks 1-7 of test), min_periods=1 means the values are computed over
+    fewer than 8/13 rows.  During training, those same features are always
+    computed over full 8/13-row windows (782 weeks of history).  This creates
+    a massive domain shift: the feature distribution at inference is
+    qualitatively different from what the model saw during training.
 
-  Fix: Custom string-based date parser that handles the dataset's synthetic calendar:
-  - Feb 29 exists every year (366-day fixed calendar, no Gregorian leap rules)
-  - Years can be > 9999 (5-digit years such as 23102)
-  - Uses split('-') to correctly parse both 4-digit and 5-digit year strings
-  Weekly aggregation uses a pure groupby (no secondary join) so ALL 2248 regions
-  are always preserved.  Rolling windows use min_periods=1 to avoid dropping rows.
+    Fix: DELETE all 8-week and 13-week rolling features.  Keep ONLY 4-week
+    rolling sums/means — a 4-week lookback is achievable in full from week 4
+    onward, and the test set has 13 weeks, so feature stability begins at
+    test week 4 (same as in training).
 
-Custom Calendar
----------------
-  The dataset uses a synthetic 366-day calendar where every year has the same
-  month structure:
-    Jan=31, Feb=29, Mar=31, Apr=30, May=31, Jun=30,
-    Jul=31, Aug=31, Sep=30, Oct=31, Nov=30, Dec=31  (total = 366 days/year)
-  This means Feb 29 is valid every year and there are NO Gregorian leap-year rules.
+Data Constants (verified by verify_data.py)
+-------------------------------------------
+  Train: 2248 regions × 5480 daily rows each
+    - Score non-NaN at row indices 6, 13, 20, ... (stride=7, first=6)
+    - 5480 = 782 × 7 + 6  →  keep first 5474 rows (782 complete weeks)
+    - Drop last 6 rows (no score, incomplete final week)
+  Test:  2248 regions × 91 daily rows = 13 × 7 (zero leftover)
+
+Physical Aggregation Rules
+--------------------------
+  prec, surf_pre  : sum   (precipitation accumulates over the week)
+  all others      : mean  (temperature, humidity, wind — intensive variables)
+  score           : max   (exactly 1 of 7 daily rows has a non-NaN score;
+                           max == that value and never creates a NaN)
+
+Cyclic Time Encoding
+--------------------
+  Uses the LAST day of each 7-day block for temporal position.
+  Parses month and day from the date string (year is ignored — only
+  intra-year position matters).
+  doy   = day-of-year (1..366, synthetic 366-day calendar)
+  ratio = doy / 365.25
+  week_sin = sin(2π × ratio)
+  week_cos = cos(2π × ratio)
+  Both correctly handle the year wrap-around (sin/cos are periodic).
 """
 
 import os
@@ -69,73 +88,59 @@ MET_COLS = [
     "wind", "wind_max", "wind_min", "wind_range",
 ]
 
-ROLL_WINDOWS = [4, 8, 13]   # weeks
+# Only 4-week rolling windows (8w and 13w DELETED – exceed test inference horizon)
+ROLL_WINDOWS = [4]
 
-# Drought index features (used by src/dataset.py)
-DROUGHT_ROLL_WINDOWS = [4, 8, 13]
+# Drought index features – 4-week rolling only
+DROUGHT_ROLL_WINDOWS = [4]
 DROUGHT_FEAT_COLS = [
     "pet",
     "deficit",
     "deficit_roll_cum_4w",
-    "deficit_roll_cum_8w",
-    "deficit_roll_cum_13w",
 ]
 
-# ---------------------------------------------------------------------------
-# Custom calendar: 366-day fixed year, Feb always has 29 days
-# ---------------------------------------------------------------------------
-# Cumulative day offset at start of each month (0-based day-of-year before the month)
+# Training data constants (verified by verify_data.py)
+_DAYS_PER_TRAIN  = 5480   # total daily rows per region
+_KEEP_DAYS_TRAIN = 5474   # 782 × 7  (drop last 6 leftover days)
+_WEEKS_PER_TRAIN = 782    # complete 7-day weeks in train
+_DAYS_PER_TEST   = 91     # 13 × 7
+_WEEKS_PER_TEST  = 13
+
+# Cumulative day offset at start of each month (synthetic 366-day calendar)
+# Jan=31, Feb=29, Mar=31, Apr=30, May=31, Jun=30,
+# Jul=31, Aug=31, Sep=30, Oct=31, Nov=30, Dec=31
 _MONTH_OFFSET = [0, 31, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335]
-# Total days per year in this calendar
-_DAYS_PER_YEAR = 366
+_DAYS_PER_SYNTH_YEAR = 366   # synthetic calendar always has 366 days
 
 
-def _date_to_components(date_str: str):
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+def _parse_doy(date_str: str) -> int:
     """
-    Parse 'YYYY-MM-DD' or 'YYYYY-MM-DD' into (year, month, day, doy, week_of_year,
-    day_ordinal) using the dataset's synthetic 366-day calendar.
-
-    Works for:
-    - Regular 4-digit years (e.g., '3020-09-18')
-    - 5-digit years (e.g., '23102-07-17')
-    - Feb 29 on any year (not a valid Gregorian date for non-leap years)
-
-    Returns
-    -------
-    (year: int, month: int, day: int, doy: int, woy: int, ordinal: int)
-      doy : day-of-year 1..366
-      woy : week-of-year 1..53  (floor-based: Jan 1-7 → W01, Jan 8-14 → W02 …)
-      ordinal : days elapsed since day 0 of year 1 in this custom calendar
+    Parse 'YYYY-MM-DD' string → day-of-year (1..366).
+    Works with any year (including 5-digit years like '23102-07-17').
+    Only month and day are used; year is intentionally ignored.
     """
     parts = date_str.split("-")
-    y = int(parts[0])
-    m = int(parts[1])
-    d = int(parts[2])
-    doy = _MONTH_OFFSET[m - 1] + d          # 1-indexed day of year
-    woy = (doy - 1) // 7 + 1               # 1-indexed week of year (1-53)
-    ordinal = (y - 1) * _DAYS_PER_YEAR + doy - 1   # days since custom epoch
-    return y, m, d, doy, woy, ordinal
+    m   = int(parts[1])
+    d   = int(parts[2])
+    return _MONTH_OFFSET[m - 1] + d   # 1-indexed doy
 
 
-def _build_date_cache(dates) -> dict:
+def _parse_ordinal(date_str: str) -> int:
     """
-    Build a lookup dict: date_str -> (week_key, year, month, week_of_year, ordinal)
-    using the dataset's synthetic 366-day calendar.
+    Parse 'YYYY-MM-DD' → absolute integer day ordinal using the synthetic
+    366-day calendar.  Used to compute the temporal gap between train and test.
 
-    Only called once on unique date strings → fast regardless of dataset size.
-    Handles:
-    - Any 4-digit or 5-digit year (zero-padded to 6 digits in week_key for
-      correct lexicographic sort order across 4-digit and 5-digit years)
-    - Feb 29 on any year (dataset's synthetic calendar)
+    ordinal = (year - 1) * 366 + (doy - 1)   [0-indexed from year 1, day 1]
     """
-    cache = {}
-    for ds in dates:
-        y, m, d, doy, woy, ordinal = _date_to_components(ds)
-        # Zero-pad year to 6 digits so lexicographic sort == chronological sort
-        # for years up to 999999 (dataset spans ~3004 to ~23102)
-        week_key = f"{y:06d}-W{woy:02d}"
-        cache[ds] = (week_key, y, m, woy, ordinal)
-    return cache
+    parts = date_str.split("-")
+    y   = int(parts[0])
+    m   = int(parts[1])
+    d   = int(parts[2])
+    doy = _MONTH_OFFSET[m - 1] + d
+    return (y - 1) * _DAYS_PER_SYNTH_YEAR + (doy - 1)
 
 
 # ---------------------------------------------------------------------------
@@ -148,12 +153,12 @@ def load_data(filename: str) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# 1. Imputation – forward/backward fill per region (NO dropna)
+# 1. Imputation – forward/backward fill per region (applied on DAILY data)
 # ---------------------------------------------------------------------------
 def impute_met_features(df: pd.DataFrame) -> pd.DataFrame:
     """
     Forward-fill then backward-fill missing meteorological values within
-    each region.  Does NOT drop any rows.
+    each region BEFORE aggregation.  Does NOT drop any rows.
     """
     df = df.copy()
     for col in MET_COLS:
@@ -166,11 +171,10 @@ def impute_met_features(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# 2. Outlier handling – Z-score clip
+# 2. Outlier handling – Z-score clip (applied on DAILY data)
 # ---------------------------------------------------------------------------
 def handle_outliers(df: pd.DataFrame, z_thresh: float = 3.5) -> pd.DataFrame:
-    """Clip met feature values beyond ±z_thresh standard deviations.
-    Never drops rows."""
+    """Clip met feature values beyond ±z_thresh standard deviations."""
     df = df.copy()
     for col in MET_COLS:
         if col in df.columns:
@@ -184,110 +188,126 @@ def handle_outliers(df: pd.DataFrame, z_thresh: float = 3.5) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# 3a. Weekly aggregation – TRAIN  (LEFT-join equivalent: all regions kept)
+# 3a. Weekly aggregation – ABSOLUTE INDEX GROUPING (Train + Test)
 # ---------------------------------------------------------------------------
-def align_labels_strategy_a(df: pd.DataFrame) -> pd.DataFrame:
+def align_labels_absolute(df: pd.DataFrame, is_train: bool = True) -> pd.DataFrame:
     """
-    Aggregate daily training rows to one row per (region_id, ISO-week).
+    Absolute Index Grouping (v10 key fix).
 
-    Meteorological features : mean of daily values in the week.
-    score                   : mean of non-NaN daily scores in the week.
-    week_end_date           : last date string in the group.
+    Groups daily rows into 7-day blocks purely by row position
+    (group_id = cumcount // 7 per region, after sorting by date).
+    This guarantees zero ghost weeks.
 
-    v9 changes:
-    - Computes week_sin = sin(2π * week_of_year / 53.0) and
-                week_cos = cos(2π * week_of_year / 53.0) for cyclical encoding.
-    - Drops original `month` and `week_of_year` columns from output to
-      prevent disruption of spatial-temporal relationships via linear encoding.
+    Train:  keeps first 5474 rows per region (782 complete weeks).
+            Drops the last 6 leftover daily rows (no score assigned).
+    Test:   91 rows × 13 weeks exactly – no truncation needed.
 
-    All 2248 regions are always preserved (pure groupby, no secondary join).
-    Uses custom 366-day calendar – safe for years > 9999 and Feb 29 every year.
+    Aggregation
+    -----------
+    prec, surf_pre          : sum   (precipitation accumulates)
+    all other met cols      : mean  (intensive variables)
+    score                   : max   (1 of 7 daily rows has non-NaN score;
+                                     max == that value, never NaN)
+    date                    : last  -> stored as week_end_date
+
+    Outputs added per weekly row
+    ----------------------------
+    week_sin, week_cos  : cyclic time (doy / 365.25 of week_end_date)
+    day_ordinal         : absolute ordinal of week_end_date
+                          (integer, for gap computation in dataset.py)
     """
-    df = df.copy()
+    df = df.copy().sort_values(["region_id", "date"], ignore_index=True)
 
-    # Build date cache on unique date strings only (fast: ~5480 unique dates)
-    unique_dates = df["date"].astype(str).unique()
-    cache = _build_date_cache(unique_dates)
+    # Per-region 0-based row position
+    cumcnt = df.groupby("region_id").cumcount()
 
-    # Use dict-map (faster than lambda for 12M rows — no per-element Python overhead)
-    _wk  = {ds: v[0] for ds, v in cache.items()}
-    _yr  = {ds: v[1] for ds, v in cache.items()}
-    _mo  = {ds: v[2] for ds, v in cache.items()}
-    _woy = {ds: v[3] for ds, v in cache.items()}
-    _ord = {ds: v[4] for ds, v in cache.items()}
+    if is_train:
+        # Keep only the first 5474 rows per region (= 782 complete 7-day weeks)
+        keep_mask = cumcnt < _KEEP_DAYS_TRAIN
+        df   = df[keep_mask].copy()
+        cumcnt = cumcnt[keep_mask]
 
-    date_col = df["date"].astype(str)
-    df["week_key"]     = date_col.map(_wk)
-    df["year"]         = date_col.map(_yr).astype(np.int64)
-    df["month"]        = date_col.map(_mo).astype(np.int32)
-    df["week_of_year"] = date_col.map(_woy).astype(np.int32)
-    df["day_ordinal"]  = date_col.map(_ord).astype(np.float64)
+    # Assign week index: rows 0-6 → week 0, rows 7-13 → week 1, ...
+    df["week_idx"] = (cumcnt // 7).values
 
-    # v9: Cyclical time features – encode week_of_year as sin/cos to
-    # preserve circular continuity (week 53 → week 1 is continuous in cyclic space)
-    df["week_sin"] = np.sin(2.0 * np.pi * df["week_of_year"] / 53.0).astype(np.float32)
-    df["week_cos"] = np.cos(2.0 * np.pi * df["week_of_year"] / 53.0).astype(np.float32)
+    # --- Build aggregation dictionary ---
+    sum_cols  = [c for c in ["prec", "surf_pre"] if c in df.columns]
+    mean_cols = [
+        c for c in [
+            "humidity",
+            "tmp", "dp_tmp", "wb_tmp", "surf_tmp",
+            "tmp_max", "tmp_min", "tmp_range",
+            "wind", "wind_max", "wind_min", "wind_range",
+        ] if c in df.columns
+    ]
 
-    # Aggregation spec
     agg = {}
-    for col in MET_COLS:
-        if col in df.columns:
-            agg[col] = "mean"
+    for c in sum_cols:
+        agg[c] = "sum"
+    for c in mean_cols:
+        agg[c] = "mean"
     if "score" in df.columns:
-        agg["score"] = "mean"   # mean of non-NaN scored days
-
-    agg.update({
-        # Keep month/week_of_year in agg temporarily (needed for groupby consistency)
-        # They will be DROPPED after aggregation per v9 spec.
-        "month":        "first",
-        "week_of_year": "first",
-        # v9: cyclical features – constant within a week, "first" is exact
-        "week_sin":     "first",
-        "week_cos":     "first",
-        "year":         "first",
-        "day_ordinal":  "last",   # ordinal of last day in the week
-        "date":         "last",   # → week_end_date
-    })
+        agg["score"] = "max"    # 1 non-NaN per group → max == that value
+    agg["date"] = "last"        # week_end_date = last daily date in the 7-day block
 
     weekly = (
-        df.groupby(["region_id", "week_key"], sort=False)
+        df.groupby(["region_id", "week_idx"], sort=False)
         .agg(agg)
         .reset_index()
     )
     weekly.rename(columns={"date": "week_end_date"}, inplace=True)
-    weekly.sort_values(["region_id", "week_key"], inplace=True, ignore_index=True)
+    weekly.sort_values(["region_id", "week_idx"], inplace=True, ignore_index=True)
 
-    # v9: Drop linear calendar columns – replaced by cyclical week_sin / week_cos
-    weekly.drop(columns=["month", "week_of_year"], errors="ignore", inplace=True)
+    # --- Cyclic time encoding (from week_end_date) ---
+    doy_arr   = weekly["week_end_date"].map(_parse_doy).astype(np.float32)
+    ratio_arr = doy_arr / 365.25
+    weekly["week_sin"] = np.sin(2.0 * np.pi * ratio_arr).astype(np.float32)
+    weekly["week_cos"] = np.cos(2.0 * np.pi * ratio_arr).astype(np.float32)
+
+    # --- Absolute day ordinal (for temporal gap computation) ---
+    weekly["day_ordinal"] = (
+        weekly["week_end_date"].map(_parse_ordinal).astype(np.int64)
+    )
 
     return weekly
 
 
 # ---------------------------------------------------------------------------
-# 3b. Weekly aggregation – TEST  (no score column)
+# 3b. Weekly aggregation – TEST  (thin wrapper)
 # ---------------------------------------------------------------------------
 def aggregate_test_weekly(df: pd.DataFrame) -> pd.DataFrame:
-    """Same weekly aggregation as align_labels_strategy_a, for test data."""
-    return align_labels_strategy_a(df)
+    """Weekly aggregation for test (91 days → 13 complete weeks, no truncation)."""
+    return align_labels_absolute(df, is_train=False)
 
 
 # ---------------------------------------------------------------------------
-# 4. Rolling + lag feature engineering
+# 4. Rolling + lag feature engineering  (4w ONLY)
 # ---------------------------------------------------------------------------
 def preprocess_data(df: pd.DataFrame) -> pd.DataFrame:
     """
     Add rolling aggregates and lag features per region.
 
-    Rolling: prec → sum, tmp/humidity → mean  (windows 4/8/13w, min_periods=1)
-    Lags:    tmp, humidity, prec, wind, score  (1w and 2w)
+    Rolling (window=[4], min_periods=1):
+      prec     → sum  : prec_roll_sum_4w
+      tmp      → mean : tmp_roll_mean_4w
+      humidity → mean : humidity_roll_mean_4w
+
+    Lags (1w and 2w):
+      tmp, humidity, prec, wind  (and score in train)
+
+    8-week and 13-week rolling features are INTENTIONALLY OMITTED.
+    They would require 8-13 weeks of warm-up data to stabilise, but the
+    test set only has 13 weeks; features computed on partial windows at
+    inference produce a distribution qualitatively different from training.
     """
-    df = df.copy().sort_values(["region_id", "week_key"], ignore_index=True)
+    df = df.copy().sort_values(["region_id", "week_idx"], ignore_index=True)
 
     roll_spec = [
         ("prec",     "sum",  "prec_roll_sum_{w}w"),
         ("tmp",      "mean", "tmp_roll_mean_{w}w"),
         ("humidity", "mean", "humidity_roll_mean_{w}w"),
     ]
+
     for base_col, func, tmpl in roll_spec:
         if base_col not in df.columns:
             continue
@@ -335,29 +355,33 @@ def export_processed(
     if fmt == "csv":
         train_df.to_csv(train_path, index=False)
         test_df.to_csv(test_path, index=False)
-    print(f"  Exported train → {train_path}  {train_df.shape}")
-    print(f"  Exported test  → {test_path}   {test_df.shape}")
+    print(f"  Exported train -> {train_path}  {train_df.shape}")
+    print(f"  Exported test  -> {test_path}   {test_df.shape}")
 
 
 # ---------------------------------------------------------------------------
-# Drought Index Feature Engineering  (used by src/dataset.py)
+# Drought Index Feature Engineering  (4w ONLY – used by src/dataset.py)
 # ---------------------------------------------------------------------------
 def add_drought_index(df: pd.DataFrame, is_train: bool = True) -> pd.DataFrame:
     """
-    PET-based drought proxy features.
-    1. PET   = 0.55 * max(tmp, 0)
-    2. deficit = prec - PET
-    3. Rolling cumulative sum of deficit: 4w, 8w, 13w (min_periods=1)
+    PET-based drought proxy features. 4-week rolling only.
+    8w and 13w rolling variants DELETED (exceed test inference horizon).
+
+    1. PET           = 0.55 * max(tmp, 0)
+    2. deficit       = prec - PET
+    3. deficit_roll_cum_4w = 4-week rolling cumulative deficit (min_periods=1)
     """
     df = df.copy()
-    df["pet"] = (0.55 * df["tmp"].clip(lower=0.0)).astype(np.float32)
+    df["pet"]     = (0.55 * df["tmp"].clip(lower=0.0)).astype(np.float32)
     df["deficit"] = (df["prec"] - df["pet"]).astype(np.float32)
+
     for w in DROUGHT_ROLL_WINDOWS:
         col = f"deficit_roll_cum_{w}w"
         df[col] = (
             df.groupby("region_id")["deficit"]
             .transform(lambda s: s.rolling(window=w, min_periods=1).sum())
         ).astype(np.float32)
+
     if not is_train:
         for col in DROUGHT_FEAT_COLS:
             if col in df.columns:
@@ -375,87 +399,88 @@ def main():
     import time
     t0 = time.time()
 
-    print("=" * 65)
-    print("Preprocessing Pipeline v9  (Cyclical Time Features)")
-    print("Custom 366-day calendar: Feb 29 every year, years > 9999 OK")
-    print("v9 changes: week_sin/week_cos replaces month/week_of_year")
-    print("=" * 65)
+    print("=" * 70)
+    print("Preprocessing Pipeline v10  (Absolute Sequence Grouping)")
+    print("Fixes: ghost-week grouping | 8w/13w feature scale collapse")
+    print("Method: row_index // 7 per region | 4w-only rolling | doy/365.25 cyclic")
+    print("=" * 70)
 
-    # 1. Load
-    print("\nLoading raw data …")
+    # 1. Load raw data
+    print("\nLoading raw data ...")
     train_raw = load_data("train.csv")
     test_raw  = load_data("test.csv")
     print(f"  train: {train_raw.shape}  |  test: {test_raw.shape}")
     print(f"  train regions: {train_raw['region_id'].nunique()}")
     print(f"  test  regions: {test_raw['region_id'].nunique()}")
 
-    # 2. Weekly aggregation FIRST (reduces 12.3M → ~1.76M rows)
-    print("\nWeekly aggregation (custom 366-day calendar) …")
-    train_w = align_labels_strategy_a(train_raw)
+    # 2. Impute on daily data (before aggregation, preserves continuity)
+    print("\nImputing met features (ffill/bfill per region on daily data) ...")
+    train_raw = impute_met_features(train_raw)
+    test_raw  = impute_met_features(test_raw)
+
+    # 3. Outlier clip on daily data
+    print("Outlier clipping (Z=3.5) ...")
+    train_raw = handle_outliers(train_raw, z_thresh=3.5)
+    test_raw  = handle_outliers(test_raw,  z_thresh=3.5)
+
+    # 4. Absolute Index Weekly Aggregation
+    print("\nAbsolute Index Grouping (cumcount // 7) ...")
+    train_w = align_labels_absolute(train_raw, is_train=True)
     test_w  = aggregate_test_weekly(test_raw)
     print(f"  train_w: {train_w.shape}  regions: {train_w['region_id'].nunique()}")
     print(f"  test_w : {test_w.shape}   regions: {test_w['region_id'].nunique()}")
 
-    # Verify week_sin/week_cos are present and month/week_of_year are NOT
-    assert "week_sin" in train_w.columns, "FAIL: week_sin not in train_w"
-    assert "week_cos" in train_w.columns, "FAIL: week_cos not in train_w"
-    assert "month" not in train_w.columns, "FAIL: month still in train_w (should be dropped)"
-    assert "week_of_year" not in train_w.columns, "FAIL: week_of_year still in train_w"
-    print("  ✓ Cyclical features: week_sin ∈ "
-          f"[{train_w['week_sin'].min():.3f}, {train_w['week_sin'].max():.3f}]  "
-          f"week_cos ∈ [{train_w['week_cos'].min():.3f}, {train_w['week_cos'].max():.3f}]")
+    # Verify week counts are exact
+    train_wk_counts = train_w.groupby("region_id").size()
+    test_wk_counts  = test_w.groupby("region_id").size()
+    print(f"  Weeks/train region : min={train_wk_counts.min()}  max={train_wk_counts.max()}  "
+          f"(expected {_WEEKS_PER_TRAIN})")
+    print(f"  Weeks/test  region : min={test_wk_counts.min()}   max={test_wk_counts.max()}  "
+          f"(expected {_WEEKS_PER_TEST})")
+    assert train_wk_counts.min() == _WEEKS_PER_TRAIN, \
+        f"Train week count mismatch: min={train_wk_counts.min()}"
+    assert test_wk_counts.min() == _WEEKS_PER_TEST, \
+        f"Test week count mismatch: min={test_wk_counts.min()}"
+    print("  WEEK COUNT ASSERTIONS PASSED")
 
-    # 3. Impute on weekly data (7× faster than on raw daily rows)
-    print("Imputing met features (ffill/bfill per region) …")
-    train_w = impute_met_features(train_w)
-    test_w  = impute_met_features(test_w)
+    # 5. Cyclic feature range check
+    assert "week_sin" in train_w.columns and "week_cos" in train_w.columns
+    print(f"  week_sin range: [{train_w['week_sin'].min():.3f}, {train_w['week_sin'].max():.3f}]")
+    print(f"  week_cos range: [{train_w['week_cos'].min():.3f}, {train_w['week_cos'].max():.3f}]")
 
-    # 4. Outlier clip on weekly data
-    print("Outlier clipping (Z=3.5) …")
-    train_w = handle_outliers(train_w, z_thresh=3.5)
-    test_w  = handle_outliers(test_w,  z_thresh=3.5)
-
-    # 5. Rolling + lag features
-    print("Adding rolling & lag features …")
+    # 6. Rolling + lag features
+    print("\nAdding rolling (4w only) & lag features ...")
     train_w = preprocess_data(train_w)
     test_w  = preprocess_data(test_w)
     print(f"  train_w: {train_w.shape}  |  test_w: {test_w.shape}")
 
-    # 5b. Forward-fill any residual NaN scores (at most 1 partial week per region)
+    # 7. ZERO GHOST WEEKS assertion
     if "score" in train_w.columns:
-        before = train_w["score"].isna().sum()
-        train_w["score"] = (
-            train_w.groupby("region_id")["score"]
-            .transform(lambda s: s.ffill().bfill())
-        )
-        after = train_w["score"].isna().sum()
-        print(f"  Score NaN before/after region ffill: {before} → {after}")
+        n_nan_scores = train_w["score"].isna().sum()
+        print(f"\n  NaN scores in train_w (MUST BE 0): {n_nan_scores}")
+        assert n_nan_scores == 0, \
+            f"GHOST WEEKS DETECTED: {n_nan_scores} NaN scores. Aborting."
+        print("  ZERO GHOST WEEKS CONFIRMED")
 
-    # 6. Validation
-    n_train_regions = train_w["region_id"].nunique()
-    n_test_regions  = test_w["region_id"].nunique()
-    assert n_train_regions == 2248, (
-        f"Expected 2248 train regions, got {n_train_regions}"
-    )
-    assert n_test_regions == 2248, (
-        f"Expected 2248 test regions, got {n_test_regions}"
-    )
-    print(f"\n✓ VALIDATION PASSED: {n_train_regions} train regions, "
-          f"{n_test_regions} test regions.")
+        score_vals = train_w["score"]
+        print(f"  Score mean:         {score_vals.mean():.4f}")
+        print(f"  Score zero fraction:{(score_vals == 0.0).mean():.2%}")
+        print(f"  Score min / max:    {score_vals.min():.4f} / {score_vals.max():.4f}")
 
-    # Zero-inflation check
-    score_vals = train_w["score"].dropna()
-    zero_frac  = (score_vals == 0.0).mean()
-    print(f"  Score mean (weekly): {score_vals.mean():.4f}")
-    print(f"  Zero-inflation: {zero_frac:.2%} of weekly scores == 0")
-    print(f"  [v9] Two-Stage architecture addresses this zero-inflation directly.")
+    # 8. Region count validation
+    n_train_rgn = train_w["region_id"].nunique()
+    n_test_rgn  = test_w["region_id"].nunique()
+    assert n_train_rgn == 2248, f"Expected 2248 train regions, got {n_train_rgn}"
+    assert n_test_rgn  == 2248, f"Expected 2248 test regions,  got {n_test_rgn}"
+    print(f"\n  REGION COUNT PASSED: {n_train_rgn} train, {n_test_rgn} test")
 
-    # 7. Export
-    print("\nExporting processed data …")
+    # 9. Export
+    print("\nExporting processed data ...")
     export_processed(train_w, test_w, fmt="csv")
 
-    print(f"\nTotal preprocessing time: {time.time() - t0:.1f}s")
-    print("=" * 65)
+    elapsed = time.time() - t0
+    print(f"\nTotal preprocessing time: {elapsed:.1f}s")
+    print("=" * 70)
 
 
 if __name__ == "__main__":
