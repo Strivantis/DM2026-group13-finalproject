@@ -1,70 +1,72 @@
 """
-preprocess.py – Full Preprocessing Pipeline (v10)
+preprocess.py – Full Preprocessing Pipeline (v19)
 =================================================
 Functions
 ---------
   load_data              : load raw CSV from /data/
   impute_met_features    : ffill / bfill within region (applied BEFORE aggregation)
   handle_outliers        : Z-score clip (Z=3.5, applied BEFORE aggregation)
-  align_labels_absolute  : weekly aggregation using ABSOLUTE INDEX grouping (TRAIN+TEST)
+  align_labels_absolute  : weekly aggregation – ENRICHED (v19: mean/max/min/std for met;
+                           sum/max for precip; dp_tmp & wb_tmp pruned from output)
   aggregate_test_weekly  : weekly aggregation for TEST (thin wrapper)
   preprocess_data        : rolling (4w ONLY) + lag (1/2w) features; min_periods=1
   export_processed       : save to /data/processed/
   add_drought_index      : PET / deficit 4w rolling features (used by dataset.py)
 
-Catastrophic Flaws Fixed from v9
----------------------------------
-  FLAW 1 – Synthetic Calendar Grouping ("Ghost Weeks"):
-    v9 used _date_to_components() which computed week_of_year from a 366-day
-    synthetic calendar (53 weeks/year).  Because year boundaries don't align
-    with 7-day multiples in this synthetic calendar, the groupby produced
-    partial weeks at every year-end.  These ghost weeks had NaN scores
-    (no daily row in that partial group was a "day 7") and silently polluted
-    the training labels with ~15 NaN scores per region per year.
+v19 Changes from v10
+--------------------
+  1. Enriched Weekly Statistics:
+     Meteorological features (tmp, humidity, wind): previously only mean-aggregated.
+     Now: mean (baseline) + max (peak extremes) + min (trough) + std (intra-week
+     variability / climate shock magnitude):
+       tmp_week_max, tmp_week_min, tmp_week_std
+       humidity_week_max, humidity_week_min, humidity_week_std
+       wind_week_max, wind_week_min, wind_week_std
+     Precipitation features (prec, surf_pre): previously only sum-aggregated.
+     Now: sum (accumulation) + max (single-day extreme event):
+       prec_week_max, surf_pre_week_max
+     Rationale: the std signal captures sudden intra-week temperature swings that are
+     predictive of drought onset but invisible in the weekly mean alone.
 
-    Fix: Absolute Index Grouping.  After sorting by (region_id, date), assign
-    week_idx = cumcount // 7.  This is purely positional and guarantees every
-    group contains exactly 7 daily rows.
+  2. Adversarial Feature Pruning:
+     dp_tmp (dew point) and wb_tmp (wet-bulb temperature) are explicitly EXCLUDED
+     from the aggregation output. Both are severe collinear proxies of (tmp, humidity)
+     and exhibit temporal covariate drift (instrument drift artefacts in the synthetic
+     calendar). They remain in MET_COLS for imputation / outlier clipping only.
+     Retaining `tmp` and `humidity` as stable baseline indicators is sufficient.
+
+Catastrophic Flaws Fixed from v9 (retained from v10)
+------------------------------------------------------
+  FLAW 1 – Synthetic Calendar Grouping ("Ghost Weeks"):
+    v9 used _date_to_components() which produced partial weeks at year-end.
+    Fix: Absolute Index Grouping. week_idx = cumcount // 7 per region.
 
   FLAW 2 – Window Size > Test Horizon (Scale Collapse):
-    v9 computed 8-week and 13-week rolling features.  The test set has only
-    13 weeks of data.  For the 8-week and 13-week features at inference time
-    (weeks 1-7 of test), min_periods=1 means the values are computed over
-    fewer than 8/13 rows.  During training, those same features are always
-    computed over full 8/13-row windows (782 weeks of history).  This creates
-    a massive domain shift: the feature distribution at inference is
-    qualitatively different from what the model saw during training.
-
-    Fix: DELETE all 8-week and 13-week rolling features.  Keep ONLY 4-week
-    rolling sums/means — a 4-week lookback is achievable in full from week 4
-    onward, and the test set has 13 weeks, so feature stability begins at
-    test week 4 (same as in training).
+    v9 computed 8-week and 13-week rolling features causing domain shift.
+    Fix: DELETE all 8w and 13w rolling features. Keep only 4-week rolling.
 
 Data Constants (verified by verify_data.py)
 -------------------------------------------
   Train: 2248 regions × 5480 daily rows each
     - Score non-NaN at row indices 6, 13, 20, ... (stride=7, first=6)
     - 5480 = 782 × 7 + 6  →  keep first 5474 rows (782 complete weeks)
-    - Drop last 6 rows (no score, incomplete final week)
-  Test:  2248 regions × 91 daily rows = 13 × 7 (zero leftover)
+  Test:  2248 regions × 91 daily rows = 13 × 7
 
-Physical Aggregation Rules
---------------------------
-  prec, surf_pre  : sum   (precipitation accumulates over the week)
-  all others      : mean  (temperature, humidity, wind — intensive variables)
-  score           : max   (exactly 1 of 7 daily rows has a non-NaN score;
-                           max == that value and never creates a NaN)
+Physical Aggregation Rules (v19)
+---------------------------------
+  prec, surf_pre  : sum   + max  (accumulation + extreme event)
+  tmp, humidity,
+  wind            : mean  + max  + min  + std  (intensive variables – climate shocks)
+  tmp_max / tmp_min / tmp_range / wind_* / surf_tmp  : mean (daily derived, week-avg)
+  score           : max   (exactly 1 non-NaN per 7-day block)
+  dp_tmp, wb_tmp  : NOT included in output (adversarial collinear features)
 
 Cyclic Time Encoding
 --------------------
-  Uses the LAST day of each 7-day block for temporal position.
-  Parses month and day from the date string (year is ignored — only
-  intra-year position matters).
   doy   = day-of-year (1..366, synthetic 366-day calendar)
   ratio = doy / 365.25
   week_sin = sin(2π × ratio)
   week_cos = cos(2π × ratio)
-  Both correctly handle the year wrap-around (sin/cos are periodic).
 """
 
 import os
@@ -159,6 +161,8 @@ def impute_met_features(df: pd.DataFrame) -> pd.DataFrame:
     """
     Forward-fill then backward-fill missing meteorological values within
     each region BEFORE aggregation.  Does NOT drop any rows.
+    dp_tmp and wb_tmp are still imputed here (they exist in raw data),
+    but their aggregated weekly columns are excluded from the output.
     """
     df = df.copy()
     for col in MET_COLS:
@@ -192,7 +196,7 @@ def handle_outliers(df: pd.DataFrame, z_thresh: float = 3.5) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 def align_labels_absolute(df: pd.DataFrame, is_train: bool = True) -> pd.DataFrame:
     """
-    Absolute Index Grouping (v10 key fix).
+    Absolute Index Grouping (v10 key fix; v19: enriched weekly statistics).
 
     Groups daily rows into 7-day blocks purely by row position
     (group_id = cumcount // 7 per region, after sorting by date).
@@ -202,13 +206,29 @@ def align_labels_absolute(df: pd.DataFrame, is_train: bool = True) -> pd.DataFra
             Drops the last 6 leftover daily rows (no score assigned).
     Test:   91 rows × 13 weeks exactly – no truncation needed.
 
-    Aggregation
-    -----------
-    prec, surf_pre          : sum   (precipitation accumulates)
-    all other met cols      : mean  (intensive variables)
-    score                   : max   (1 of 7 daily rows has non-NaN score;
-                                     max == that value, never NaN)
-    date                    : last  -> stored as week_end_date
+    v19 Enriched Aggregation
+    -------------------------
+    Precipitation (prec, surf_pre):
+        sum    – weekly accumulation (original behaviour)
+        max    – peak single-day rainfall / surface precip (extreme event)
+                 → prec_week_max, surf_pre_week_max
+    Meteorological (tmp, humidity, wind):
+        mean   – weekly baseline average (retains original column name)
+        max    – peak daily extreme          → tmp_week_max, humidity_week_max, wind_week_max
+        min    – daily trough                → tmp_week_min, humidity_week_min, wind_week_min
+        std    – intra-week variability      → tmp_week_std, humidity_week_std, wind_week_std
+    Derived daily cols (tmp_max, tmp_min, tmp_range, wind_max, wind_min,
+        wind_range, surf_tmp): mean over the 7-day block (unchanged from v10).
+    score  : max – exactly 1 of 7 daily rows has a non-NaN score;
+             max == that value and never creates a NaN.
+    date   : last → renamed week_end_date (last daily date in the 7-day block).
+
+    Adversarial Feature Pruning (v19)
+    ----------------------------------
+    dp_tmp (dew point) and wb_tmp (wet-bulb temperature) are intentionally
+    EXCLUDED from the aggregation output. Both are severe collinear proxies of
+    (tmp, humidity) and exhibit temporal covariate drift. They remain in
+    MET_COLS for imputation / outlier clipping on the raw daily data.
 
     Outputs added per weekly row
     ----------------------------
@@ -230,33 +250,59 @@ def align_labels_absolute(df: pd.DataFrame, is_train: bool = True) -> pd.DataFra
     # Assign week index: rows 0-6 → week 0, rows 7-13 → week 1, ...
     df["week_idx"] = (cumcnt // 7).values
 
-    # --- Build aggregation dictionary ---
-    sum_cols  = [c for c in ["prec", "surf_pre"] if c in df.columns]
-    mean_cols = [
-        c for c in [
-            "humidity",
-            "tmp", "dp_tmp", "wb_tmp", "surf_tmp",
-            "tmp_max", "tmp_min", "tmp_range",
-            "wind", "wind_max", "wind_min", "wind_range",
-        ] if c in df.columns
-    ]
+    # --- Build named aggregation specification (v19: enriched weekly stats) ---
+    # Uses pd.NamedAgg to produce multiple output columns from the same input column.
+    named_agg = {}
 
-    agg = {}
-    for c in sum_cols:
-        agg[c] = "sum"
-    for c in mean_cols:
-        agg[c] = "mean"
+    # Precipitation: weekly sum (accumulation) + intra-week max (extreme event capture)
+    # dp_tmp and wb_tmp are intentionally NOT included here.
+    if "prec" in df.columns:
+        named_agg["prec"]          = pd.NamedAgg(column="prec", aggfunc="sum")
+        named_agg["prec_week_max"] = pd.NamedAgg(column="prec", aggfunc="max")
+    if "surf_pre" in df.columns:
+        named_agg["surf_pre"]          = pd.NamedAgg(column="surf_pre", aggfunc="sum")
+        named_agg["surf_pre_week_max"] = pd.NamedAgg(column="surf_pre", aggfunc="max")
+
+    # Meteorological: mean + max + min + std  (dp_tmp & wb_tmp intentionally excluded)
+    if "humidity" in df.columns:
+        named_agg["humidity"]          = pd.NamedAgg(column="humidity", aggfunc="mean")
+        named_agg["humidity_week_max"] = pd.NamedAgg(column="humidity", aggfunc="max")
+        named_agg["humidity_week_min"] = pd.NamedAgg(column="humidity", aggfunc="min")
+        named_agg["humidity_week_std"] = pd.NamedAgg(column="humidity", aggfunc="std")
+    if "tmp" in df.columns:
+        named_agg["tmp"]          = pd.NamedAgg(column="tmp", aggfunc="mean")
+        named_agg["tmp_week_max"] = pd.NamedAgg(column="tmp", aggfunc="max")
+        named_agg["tmp_week_min"] = pd.NamedAgg(column="tmp", aggfunc="min")
+        named_agg["tmp_week_std"] = pd.NamedAgg(column="tmp", aggfunc="std")
+    if "wind" in df.columns:
+        named_agg["wind"]          = pd.NamedAgg(column="wind", aggfunc="mean")
+        named_agg["wind_week_max"] = pd.NamedAgg(column="wind", aggfunc="max")
+        named_agg["wind_week_min"] = pd.NamedAgg(column="wind", aggfunc="min")
+        named_agg["wind_week_std"] = pd.NamedAgg(column="wind", aggfunc="std")
+
+    # Derived daily columns: mean-averaged over the 7-day block (unchanged from v10)
+    for _c in ["tmp_max", "tmp_min", "tmp_range", "surf_tmp",
+               "wind_max", "wind_min", "wind_range"]:
+        if _c in df.columns:
+            named_agg[_c] = pd.NamedAgg(column=_c, aggfunc="mean")
+
     if "score" in df.columns:
-        agg["score"] = "max"    # 1 non-NaN per group → max == that value
-    agg["date"] = "last"        # week_end_date = last daily date in the 7-day block
+        named_agg["score"] = pd.NamedAgg(column="score", aggfunc="max")
+
+    # Output "date" as "week_end_date" directly via NamedAgg key (no separate rename needed)
+    named_agg["week_end_date"] = pd.NamedAgg(column="date", aggfunc="last")
 
     weekly = (
         df.groupby(["region_id", "week_idx"], sort=False)
-        .agg(agg)
+        .agg(**named_agg)
         .reset_index()
     )
-    weekly.rename(columns={"date": "week_end_date"}, inplace=True)
     weekly.sort_values(["region_id", "week_idx"], inplace=True, ignore_index=True)
+
+    # Safety fill: std columns may be NaN for perfectly constant feature groups (rare edge case)
+    for _std_col in ["tmp_week_std", "humidity_week_std", "wind_week_std"]:
+        if _std_col in weekly.columns:
+            weekly[_std_col] = weekly[_std_col].fillna(0.0).astype(np.float32)
 
     # --- Cyclic time encoding (from week_end_date) ---
     doy_arr   = weekly["week_end_date"].map(_parse_doy).astype(np.float32)
@@ -299,6 +345,10 @@ def preprocess_data(df: pd.DataFrame) -> pd.DataFrame:
     They would require 8-13 weeks of warm-up data to stabilise, but the
     test set only has 13 weeks; features computed on partial windows at
     inference produce a distribution qualitatively different from training.
+
+    v19: No rolling / lag features are added for the new enriched weekly
+    statistics (tmp_week_max, etc.) as these are already intra-week
+    temporal statistics computed at the aggregation stage.
     """
     df = df.copy().sort_values(["region_id", "week_idx"], ignore_index=True)
 
@@ -399,11 +449,11 @@ def main():
     import time
     t0 = time.time()
 
-    print("=" * 70)
-    print("Preprocessing Pipeline v10  (Absolute Sequence Grouping)")
-    print("Fixes: ghost-week grouping | 8w/13w feature scale collapse")
-    print("Method: row_index // 7 per region | 4w-only rolling | doy/365.25 cyclic")
-    print("=" * 70)
+    print("=" * 75)
+    print("Preprocessing Pipeline v19  (Enriched Weekly Stats + Adversarial Pruning)")
+    print("Fixes: ghost-week grouping | 8w/13w scale collapse | dp_tmp/wb_tmp collinearity")
+    print("New:   mean/max/min/std for tmp/humidity/wind  |  sum/max for prec/surf_pre")
+    print("=" * 75)
 
     # 1. Load raw data
     print("\nLoading raw data ...")
@@ -423,12 +473,24 @@ def main():
     train_raw = handle_outliers(train_raw, z_thresh=3.5)
     test_raw  = handle_outliers(test_raw,  z_thresh=3.5)
 
-    # 4. Absolute Index Weekly Aggregation
-    print("\nAbsolute Index Grouping (cumcount // 7) ...")
+    # 4. Absolute Index Weekly Aggregation (v19: enriched stats)
+    print("\nAbsolute Index Grouping (cumcount // 7) with v19 enriched aggregation ...")
     train_w = align_labels_absolute(train_raw, is_train=True)
     test_w  = aggregate_test_weekly(test_raw)
     print(f"  train_w: {train_w.shape}  regions: {train_w['region_id'].nunique()}")
     print(f"  test_w : {test_w.shape}   regions: {test_w['region_id'].nunique()}")
+
+    # v19: show new enriched columns
+    new_cols = [c for c in train_w.columns
+                if any(x in c for x in ["_week_max", "_week_min", "_week_std"])]
+    print(f"  [v19] New enriched weekly columns ({len(new_cols)}): {new_cols}")
+
+    # Verify dp_tmp and wb_tmp are absent from processed output
+    adv_cols = [c for c in train_w.columns if c in ("dp_tmp", "wb_tmp")]
+    if adv_cols:
+        print(f"  *** WARNING: Adversarial columns still present: {adv_cols}")
+    else:
+        print("  v dp_tmp and wb_tmp correctly pruned from weekly output.")
 
     # Verify week counts are exact
     train_wk_counts = train_w.groupby("region_id").size()
@@ -480,7 +542,7 @@ def main():
 
     elapsed = time.time() - t0
     print(f"\nTotal preprocessing time: {elapsed:.1f}s")
-    print("=" * 70)
+    print("=" * 75)
 
 
 if __name__ == "__main__":

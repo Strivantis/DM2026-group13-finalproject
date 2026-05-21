@@ -1,5 +1,5 @@
 """
-Drought Prediction - Exploratory Data Analysis (v16)
+Drought Prediction - Exploratory Data Analysis (v19)
 =====================================================
 Generates and saves to /plots:
   1. Pearson & Spearman correlation heatmaps (features vs. score)
@@ -10,18 +10,22 @@ Generates and saves to /plots:
   6. Cyclical Time Feature Coverage (week_sin vs week_cos circle)
   7. Region Target Encoding Distribution
      (region_mean_score & region_zero_prob histograms)
-  8. [v16 NEW] 13-Week Sequence Distribution
+  8. [v19] 13-Week Sequence Distribution
      (sequence lengths, actual-gap distribution, per-region history depth)
 
-v16 Changes
+v19 Changes
 -----------
   - Loads directly from data/processed/ (preprocessing already complete).
   - No longer re-runs preprocess.py pipeline (avoids stale import errors).
   - Removed all 8-week and 13-week rolling feature analysis tracks.
   - Correctly tracks ``week_sin`` and ``week_cos`` instead of linear month /
     week_of_year temporal values.
-  - Feature count confirmed as 29 (4w-only rolling, no 8w/13w).
-  - New plot: 13-week window / gap distribution analysis (Plot 8).
+  - Feature count expanded to 40 (11 base weather + 11 enriched weekly stats +
+    2 cyclic + 3 rolling-4w + 4 lag1 + 4 lag2 + 3 drought-4w + 2 TE).
+  - dp_tmp and wb_tmp excluded from aggregation output (kept in MET_COLS
+    for imputation only).
+  - New enriched weekly stats: tmp/humidity/wind max+min+std, prec/surf_pre max.
+  - Architecture: Single-Output Tweedie Regressor (p=1.5) [v19].
 
 Run AFTER preprocess.py has been executed (data/processed/*.csv must exist).
 
@@ -84,8 +88,8 @@ np.random.seed(RANDOM_SEED)
 # Seaborn theme
 sns.set_theme(style="whitegrid", palette="muted", font_scale=1.1)
 
-# Features that are in FEATURE_COLS but NOT 8w or 13w variants (v16 clean set)
-_EXPECTED_FEATURE_COUNT = 29
+# Features that are in FEATURE_COLS but NOT 8w or 13w variants (v19 enriched set)
+_EXPECTED_FEATURE_COUNT = 40
 
 
 # ---------------------------------------------------------------------------
@@ -107,8 +111,9 @@ def plot_correlation_heatmaps(df: pd.DataFrame) -> None:
     engineered features and ``score``, then save heatmaps.
     Rows with NaN score are dropped before computing correlations.
     Downsamples to 500 k rows for Spearman performance.
-    v16: week_sin and week_cos appear instead of month/week_of_year.
-         8w/13w rolling features are absent (removed in v16 preprocessing).
+    v19: week_sin and week_cos appear instead of month/week_of_year.
+         8w/13w rolling features are absent (removed in v19 preprocessing).
+         40 features including enriched weekly stats.
     """
     df_valid   = df.dropna(subset=["score"]).copy()
     df_sampled = df_valid.sample(n=min(500_000, len(df_valid)), random_state=RANDOM_SEED)
@@ -141,8 +146,8 @@ def plot_correlation_heatmaps(df: pd.DataFrame) -> None:
             cbar_kws={"shrink": 0.6},
         )
         ax.set_title(
-            f"{method.capitalize()} Correlation Heatmap (Weekly Features) — v16\n"
-            f"29 features (4w-only rolling | no 8w/13w domain-shift features)",
+            f"{method.capitalize()} Correlation Heatmap (Weekly Features) — v19\n"
+            f"40 features (enriched weekly stats | no dp_tmp/wb_tmp | no 8w/13w)",
             fontsize=13, pad=12,
         )
         _save(fig, f"corr_heatmap_{method}.png")
@@ -159,7 +164,7 @@ def plot_correlation_heatmaps(df: pd.DataFrame) -> None:
         ax2.axvline(0, color="black", linewidth=0.8)
         ax2.set_xlabel(f"{method.capitalize()} correlation with score")
         ax2.set_title(
-            f"Feature vs. Score ({method.capitalize()}) — Weekly v16 (29 features)",
+            f"Feature vs. Score ({method.capitalize()}) — Weekly v19 (40 features)",
             fontsize=13,
         )
         _save(fig2, f"corr_score_bar_{method}.png")
@@ -233,7 +238,7 @@ def plot_region_timeseries(df: pd.DataFrame, n_regions: int = 5) -> None:
         ax_bot.set_xticklabels(tick_labels, rotation=35, ha="right", fontsize=7)
         ax_bot.set_xlabel("Week (day_ordinal)", fontsize=9)
 
-        fig.suptitle(f"Weekly Weather & Score — Region {rid} — v16", fontsize=13, y=1.01)
+        fig.suptitle(f"Weekly Weather & Score — Region {rid} — v19", fontsize=13, y=1.01)
         fig.tight_layout()
         _save(fig, f"timeseries_{rid}.png")
 
@@ -242,7 +247,7 @@ def plot_region_timeseries(df: pd.DataFrame, n_regions: int = 5) -> None:
 # 3. Score histogram
 # ---------------------------------------------------------------------------
 def plot_score_histogram(df: pd.DataFrame) -> None:
-    """Histogram of the target variable score (0–5 integer scale)."""
+    """Histogram of the target variable score (0-5 integer scale)."""
     score_vals = df["score"].dropna()
 
     fig, ax = plt.subplots(figsize=(8, 5))
@@ -251,7 +256,7 @@ def plot_score_histogram(df: pd.DataFrame) -> None:
     ax.set_xlabel("Score", fontsize=12)
     ax.set_ylabel("Count", fontsize=12)
     ax.set_title(
-        "Distribution of Target Variable (score) — Weekly Aggregation v16\n"
+        "Distribution of Target Variable (score) — Weekly Aggregation v19\n"
         "(Absolute Index Grouping — Zero Ghost Weeks)",
         fontsize=12,
     )
@@ -294,7 +299,7 @@ def plot_feature_boxplots(df: pd.DataFrame) -> None:
     for j in range(i + 1, len(axes)):
         axes[j].set_visible(False)
 
-    fig.suptitle("Meteorological Feature Boxplots — Weekly Aggregated (Post-Clip) v16",
+    fig.suptitle("Meteorological Feature Boxplots — Weekly Aggregated (Post-Clip) v19",
                  fontsize=13)
     fig.tight_layout(rect=[0, 0, 1, 0.97])
     _save(fig, "feature_boxplots.png")
@@ -310,8 +315,8 @@ def plot_zero_inflation(df: pd.DataFrame) -> None:
       - Pie chart: fraction of scores == 0 vs > 0
       - Bar chart: count per integer score bracket
       - Cumulative distribution up to score 5
-    This directly motivates the Two-Stage architecture (prob × severity).
-    v16: Also shows Focal Loss motivation (hard active-drought boundaries).
+    This directly motivates the Tweedie Regressor (p=1.5) architecture.
+    v19: Zero-inflation handled implicitly via Tweedie deviance loss.
     """
     score_vals = df["score"].dropna().values
     zero_mask  = score_vals == 0.0
@@ -333,7 +338,7 @@ def plot_zero_inflation(df: pd.DataFrame) -> None:
         startangle=90,
         textprops={"fontsize": 11},
     )
-    ax1.set_title("Zero-Inflation in Score Distribution\n(motivates Focal Loss in v16)", fontsize=12)
+    ax1.set_title("Zero-Inflation in Score Distribution\n(motivates Tweedie Regressor p=1.5 in v19)", fontsize=12)
 
     # ---- Panel 2: Bar chart of integer score brackets ----
     ax2 = axes[1]
@@ -377,12 +382,12 @@ def plot_zero_inflation(df: pd.DataFrame) -> None:
     ax3.grid(True, alpha=0.4)
 
     fig.suptitle(
-        f"v16 Zero-Inflation Analysis  —  {zero_frac:.1%} of weekly scores are exactly 0\n"
-        f"Motivates Two-Stage Arch (P(drought)×Severity) + Focal Loss (γ=2.0) + Masked Regression",
+        f"v19 Zero-Inflation Analysis  —  {zero_frac:.1%} of weekly scores are exactly 0\n"
+        f"Motivates Single-Output Tweedie Regressor (p=1.5) | Zero-inflation handled via deviance loss",
         fontsize=12, y=1.02,
     )
     fig.tight_layout()
-    _save(fig, "zero_inflation_analysis_v16.png")
+    _save(fig, "zero_inflation_analysis_v19.png")
 
 
 # ---------------------------------------------------------------------------
@@ -392,7 +397,7 @@ def plot_cyclical_features(df: pd.DataFrame) -> None:
     """
     Verify that week_sin and week_cos form a proper unit circle
     (covering all 53 weeks uniformly), and show their individual distributions.
-    v16: cyclic features derived from doy/365.25 (absolute index grouping).
+    v19: cyclic features derived from doy/365.25 (absolute index grouping).
     """
     if "week_sin" not in df.columns or "week_cos" not in df.columns:
         print("  [Skip] week_sin / week_cos not found in dataframe.")
@@ -434,12 +439,12 @@ def plot_cyclical_features(df: pd.DataFrame) -> None:
     ax3.set_title("Distribution of week_cos", fontsize=12)
 
     fig.suptitle(
-        "v16 Cyclical Time Encoding: week_sin / week_cos\n"
+        "v19 Cyclical Time Encoding: week_sin / week_cos\n"
         "(doy/365.25 ratio from absolute-index week_end_date — zero ghost weeks)",
         fontsize=12, y=1.01,
     )
     fig.tight_layout()
-    _save(fig, "cyclical_features_v16.png")
+    _save(fig, "cyclical_features_v19.png")
 
 
 # ---------------------------------------------------------------------------
@@ -449,7 +454,7 @@ def plot_region_te_stats(df: pd.DataFrame) -> None:
     """
     Compute and show the distribution of per-region target encoding statistics
     (region_mean_score & region_zero_prob).
-    v16: used as static features in the 29-feature FEATURE_COLS.
+    v19: used as static features in the 40-feature FEATURE_COLS.
     """
     if "score" not in df.columns:
         print("  [Skip] No score column for TE stats plot.")
@@ -502,21 +507,21 @@ def plot_region_te_stats(df: pd.DataFrame) -> None:
     ax3.grid(True, alpha=0.3)
 
     fig.suptitle(
-        "v16 Target Encoding Feature Distributions (Full Training Set)\n"
+        "v19 Target Encoding Feature Distributions (Full Training Set)\n"
         f"  2248 regions  |  Global mean score = {te_stats['region_mean_score'].mean():.3f}"
         f"  |  Global zero_prob = {te_stats['region_zero_prob'].mean():.3f}",
         fontsize=12, y=1.01,
     )
     fig.tight_layout()
-    _save(fig, "region_te_stats_v16.png")
+    _save(fig, "region_te_stats_v19.png")
 
 
 # ---------------------------------------------------------------------------
-# 8. [v16 NEW] 13-Week Sequence Distribution Analysis
+# 8. [v19] 13-Week Sequence Distribution Analysis
 # ---------------------------------------------------------------------------
-def plot_v16_sequence_distribution(train_df: pd.DataFrame, test_df: pd.DataFrame) -> None:
+def plot_v19_sequence_distribution(train_df: pd.DataFrame, test_df: pd.DataFrame) -> None:
     """
-    v16 new plot: analyse the 13-week physical window constraints.
+    v19 plot: analyse the 13-week physical window constraints.
     Shows:
       - Histogram of weeks-per-region in training (should all be 782).
       - Histogram of weeks-per-region in test (should all be 13).
@@ -525,8 +530,8 @@ def plot_v16_sequence_distribution(train_df: pd.DataFrame, test_df: pd.DataFrame
     """
     fig, axes = plt.subplots(2, 2, figsize=(16, 10))
     fig.suptitle(
-        "v16 13-Week Window & Gap Distribution Analysis\n"
-        f"WINDOW_SIZE={WINDOW_SIZE}, HORIZON={HORIZON} | 4w-only rolling features",
+        "v19 13-Week Window & Gap Distribution Analysis\n"
+        f"WINDOW_SIZE={WINDOW_SIZE}, HORIZON={HORIZON} | 40 enriched features | Tweedie p=1.5",
         fontsize=13, y=1.01,
     )
 
@@ -566,8 +571,8 @@ def plot_v16_sequence_distribution(train_df: pd.DataFrame, test_df: pd.DataFrame
         ax3.set_xlabel("Deployment Gap (weeks)", fontsize=11)
         ax3.set_ylabel("# Regions", fontsize=11)
         ax3.set_title(
-            "Per-Region Deployment Gap (train_end → test_start)\n"
-            "v16 Gap-Gating: G = Sigmoid(Linear(gap_size, 1,1))",
+            "Per-Region Deployment Gap (train_end -> test_start)\n"
+            "v17/v19 Exponential Decay Gap-Gating",
             fontsize=11,
         )
         ax3.legend(fontsize=9)
@@ -601,14 +606,14 @@ def plot_v16_sequence_distribution(train_df: pd.DataFrame, test_df: pd.DataFrame
     ax4.set_ylabel("# Regions", fontsize=11)
     ax4.set_title(
         f"Available Sliding Windows per Region\n"
-        f"(W={WINDOW_SIZE}, H={HORIZON}, median_gap={median_gap}  →  "
-        f"total≈{seq_counts.sum():,})",
+        f"(W={WINDOW_SIZE}, H={HORIZON}, median_gap={median_gap}  ->  "
+        f"total~{seq_counts.sum():,})",
         fontsize=11,
     )
     ax4.legend(fontsize=9)
 
     fig.tight_layout()
-    _save(fig, "v16_sequence_distribution.png")
+    _save(fig, "v19_sequence_distribution.png")
 
 
 # ---------------------------------------------------------------------------
@@ -616,8 +621,8 @@ def plot_v16_sequence_distribution(train_df: pd.DataFrame, test_df: pd.DataFrame
 # ---------------------------------------------------------------------------
 def main() -> None:
     print("=" * 70)
-    print("Drought Prediction — EDA Pipeline v16")
-    print("13-Week Physical Window | 29 Features | No 8w/13w domain-shift")
+    print("Drought Prediction — EDA Pipeline v19")
+    print("13-Week Physical Window | 40 Features | Enriched Weekly Stats | Tweedie p=1.5")
     print("=" * 70)
 
     # ------------------------------------------------------------------
@@ -638,22 +643,35 @@ def main() -> None:
     print(f"  train_w: {train_w.shape}  |  test_w: {test_w.shape}")
 
     # ------------------------------------------------------------------
-    # v16 Feature validation
+    # v19 Feature validation
     # ------------------------------------------------------------------
-    print("\n[v16 Feature Validation]")
+    print("\n[v19 Feature Validation]")
     assert "week_sin" in train_w.columns, "week_sin missing — rerun preprocess.py"
     assert "week_cos" in train_w.columns, "week_cos missing — rerun preprocess.py"
     assert "month" not in train_w.columns, "month still present — preprocess.py issue"
     assert "week_of_year" not in train_w.columns, "week_of_year still present — preprocess.py issue"
-    print(f"  ✓ week_sin range: [{train_w['week_sin'].min():.3f}, {train_w['week_sin'].max():.3f}]")
-    print(f"  ✓ week_cos range: [{train_w['week_cos'].min():.3f}, {train_w['week_cos'].max():.3f}]")
+    print(f"  week_sin range: [{train_w['week_sin'].min():.3f}, {train_w['week_sin'].max():.3f}]")
+    print(f"  week_cos range: [{train_w['week_cos'].min():.3f}, {train_w['week_cos'].max():.3f}]")
 
     # Check that no 8w or 13w rolling columns exist
     bad_cols = [c for c in train_w.columns if ("8w" in c or "13w" in c)]
     if bad_cols:
         print(f"  *** WARNING: 8w/13w features found (domain-shift risk): {bad_cols}")
     else:
-        print("  ✓ No 8w/13w rolling features present (domain-shift columns correctly absent).")
+        print("  No 8w/13w rolling features present (domain-shift columns correctly absent).")
+
+    # Check enriched weekly stat columns
+    v19_new_cols = [
+        "tmp_week_max", "tmp_week_min", "tmp_week_std",
+        "humidity_week_max", "humidity_week_min", "humidity_week_std",
+        "wind_week_max", "wind_week_min", "wind_week_std",
+        "prec_week_max", "surf_pre_week_max",
+    ]
+    missing_v19 = [c for c in v19_new_cols if c not in train_w.columns]
+    if missing_v19:
+        print(f"  *** WARNING: v19 enriched weekly stats missing: {missing_v19}")
+    else:
+        print(f"  All 11 v19 enriched weekly stat columns present.")
 
     # Check week counts
     wk_counts = train_w.groupby("region_id").size()
@@ -670,26 +688,26 @@ def main() -> None:
     n_test  = test_w["region_id"].nunique()
     assert n_train == 2248, f"Expected 2248 train regions, got {n_train}"
     assert n_test  == 2248, f"Expected 2248 test regions, got {n_test}"
-    print(f"  ✓ Region counts: train={n_train}, test={n_test}")
+    print(f"  Region counts: train={n_train}, test={n_test}")
 
     # ------------------------------------------------------------------
     # Zero-inflation stats
     # ------------------------------------------------------------------
     score_vals = train_w["score"].dropna()
     zero_frac  = (score_vals == 0.0).mean()
-    print(f"\n[v16 Zero-Inflation Check]")
+    print(f"\n[v19 Zero-Inflation Check]")
     print(f"  Score mean  : {score_vals.mean():.4f}")
     print(f"  Score std   : {score_vals.std():.4f}")
     print(f"  Score == 0  : {zero_frac:.2%}  ({(score_vals == 0.0).sum():,} / {len(score_vals):,} rows)")
     print(f"  Score >  0  : {1 - zero_frac:.2%}")
-    print(f"  ==> Focal Loss (γ=2.0) + Masked Regression address this in v16.")
+    print(f"  ==> Tweedie Deviance Loss (p=1.5) addresses zero-inflation implicitly in v19.")
 
     # NaN score check (ghost-week guard)
     n_nan_scores = train_w["score"].isna().sum()
-    print(f"\n[v16 Ghost-Week Check]")
+    print(f"\n[v19 Ghost-Week Check]")
     print(f"  NaN scores in train_w: {n_nan_scores}  (must be 0 with absolute-index grouping)")
     assert n_nan_scores == 0, f"GHOST WEEKS DETECTED: {n_nan_scores} NaN scores!"
-    print("  ✓ ZERO GHOST WEEKS CONFIRMED")
+    print("  ZERO GHOST WEEKS CONFIRMED")
 
     # ------------------------------------------------------------------
     # EDA plots
@@ -715,8 +733,8 @@ def main() -> None:
     print("[7/8] Region target encoding stats ...")
     plot_region_te_stats(train_w)
 
-    print("[8/8] v16 13-Week Sequence Distribution ...")
-    plot_v16_sequence_distribution(train_w, test_w)
+    print("[8/8] v19 13-Week Sequence Distribution ...")
+    plot_v19_sequence_distribution(train_w, test_w)
 
     # ------------------------------------------------------------------
     # Validation
@@ -727,18 +745,18 @@ def main() -> None:
     if len(nonzero_nans) > 0:
         print(nonzero_nans.to_string())
     else:
-        print("  ✓ No NaNs detected in any column.")
+        print("  No NaNs detected in any column.")
 
     met_check = [c for c in MET_COLS if c in train_w.columns]
     nan_met   = train_w[met_check].isna().sum().sum()
     print(f"\nNaN in meteorological feature columns: {nan_met}")
     assert nan_met == 0, f"Unexpected NaNs in met features: {nan_met}"
 
-    print(f"\n✓ EDA pipeline v16 completed. All plots saved to: {PLOTS_DIR}")
+    print(f"\nEDA pipeline v19 completed. All plots saved to: {PLOTS_DIR}")
     print(f"  Feature count (FEATURE_COLS): {len(FEATURE_COLS)}  "
-          f"(29 = 11 weather + 2 cyclic + 3 rolling-4w + 4 lag1 + 4 lag2 + 3 drought-4w + 2 TE)")
+          f"(40 = 11 base weather + 11 enriched weekly stats + 2 cyclic + 3 rolling-4w + 4 lag1 + 4 lag2 + 3 drought-4w + 2 TE)")
     print(f"  Window: {WINDOW_SIZE} weeks | Horizon: {HORIZON} weeks")
-    print(f"  Architecture: LSTM(H=128)→256 + Dilated TCN(d=1,2,4)→128 + Gap-Gating")
+    print(f"  Architecture: Single-Output Tweedie Regressor [v19] | BiLSTM(H=128)-->256 + Dilated TCN(d=1,2,4)-->128")
 
 
 if __name__ == "__main__":

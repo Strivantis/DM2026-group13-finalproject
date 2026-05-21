@@ -11,47 +11,49 @@ Design
 - Feature pruning, log1p precipitation transform, and Drought Index
   (PET-based deficit 4-week rolling sum) are applied here.
 
+v21 Changes (Pure Continuous-Time Prediction + StratifiedGroupKFold CV)
+------------------------------------------------------------------------
+PARADIGM SHIFT: The Dataset Gap (train/test time discontinuity) was NEVER
+  a valid modelling concern at the input→prediction level.
+  V21 returns to the purest possible formulation:
+    Given 13 consecutive weeks X, predict the IMMEDIATELY FOLLOWING 5 weeks Y.
+    Gap = 0 between end of X and start of Y.
+
+- ABOLISHED all Gap mechanisms: `gap_size`, `actual_gap`, `effective_gap`,
+  `compute_actual_gaps`, `build_temporal_shift_cv_folds`, `build_single_fold`,
+  `build_gap_replay_folds`.  All Gap-related constants removed.
+
+- NEW primary CV: `build_stratified_group_cv_folds()` (5-Fold StratifiedGroupKFold).
+    Group  = region_id (each region is one group).
+    Strata = 10-quantile bins of each region's historical mean_score.
+    Train  = 80% of regions per fold  (geographically unseen at validation).
+    Val    = 20% of regions per fold  (completely held-out geography).
+  Forces the model to generalise weather physics, not memorise regions.
+
+- DroughtDataset.__getitem__ returns a 4-tuple (removing gap_size):
+    (X, y, target_time, group_id)
+  group_id retained for diagnostic purposes (last context row index).
+
+v19 Changes (Tweedie Paradigm Shift – Enriched Features + Time-Decay)
+----------------------------------------------------------------------
+- FEATURE_COLS expanded from 29 → 40 features to incorporate v19 enriched
+  weekly statistics produced by preprocess.py:
+    tmp_week_max, tmp_week_min, tmp_week_std     (intra-week temperature shocks)
+    humidity_week_max, humidity_week_min, humidity_week_std
+    wind_week_max, wind_week_min, wind_week_std
+    prec_week_max, surf_pre_week_max             (extreme precipitation events)
+
+- PREC_COLS updated: added prec_week_max for log1p precipitation transform
+  (right-skewed positive distribution consistent with weekly rainfall peaks).
+
+- DROP_COLS retained as guard: dp_tmp, wb_tmp, surf_tmp are excluded both at
+  the preprocess.py aggregation level (v19 new) and here (defensive pruning).
+
 v16 Changes (Preprocessing Overhaul – Sequence Grouping & 13-Week Bounds)
 --------------------------------------------------------------------------
 - WINDOW_SIZE reduced from 26 → 13 (hard cap at the test-set horizon).
-  Using a window larger than the test horizon causes domain shift: the model
-  never sees a 26-week context at inference time (test has only 13 weeks).
-  Setting WINDOW_SIZE=13 ensures the inference context is always achievable.
-
-- FEATURE_COLS updated: removed ALL 8-week and 13-week rolling features
-  (prec_roll_sum_8w/13w, tmp_roll_mean_8w/13w, humidity_roll_mean_8w/13w,
-  deficit_roll_cum_8w/13w) that cause training-vs-inference distribution shift.
-  These features require 8-13 weeks of history to stabilise, but the model
-  sees them fully-computed during training (782 weeks) and partially-computed
-  (min_periods=1 truncation) at inference — a catastrophic domain shift.
-  Only 4-week rolling features are kept: they stabilise from week 4 onward,
-  which is achievable in both training and the 13-week test set.
-
-- PREC_COLS updated accordingly (removed 8w/13w entries).
-
-- compute_actual_gaps() updated to prefer the `day_ordinal` column (produced
-  by v10 preprocess.py) over the legacy `week_key` string column.  Uses:
-    gap_weeks = round((test_min_ordinal - train_max_ordinal) / 7)
-
-  Total feature count: 29 (down from 37).
-
-v15 Changes
------------
-- PARADIGM SHIFT 2: 3-Fold Walk-Forward CV abolished in favour of a
-  Single-Fold data-maximizing strategy (build_single_fold).
-  - Val_Y = last 5 weeks of each region's historical data (fixed, no rotation).
-  - Train set uses ALL available sliding windows ending strictly before
-    Val_Y (no data left on the table from folding).
-  - Scaler is fit on the entire maximized training split.
-- build_gap_replay_folds() and build_walk_forward_folds() are retained
-  as backward-compat stubs but are no longer called by train.py.
-
-v14 Changes
------------
-- PARADIGM SHIFT: Absolute CV replaced with "Relative Gap-Replay" CV.
-  - actual_gap is computed per-region from the real calendar distance
-    between the last train week and the first test week.
-  - __getitem__ returns (X, y, target_time, gap_size).
+- FEATURE_COLS: removed ALL 8-week and 13-week rolling features.
+- PREC_COLS: removed 8w/13w entries.
 """
 
 import numpy as np
@@ -71,30 +73,47 @@ HORIZON = 5        # forecast horizon (weeks)
 WF_FOLD_WEEKS  = 5   # weeks per fold
 WF_NUM_FOLDS   = 3   # number of folds
 
-# v11 legacy fallback gap (kept for import compat; unused in SingleFold path)
-GAP_WEEKS = 4
+# v11 legacy fallback gap (kept for import compat; UNUSED in V21 path)
+GAP_WEEKS = 0
 
-# Drop collinear temp proxies (keep tmp, tmp_max, tmp_min, tmp_range)
+# v20 legacy constants (kept for backward compat imports)
+N_TS_FOLDS     = 5
+TS_VAL_HORIZON = 5
+TS_SHIFT_WEEKS = 26
+
+# Drop collinear / adversarial columns
+# dp_tmp and wb_tmp are now pruned at the preprocess.py level (v19);
+# they are kept here as a defensive guard in case older CSVs are loaded.
 DROP_COLS = ["wb_tmp", "dp_tmp", "surf_tmp"]
 
 # Precipitation columns to log1p-transform (handle right-skew)
 # v16: removed prec_roll_sum_8w, prec_roll_sum_13w (features deleted)
+# v19: added prec_week_max (extreme event peak – also right-skewed)
 PREC_COLS = [
     "prec",
+    "prec_week_max",
     "prec_roll_sum_4w",
     "prec_lag1w", "prec_lag2w",
 ]
 
 # Feature columns fed to the model (order matters for scaler alignment)
-# v16: removed ALL 8w and 13w rolling features; WINDOW_SIZE capped at 13.
+# v19: 40 features = 11 base weather + 11 enriched weekly stats + 2 cyclic
+#      + 3 rolling-4w + 4 lag1 + 4 lag2 + 3 drought-4w + 2 TE
+#
 # Count breakdown:
-#   base weather (11) + cyclic calendar (2) + rolling 4w (3)
-#   + lag-1 (4) + lag-2 (4) + drought 4w (3) + target encoding (2) = 29
+#   base weather (11) + enriched weekly stats (11) + cyclic calendar (2)
+#   + rolling 4w (3) + lag-1 (4) + lag-2 (4) + drought 4w (3)
+#   + target encoding (2) = 40
 FEATURE_COLS = [
     # --- base weather (11) ---
     "prec", "surf_pre", "humidity",
     "tmp", "tmp_max", "tmp_min", "tmp_range",
     "wind", "wind_max", "wind_min", "wind_range",
+    # --- enriched weekly statistics (11) [v19: intra-week climate shocks] ---
+    "tmp_week_max", "tmp_week_min", "tmp_week_std",
+    "humidity_week_max", "humidity_week_min", "humidity_week_std",
+    "wind_week_max", "wind_week_min", "wind_week_std",
+    "prec_week_max", "surf_pre_week_max",
     # --- cyclical calendar (2) [v9: replaces month + week_of_year] ---
     "week_sin", "week_cos",
     # --- rolling aggregates 4w only (3) [v16: removed 8w and 13w] ---
@@ -108,7 +127,7 @@ FEATURE_COLS = [
     "deficit_roll_cum_4w",
     # --- target encoding (2) [v9: leakage-free region stats, injected in train.py] ---
     "region_mean_score", "region_zero_prob",
-]   # total = 29 features
+]   # total = 40 features
 
 
 # ---------------------------------------------------------------------------
@@ -117,7 +136,7 @@ FEATURE_COLS = [
 def refine_features(df: pd.DataFrame, is_train: bool = True) -> pd.DataFrame:
     """
     1. Compute Drought Index (PET/deficit 4w) BEFORE log1p (uses raw prec).
-    2. Drop collinear temperature proxies (wb_tmp, dp_tmp, surf_tmp).
+    2. Drop adversarial / collinear columns (wb_tmp, dp_tmp, surf_tmp).
     3. Apply log1p to all precipitation-related columns.
     4. Handle NaN rows:
        - Train: drop rows where any FEATURE_COL is NaN (lag head: first 2/region).
@@ -133,7 +152,7 @@ def refine_features(df: pd.DataFrame, is_train: bool = True) -> pd.DataFrame:
     # Step 0 – drought index (must be before log1p of prec)
     df = add_drought_index(df, is_train=is_train)
 
-    # Step 1 – drop collinear columns
+    # Step 1 – drop collinear / adversarial columns
     df.drop(columns=[c for c in DROP_COLS if c in df.columns], inplace=True)
 
     # Step 2 – log1p precipitation (clip negatives to 0 first)
@@ -162,20 +181,30 @@ def refine_features(df: pd.DataFrame, is_train: bool = True) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# Region-aware sliding-window dataset  (v14+: Gap-Replay)
+# Region-aware sliding-window dataset  (v21: pure gap=0)
 # ---------------------------------------------------------------------------
 class DroughtDataset(Dataset):
     """
-    v14 Gap-Replay Dataset
-    ----------------------
+    V21 Pure Sliding Window Dataset (Hurdle Dual-Head)
+    ---------------------------------------------------
     Parameters
     ----------
-    region_groups : list of (group_df, i_min, i_max, actual_gap)
-        Each entry defines one region's data, the [inclusive] range of
-        valid sequence start indices, and the actual deployment gap.
+    region_groups : list of (group_df, i_min, i_max)  OR
+                   (group_df, i_min, i_max, _unused_gap)
+        Each entry defines one region's data and the [inclusive] range of
+        valid sequence start indices.  Gap is always 0 in V21.
     window  : look-back length (weeks) — v16: default=13
     horizon : forecast horizon (weeks)
     scaler  : fitted sklearn scaler; applied if not None
+
+    __getitem__ returns a 4-tuple:
+        (X, y, target_time, group_id)
+
+    group_id
+    --------
+    For each training sample starting at window index i, the group_id is
+    defined as (i + window - 1) — the index of the last row in the context
+    window within this region's weekly time series.
     """
 
     def __init__(
@@ -191,16 +220,15 @@ class DroughtDataset(Dataset):
         sequences    = []
         targets      = []
         target_times = []   # (H, 2) week_sin/cos for each target week
-        gap_sizes    = []   # scalar actual_gap / 100.0
+        group_ids    = []   # chronological week position (last context row index)
 
         for entry in region_groups:
-            # Support both old 3-tuple (group, i_min, i_max) and new
-            # 4-tuple (group, i_min, i_max, actual_gap) for backward compat.
+            # Support both old 4-tuple (group, i_min, i_max, _gap) and
+            # new 3-tuple (group, i_min, i_max) for backward compat.
             if len(entry) == 4:
-                group, i_min, i_max, actual_gap = entry
+                group, i_min, i_max, _gap = entry
             else:
                 group, i_min, i_max = entry
-                actual_gap = GAP_WEEKS  # legacy fallback
 
             feat_cols = [c for c in FEATURE_COLS if c in group.columns]
             X = group[feat_cols].values.astype(np.float32)
@@ -218,9 +246,9 @@ class DroughtDataset(Dataset):
             )
 
             for i in range(i_min, i_max + 1):
-                end_feat = i + window
-                # v14: target window starts `actual_gap` weeks after X ends
-                tgt_start = end_feat + actual_gap
+                end_feat  = i + window
+                # V21: target starts IMMEDIATELY after X ends (gap = 0)
+                tgt_start = end_feat
                 tgt_end   = tgt_start + horizon
                 if tgt_end > len(group):
                     break
@@ -240,12 +268,12 @@ class DroughtDataset(Dataset):
                     tt = np.zeros((horizon, 2), dtype=np.float32)
                 target_times.append(tt)
 
-                # gap_size: normalised scalar (1,)
-                gap_sizes.append(np.array([actual_gap / 100.0], dtype=np.float32))
+                # group_id: index of the last context row = end_feat - 1
+                group_ids.append(np.array([float(end_feat - 1)], dtype=np.float32))
 
         self.sequences    = np.array(sequences,    dtype=np.float32)   # (N, W, F)
         self.target_times = np.array(target_times, dtype=np.float32)   # (N, H, 2)
-        self.gap_sizes    = np.array(gap_sizes,    dtype=np.float32)   # (N, 1)
+        self.group_ids    = np.array(group_ids,    dtype=np.float32)   # (N, 1)
         self.targets = (
             np.array(targets, dtype=np.float32) if targets else None   # (N, H)
         )
@@ -264,297 +292,62 @@ class DroughtDataset(Dataset):
     def __getitem__(self, idx):
         x           = torch.tensor(self.sequences[idx],    dtype=torch.float32)
         target_time = torch.tensor(self.target_times[idx], dtype=torch.float32)
-        gap_size    = torch.tensor(self.gap_sizes[idx],    dtype=torch.float32)
+        group_id    = torch.tensor(self.group_ids[idx],    dtype=torch.float32)  # (1,)
 
         if self.targets is not None:
             y = torch.tensor(self.targets[idx], dtype=torch.float32)
         else:
             y = torch.empty(0)
-        return x, y, target_time, gap_size
+        return x, y, target_time, group_id
 
 
 # ---------------------------------------------------------------------------
-# Helper – compute per-region actual gap from train/test DataFrames
+# V21 Primary CV: 5-Fold StratifiedGroupKFold builder
 # ---------------------------------------------------------------------------
-def compute_actual_gaps(train_df: pd.DataFrame, test_df: pd.DataFrame) -> dict:
-    """
-    Compute the actual deployment gap (in weeks) for each region_id.
-
-    Priority:
-    1. day_ordinal column (v10 preprocessed data): precise calendar-based gap.
-       gap_days  = test_min_ordinal - train_max_ordinal
-       gap_weeks = max(round(gap_days / 7), 1)
-
-    2. week_key column (v9 legacy): string-based week key conversion.
-
-    3. Fallback: assume test starts immediately after train (gap = 1 week).
-
-    Returns
-    -------
-    gaps : dict  region_id -> int  (number of weeks gap, >= 1)
-    """
-    # ------------------------------------------------------------------
-    # Path 1: day_ordinal (v10+ preprocess)
-    # ------------------------------------------------------------------
-    if "day_ordinal" in train_df.columns and "day_ordinal" in test_df.columns:
-        train_max = train_df.groupby("region_id")["day_ordinal"].max()
-        test_min  = test_df.groupby("region_id")["day_ordinal"].min()
-
-        gaps = {}
-        for rid in train_max.index:
-            if rid in test_min.index:
-                gap_days  = float(test_min[rid]) - float(train_max[rid])
-                gap_weeks = max(int(round(gap_days / 7)), 1)
-                gaps[rid] = gap_weeks
-            else:
-                gaps[rid] = GAP_WEEKS
-        return gaps
-
-    # ------------------------------------------------------------------
-    # Path 2: week_key (v9 legacy)
-    # ------------------------------------------------------------------
-    if "week_key" in train_df.columns and "week_key" in test_df.columns:
-        def _abs_week(df):
-            def parse(wk):
-                if pd.isna(wk):
-                    return np.nan
-                parts = str(wk).split("-W")
-                year = int(parts[0]) if parts[0].isdigit() else int(parts[0][-6:])
-                week = int(parts[1])
-                return year * 53 + week
-            return df["week_key"].apply(parse)
-
-        tr_abs = _abs_week(train_df)
-        te_abs = _abs_week(test_df)
-
-        train_max = train_df.assign(_aw=tr_abs).groupby("region_id")["_aw"].max()
-        test_min  = test_df.assign(_aw=te_abs).groupby("region_id")["_aw"].min()
-
-        gaps = {}
-        for rid in train_max.index:
-            if rid in test_min.index:
-                gap = int(test_min[rid] - train_max[rid])
-                gaps[rid] = max(gap, 1)
-            else:
-                gaps[rid] = GAP_WEEKS
-        return gaps
-
-    # ------------------------------------------------------------------
-    # Path 3: Positional fallback (gap = 1 week)
-    # ------------------------------------------------------------------
-    train_max = train_df.groupby("region_id").apply(lambda g: len(g) - 1)
-    test_min  = train_max + 1   # assume test starts immediately after train
-
-    gaps = {}
-    for rid in train_max.index:
-        if rid in test_min.index:
-            gap = int(test_min[rid] - train_max[rid])
-            gaps[rid] = max(gap, 1)
-        else:
-            gaps[rid] = GAP_WEEKS
-    return gaps
-
-
-# ---------------------------------------------------------------------------
-# v15: Single-Fold Data-Maximizing Split builder
-# ---------------------------------------------------------------------------
-def build_single_fold(
+def build_stratified_group_cv_folds(
     df: pd.DataFrame,
-    actual_gaps: dict,
-):
-    """
-    v15 Single-Fold Data-Maximizing CV.
-
-    For each region:
-      - Val_Y  = last 5 rows (HORIZON) of historical train data (fixed).
-      - Val_X  (length WINDOW_SIZE) ends exactly `actual_gap` weeks before
-        Val_Y starts.
-      - Train (X, Y) pairs use ALL available sliding windows; each pair
-        enforces the same `actual_gap` distance between End_of_X and
-        Start_of_Y, and the target window must end strictly before Val_Y
-        begins (no leakage into validation).
-      - Zero Data Waste Fallback: if history is too short for
-        `WINDOW_SIZE + actual_gap + HORIZON`, shrink the gap dynamically
-        to the largest value that yields ≥1 pair.
-
-    v16: WINDOW_SIZE=13 allows more training samples per region.
-
-    Returns
-    -------
-    train_groups : list of (group_df, i_min, i_max, effective_gap)
-    val_groups   : list of (group_df, val_i, val_i, effective_gap)
-    """
-    train_groups = []
-    val_groups   = []
-
-    for _, group in df.groupby("region_id"):
-        group = group.reset_index(drop=True)
-        n     = len(group)
-        rid   = group["region_id"].iloc[0]
-
-        # Retrieve per-region actual gap; fall back to global default
-        actual_gap = actual_gaps.get(rid, GAP_WEEKS)
-
-        # Val_Y = last HORIZON rows: indices [n-HORIZON : n]
-        val_y_start = n - HORIZON  # inclusive index of first val target row
-
-        # --------------------------------------------------------------------
-        # Zero Data Waste: shrink gap if needed
-        # --------------------------------------------------------------------
-        min_required = WINDOW_SIZE + actual_gap + HORIZON
-        if min_required > n:
-            max_feasible_gap = n - WINDOW_SIZE - HORIZON
-            if max_feasible_gap < 1:
-                continue
-            effective_gap = max_feasible_gap
-        else:
-            effective_gap = actual_gap
-
-        # --------------------------------------------------------------------
-        # Val split: Val_X ends `effective_gap` weeks before val_y_start
-        # --------------------------------------------------------------------
-        val_x_end   = val_y_start - effective_gap
-        val_x_start = val_x_end - WINDOW_SIZE
-
-        if val_x_start < 0 or val_x_end < WINDOW_SIZE:
-            continue
-
-        val_tgt_start = val_x_end + effective_gap   # == val_y_start
-        val_tgt_end   = val_tgt_start + HORIZON
-        if val_tgt_end > n:
-            continue
-
-        val_groups.append((group, val_x_start, val_x_start, effective_gap))
-
-        # --------------------------------------------------------------------
-        # Train: ALL sliding windows with target strictly before val_y_start.
-        # i + WINDOW_SIZE + effective_gap + HORIZON <= val_y_start
-        # --------------------------------------------------------------------
-        train_i_max = val_y_start - WINDOW_SIZE - effective_gap - HORIZON
-        if train_i_max >= 0:
-            train_groups.append((group, 0, train_i_max, effective_gap))
-
-    return train_groups, val_groups
-
-
-# ---------------------------------------------------------------------------
-# Helper – Walk-Forward Gap-Replay Fold builder  (v14 – retained as stub)
-# ---------------------------------------------------------------------------
-def build_gap_replay_folds(
-    df: pd.DataFrame,
-    actual_gaps: dict,
-):
-    """
-    v14 Relative Gap-Replay Walk-Forward CV.
-    Retained for backward compatibility. New code uses build_single_fold().
-    """
-    folds = []
-
-    for fold_k in range(WF_NUM_FOLDS):
-        val_end_from_end   = fold_k * WF_FOLD_WEEKS
-        val_start_from_end = val_end_from_end + WF_FOLD_WEEKS
-
-        train_groups, val_groups = [], []
-
-        for _, group in df.groupby("region_id"):
-            group = group.reset_index(drop=True)
-            n     = len(group)
-            rid   = group["region_id"].iloc[0]
-
-            actual_gap = actual_gaps.get(rid, GAP_WEEKS)
-
-            val_start = n - val_start_from_end
-            val_end   = n - val_end_from_end
-
-            min_required = WINDOW_SIZE + actual_gap + HORIZON
-            if min_required > n:
-                max_feasible_gap = n - WINDOW_SIZE - HORIZON
-                if max_feasible_gap < 1:
-                    continue
-                effective_gap = max_feasible_gap
-            else:
-                effective_gap = actual_gap
-
-            val_x_end   = val_start - effective_gap
-            val_x_start = val_x_end - WINDOW_SIZE
-
-            if val_x_start < 0 or val_x_end < WINDOW_SIZE:
-                continue
-
-            val_i = val_x_start
-            val_tgt_start = val_x_end + effective_gap
-            val_tgt_end   = val_tgt_start + HORIZON
-            if val_tgt_end > n:
-                continue
-
-            val_groups.append((group, val_i, val_i, effective_gap))
-
-            train_i_max = val_x_start - WINDOW_SIZE - effective_gap - HORIZON
-            if train_i_max >= 0:
-                train_groups.append((group, 0, train_i_max, effective_gap))
-
-        folds.append((train_groups, val_groups))
-
-    return folds
-
-
-# ---------------------------------------------------------------------------
-# Backward compat alias
-# ---------------------------------------------------------------------------
-def build_walk_forward_folds(df: pd.DataFrame):
-    """
-    Legacy stub. New code uses build_single_fold().
-    """
-    fallback_gaps = {rid: GAP_WEEKS for rid in df["region_id"].unique()}
-    return build_gap_replay_folds(df, fallback_gaps)
-
-
-# ---------------------------------------------------------------------------
-# v18: 5-Fold Stratified Region Group CV builder (StratifiedGroupKFold)
-# ---------------------------------------------------------------------------
-def build_region_group_cv_folds(
-    df: pd.DataFrame,
-    actual_gaps: dict,
     n_splits: int = 5,
 ):
     """
-    v18: 5-Fold Stratified Region Group CV.
+    V21 Primary CV: 5-Fold StratifiedGroupKFold.
 
-    Uses sklearn StratifiedGroupKFold(n_splits=5) grouped strictly by
-    region_id and stratified by 10-quantile bins of each region's historical
-    mean drought score.
+    Strategy:
+    ---------
+    - Group  = region_id (one group per region, never split across folds).
+    - Strata = 10-quantile bins of each region's historical mean drought score.
+    - Train  = 80% of regions per fold (geography unseen during validation).
+    - Val    = 20% of regions per fold (completely held-out geography).
 
-    Stratification Logic (v18 NEW):
-        1. Compute per-region mean score from the training DataFrame.
-        2. Map those means into 10 quantile bins via pd.qcut(q=10,
-           duplicates='drop') to ensure each fold has an identical proportion
-           of "perpetual desert regions" vs "frequent rainy regions".
-        3. Pass bins as `y` to StratifiedGroupKFold while keeping
-           `groups=region_ids` to prevent cross-region data leakage.
-        This eliminates the Fold 2 outlier variance seen in v17 caused by
-        GroupKFold's purely positional splitting of the region_id array.
+    This forces the model to generalise climate physics rather than memorise
+    region-specific baselines.  20% held-out geography is the gold standard
+    for spatial time-series cross-validation.
 
-    Train groups: ALL sliding windows for each training-fold region
-                  (same logic as build_full_train_groups).
-    Val groups  : Last HORIZON rows as Val_Y for each validation-fold region,
-                  with per-region gap-replay using each region's actual_gap
-                  (same windowing logic as build_single_fold).
+    Train sample construction (per region):
+    ----------------------------------------
+    ALL valid sliding windows with gap = 0:
+      X[i : i+WINDOW_SIZE]  →  Y[i+WINDOW_SIZE : i+WINDOW_SIZE+HORIZON]
+    i ranges from 0 to n - WINDOW_SIZE - HORIZON (inclusive).
 
-    NOTE: TE columns (region_mean_score, region_zero_prob) are NOT added here.
-          They are injected per-fold by train.py._augment_groups_with_te()
-          AFTER calling this function, using fold-local TE statistics.
+    Val sample construction (per region):
+    ---------------------------------------
+    LAST HORIZON rows as Val_Y.  Val_X = WINDOW_SIZE rows immediately before.
+    i.e. val_x_start = n - WINDOW_SIZE - HORIZON
+         val_x_end   = n - HORIZON
+         val_y_start = n - HORIZON
+         val_y_end   = n
+
+    Note: gap = 0 throughout (V21 paradigm).
 
     Parameters
     ----------
-    df          : pd.DataFrame with refined features (no TE cols required)
-    actual_gaps : dict  region_id -> int (deployment gap in weeks)
-    n_splits    : int   number of CV folds (default 5)
+    df       : pd.DataFrame with refined features
+    n_splits : int, number of CV folds (default 5)
 
     Returns
     -------
     folds : list of (train_groups, val_groups)
-        train_groups : list of (group_df, i_min, i_max, effective_gap)
-        val_groups   : list of (group_df, val_i, val_i, effective_gap)
+        train_groups : list of (group_df, i_min, i_max)
+        val_groups   : list of (group_df, val_i, val_i)
     """
     from sklearn.model_selection import StratifiedGroupKFold
 
@@ -562,10 +355,7 @@ def build_region_group_cv_folds(
     n_regions  = len(region_ids)
 
     # ------------------------------------------------------------------
-    # v18: Build stratification labels -- 10-quantile bins of per-region
-    # mean score so every fold mirrors the full drought-severity spectrum.
-    # pd.qcut with duplicates='drop' gracefully handles ties in the tails
-    # (common in zero-inflated distributions with many desert regions).
+    # Build stratification labels -- 10-quantile bins of per-region mean score
     # ------------------------------------------------------------------
     region_mean_series = df.groupby("region_id")["score"].mean()
     region_means_arr   = np.array(
@@ -576,7 +366,7 @@ def build_region_group_cv_folds(
         region_means_arr, q=10, labels=False, duplicates="drop"
     ).astype(int)
 
-    sgkf    = StratifiedGroupKFold(n_splits=n_splits)
+    sgkf    = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=42)
     dummy_X = np.zeros((n_regions, 1))
 
     folds = []
@@ -590,56 +380,33 @@ def build_region_group_cv_folds(
         train_df_fold = df[df["region_id"].isin(train_region_set)]
         val_df_fold   = df[df["region_id"].isin(val_region_set)]
 
-        # ---- Train: ALL sliding windows (data-maximizing) ----
+        # ---- Train: ALL sliding windows with gap=0 (data-maximizing) ----
         train_groups = []
         for _, group in train_df_fold.groupby("region_id"):
             group = group.reset_index(drop=True)
-            n   = len(group)
-            rid = group["region_id"].iloc[0]
+            n = len(group)
 
-            actual_gap = actual_gaps.get(rid, GAP_WEEKS)
-            # Zero Data Waste Fallback
-            if n < WINDOW_SIZE + actual_gap + HORIZON:
-                effective_gap = n - WINDOW_SIZE - HORIZON
-                if effective_gap < 1:
-                    continue
-            else:
-                effective_gap = actual_gap
+            if n < WINDOW_SIZE + HORIZON:
+                continue  # region too short for even one sample
 
-            train_i_max = n - WINDOW_SIZE - effective_gap - HORIZON
-            if train_i_max >= 0:
-                train_groups.append((group, 0, train_i_max, effective_gap))
+            train_i_max = n - WINDOW_SIZE - HORIZON
+            train_groups.append((group, 0, train_i_max))
 
-        # ---- Val: last HORIZON rows as Val_Y, gap-replay windowing ----
+        # ---- Val: ALL sliding windows across the entire timeline ----
+        # v21.1 FIX: Use ALL historical windows for validation regions,
+        # identical to training region treatment.  Previously this was
+        # limited to a single last-window snapshot (Snapshot Bias).
+        # Expected ~340k sequences once all windows are included.
         val_groups = []
         for _, group in val_df_fold.groupby("region_id"):
             group = group.reset_index(drop=True)
-            n   = len(group)
-            rid = group["region_id"].iloc[0]
+            n = len(group)
 
-            actual_gap = actual_gaps.get(rid, GAP_WEEKS)
-            # Zero Data Waste Fallback
-            min_required = WINDOW_SIZE + actual_gap + HORIZON
-            if min_required > n:
-                effective_gap = n - WINDOW_SIZE - HORIZON
-                if effective_gap < 1:
-                    continue
-            else:
-                effective_gap = actual_gap
+            if n < WINDOW_SIZE + HORIZON:
+                continue  # region too short for even one sample
 
-            val_y_start = n - HORIZON
-            val_x_end   = val_y_start - effective_gap
-            val_x_start = val_x_end - WINDOW_SIZE
-
-            if val_x_start < 0 or val_x_end < WINDOW_SIZE:
-                continue
-
-            val_tgt_start = val_x_end + effective_gap   # == val_y_start
-            val_tgt_end   = val_tgt_start + HORIZON
-            if val_tgt_end > n:
-                continue
-
-            val_groups.append((group, val_x_start, val_x_start, effective_gap))
+            val_i_max = n - WINDOW_SIZE - HORIZON
+            val_groups.append((group, 0, val_i_max))
 
         folds.append((train_groups, val_groups))
 
@@ -652,29 +419,87 @@ def build_region_group_cv_folds(
 def build_full_train_groups(df: pd.DataFrame, actual_gaps: dict = None):
     """
     Build region groups using ALL rows (no held-out validation period).
-    Used for final model training after walk-forward CV is complete.
+    Used for final model training after CV is complete.
 
-    v14: accepts optional actual_gaps dict; falls back to GAP_WEEKS.
-    v16: WINDOW_SIZE=13, so more samples per region.
+    V21: gap=0 throughout.  actual_gaps parameter retained for backward compat
+    but is ignored.
     """
     train_groups = []
     for _, group in df.groupby("region_id"):
         group = group.reset_index(drop=True)
-        n     = len(group)
-        rid   = group["region_id"].iloc[0]
+        n = len(group)
 
-        if actual_gaps is not None:
-            actual_gap = actual_gaps.get(rid, GAP_WEEKS)
-        else:
-            actual_gap = GAP_WEEKS
+        if n < WINDOW_SIZE + HORIZON:
+            continue
 
-        # Zero Data Waste Fallback
-        if n < WINDOW_SIZE + actual_gap + HORIZON:
-            effective_gap = max(n - WINDOW_SIZE - HORIZON, 1)
-        else:
-            effective_gap = actual_gap
-
-        train_i_max = n - WINDOW_SIZE - effective_gap - HORIZON
+        train_i_max = n - WINDOW_SIZE - HORIZON
         if train_i_max >= 0:
-            train_groups.append((group, 0, train_i_max, effective_gap))
+            train_groups.append((group, 0, train_i_max))
     return train_groups
+
+
+# ---------------------------------------------------------------------------
+# Legacy stubs retained for backward compat imports
+# ---------------------------------------------------------------------------
+def compute_actual_gaps(train_df: pd.DataFrame, test_df: pd.DataFrame) -> dict:
+    """
+    V21 STUB: Gap computation is abolished.  Returns a dict mapping every
+    region_id to 0.  Retained for import compatibility with older train.py.
+    """
+    all_ids = set(train_df["region_id"].unique()) | set(test_df["region_id"].unique())
+    return {rid: 0 for rid in all_ids}
+
+
+def build_temporal_shift_cv_folds(
+    df: pd.DataFrame,
+    actual_gaps: dict = None,
+    n_folds: int = N_TS_FOLDS,
+    val_horizon: int = TS_VAL_HORIZON,
+    shift_weeks: int = TS_SHIFT_WEEKS,
+):
+    """
+    V21 STUB: Temporal Shift CV is abolished.
+    Delegates to build_stratified_group_cv_folds().
+    Retained for import compatibility.
+    """
+    return build_stratified_group_cv_folds(df, n_splits=n_folds)
+
+
+def build_region_group_cv_folds(
+    df: pd.DataFrame,
+    actual_gaps: dict = None,
+    n_splits: int = 5,
+):
+    """
+    V18/V19 builder – now identical to V21 primary builder.
+    Retained for import compatibility.
+    """
+    return build_stratified_group_cv_folds(df, n_splits=n_splits)
+
+
+def build_single_fold(df: pd.DataFrame, actual_gaps: dict = None):
+    """
+    V15 legacy stub.  Returns (train_groups, val_groups) from first fold of
+    StratifiedGroupKFold.
+
+    V21: gap=0. actual_gaps ignored.
+    """
+    folds = build_stratified_group_cv_folds(df, n_splits=5)
+    if folds:
+        return folds[0]
+    return [], []
+
+
+def build_gap_replay_folds(df: pd.DataFrame, actual_gaps: dict = None):
+    """
+    V14 legacy stub. Returns StratifiedGroupKFold folds.
+    V21: gap=0. actual_gaps ignored.
+    """
+    return build_stratified_group_cv_folds(df, n_splits=WF_NUM_FOLDS)
+
+
+def build_walk_forward_folds(df: pd.DataFrame):
+    """
+    Legacy stub. Delegates to build_stratified_group_cv_folds().
+    """
+    return build_stratified_group_cv_folds(df, n_splits=WF_NUM_FOLDS)
