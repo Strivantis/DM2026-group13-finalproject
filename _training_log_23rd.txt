@@ -1,0 +1,273 @@
+=====================================================================================
+Drought Forecasting Pipeline  v23
+13-Week Full Tabular Flattening (507 features)  |  Median Ensemble
+StratifiedGroupKFold CV  |  L1 (MAE) Objective  |  OOF StandardScaler
+=====================================================================================
+
+v23 Changes over v22:
+  [1] Tabular flattening expanded: (N, 39) -> (N, 507).
+      ALL 13 context weeks flattened into wide feature matrix.
+      Column names: <feat>_w1 ... <feat>_w13 (13 x 39 = 507).
+  [2] n_estimators: 1500 -> 5000  (deep budget for 507-dim space).
+  [3] learning_rate: 0.04 -> 0.02  (stable convergence over wide matrix).
+  [4] Ensemble blending: np.mean -> np.median  (aligns with L1 target).
+  [5] No manual thresholding. np.clip(pred, 0.0, 5.0) safety guard only.
+
+LGBM Hyperparameters per-week model:
+  objective        = 'regression_l1'
+  learning_rate    = 0.02
+  colsample_bytree = 0.75
+  subsample        = 0.75
+  n_estimators     = 5000  (early stopping patience=50)
+  n_jobs           = -1  (all CPU cores)
+  random_state     = 42
+
+CV Strategy  : 5-Fold StratifiedGroupKFold (unchanged from v21/v22)
+  N_FOLDS      : 5
+  Group        : region_id
+  Strata       : 10-quantile bins of per-region historical mean score
+  Train        : 80% of regions per fold (geography-unseen)
+  Val          : 20% of regions per fold (completely held-out)
+
+Inference    : MEDIAN across 5 folds (per week) -- aligns with L1.
+               np.clip(final_pred, 0.0, 5.0) safety guard applied.
+               NO Sigmoid gate, NO hurdle multiplication, NO thresholding.
+
+Loading processed data ...
+  train raw: (1757936, 43)  |  test raw: (29224, 40)
+  train regions: 2248  |  test regions: 2248
+
+[v23 Feature Validation]
+  v week_sin, week_cos present.
+  v No 8w/13w rolling features (domain-shift columns absent).
+  [INFO] Adversarial columns in raw CSV (will be pruned by refine_features): ['wind_max']
+  v v19 enriched weekly statistics confirmed present.
+
+[Data Leakage Check]
+  v No raw-score autoregressive features in FEATURE_COLS.
+  FEATURE_COLS (39): ['prec', 'surf_pre', 'humidity', 'tmp', 'tmp_max', 'tmp_min', 'tmp_range', 'wind', 'wind_min', 'wind_range', 'tmp_week_max', 'tmp_week_min', 'tmp_week_std', 'humidity_week_max', 'humidity_week_min', 'humidity_week_std', 'wind_week_max', 'wind_week_min', 'wind_week_std', 'prec_week_max', 'surf_pre_week_max', 'week_sin', 'week_cos', 'prec_roll_sum_4w', 'tmp_roll_mean_4w', 'humidity_roll_mean_4w', 'tmp_lag1w', 'humidity_lag1w', 'prec_lag1w', 'wind_lag1w', 'tmp_lag2w', 'humidity_lag2w', 'prec_lag2w', 'wind_lag2w', 'pet', 'deficit', 'deficit_roll_cum_4w', 'region_mean_score', 'region_zero_prob']
+
+Refining features (drought proxy index + log1p prec + v22 pruning) ...
+  train after refinement: (1753440, 44)  |  test: (29224, 41)
+
+[Training Target Distribution]
+  mean=0.8352  std=1.2611  min=0.00  max=5.00
+  Zero-inflation: 59.64% of training scores == 0.0
+  LightGBM regression_l1 (Conditional Median) is optimal for 59.64% zero-inflation.
+  score > 1.0: 23.09%  [404,840 samples]
+  score > 2.0: 12.49%  [219,066 samples]
+  score > 3.0: 5.76%  [100,984 samples]
+  score > 4.0: 1.82%  [31,908 samples]
+
+[v23] Feature columns and flat input shape ...
+  Base features (excl. TE): 37
+  Total with TE: 39
+  v23 flat input_size = 507  (WINDOW_SIZE=13 x FEATURE_COLS=39 = 507)
+
+=====================================================================================
+5-Fold StratifiedGroupKFold CV  [v23 – 13-Week Full Tabular LightGBM]
+  Group  : region_id
+  Strata : 10-quantile bins of per-region historical mean drought score
+  Train  : 80% of regions per fold (geographically unseen)
+  Val    : 20% of regions per fold (completely held-out)
+=====================================================================================
+
+  Folds built: 5
+  Fold 0: train_groups=1,799  val_groups=449
+  Fold 1: train_groups=1,799  val_groups=449
+  Fold 2: train_groups=1,798  val_groups=450
+  Fold 3: train_groups=1,798  val_groups=450
+  Fold 4: train_groups=1,798  val_groups=450
+
+=====================================================================================
+FOLD 1 / 5  [v23 LightGBM 13-Week Flat – Direct Multi-Step]
+  train_groups: 1,799  |  val_groups: 449
+=====================================================================================
+  [OOF TE] Train regions in fold: 1799
+  [OOF TE]  Val regions in fold : 449
+  [OOF TE] global_mean_score=0.8352  global_zero_prob=0.5965
+  feat_cols available: 39 / 39
+
+  [V23 Tabular Flattening] Flattening all 13 context weeks ...
+  Expected flat width: 13 weeks x 39 feats = 507 cols
+  X_train : (1372637, 507)  |  y_train : (1372637, 5)
+  X_val   : (342587, 507)    |  y_val   : (342587, 5)
+
+  [OOF Scaler] Fitting StandardScaler on 1,372,637 training rows (507 flat features) ...
+  X_test  : (2248, 507)  (2248 test regions x 507 flat features)
+
+  Training 5 LGBMRegressor models (one per forecast week) ...
+    Week 1: best_iter=5000  val_MAE=0.4971
+    Week 2: best_iter=5000  val_MAE=0.5030
+    Week 3: best_iter=5000  val_MAE=0.5124
+    Week 4: best_iter=5000  val_MAE=0.5103
+    Week 5: best_iter=5000  val_MAE=0.5142
+
+  [Fold 0] Week MAEs : W1=0.4971  W2=0.5030  W3=0.5124  W4=0.5103  W5=0.5142
+  [Fold 0] Mean Val MAE : 0.5074
+  Fold scaler saved -> /home/sean/文件/NYCU/114-2/Data Mining/FinalProject/models/scaler_fold_0.pkl
+
+=====================================================================================
+FOLD 2 / 5  [v23 LightGBM 13-Week Flat – Direct Multi-Step]
+  train_groups: 1,799  |  val_groups: 449
+=====================================================================================
+  [OOF TE] Train regions in fold: 1799
+  [OOF TE]  Val regions in fold : 449
+  [OOF TE] global_mean_score=0.8346  global_zero_prob=0.5963
+  feat_cols available: 39 / 39
+
+  [V23 Tabular Flattening] Flattening all 13 context weeks ...
+  Expected flat width: 13 weeks x 39 feats = 507 cols
+  X_train : (1372637, 507)  |  y_train : (1372637, 5)
+  X_val   : (342587, 507)    |  y_val   : (342587, 5)
+
+  [OOF Scaler] Fitting StandardScaler on 1,372,637 training rows (507 flat features) ...
+  X_test  : (2248, 507)  (2248 test regions x 507 flat features)
+
+  Training 5 LGBMRegressor models (one per forecast week) ...
+    Week 1: best_iter=5000  val_MAE=0.4936
+    Week 2: best_iter=5000  val_MAE=0.5029
+    Week 3: best_iter=5000  val_MAE=0.5069
+    Week 4: best_iter=5000  val_MAE=0.5099
+    Week 5: best_iter=5000  val_MAE=0.5168
+
+  [Fold 1] Week MAEs : W1=0.4936  W2=0.5029  W3=0.5069  W4=0.5099  W5=0.5168
+  [Fold 1] Mean Val MAE : 0.5060
+  Fold scaler saved -> /home/sean/文件/NYCU/114-2/Data Mining/FinalProject/models/scaler_fold_1.pkl
+
+=====================================================================================
+FOLD 3 / 5  [v23 LightGBM 13-Week Flat – Direct Multi-Step]
+  train_groups: 1,798  |  val_groups: 450
+=====================================================================================
+  [OOF TE] Train regions in fold: 1798
+  [OOF TE]  Val regions in fold : 450
+  [OOF TE] global_mean_score=0.8354  global_zero_prob=0.5970
+  feat_cols available: 39 / 39
+
+  [V23 Tabular Flattening] Flattening all 13 context weeks ...
+  Expected flat width: 13 weeks x 39 feats = 507 cols
+  X_train : (1371874, 507)  |  y_train : (1371874, 5)
+  X_val   : (343350, 507)    |  y_val   : (343350, 5)
+
+  [OOF Scaler] Fitting StandardScaler on 1,371,874 training rows (507 flat features) ...
+  X_test  : (2248, 507)  (2248 test regions x 507 flat features)
+
+  Training 5 LGBMRegressor models (one per forecast week) ...
+    Week 1: best_iter=5000  val_MAE=0.4987
+    Week 2: best_iter=5000  val_MAE=0.5076
+    Week 3: best_iter=5000  val_MAE=0.5122
+    Week 4: best_iter=5000  val_MAE=0.5218
+    Week 5: best_iter=5000  val_MAE=0.5181
+
+  [Fold 2] Week MAEs : W1=0.4987  W2=0.5076  W3=0.5122  W4=0.5218  W5=0.5181
+  [Fold 2] Mean Val MAE : 0.5117
+  Fold scaler saved -> /home/sean/文件/NYCU/114-2/Data Mining/FinalProject/models/scaler_fold_2.pkl
+
+=====================================================================================
+FOLD 4 / 5  [v23 LightGBM 13-Week Flat – Direct Multi-Step]
+  train_groups: 1,798  |  val_groups: 450
+=====================================================================================
+  [OOF TE] Train regions in fold: 1798
+  [OOF TE]  Val regions in fold : 450
+  [OOF TE] global_mean_score=0.8347  global_zero_prob=0.5967
+  feat_cols available: 39 / 39
+
+  [V23 Tabular Flattening] Flattening all 13 context weeks ...
+  Expected flat width: 13 weeks x 39 feats = 507 cols
+  X_train : (1371874, 507)  |  y_train : (1371874, 5)
+  X_val   : (343350, 507)    |  y_val   : (343350, 5)
+
+  [OOF Scaler] Fitting StandardScaler on 1,371,874 training rows (507 flat features) ...
+  X_test  : (2248, 507)  (2248 test regions x 507 flat features)
+
+  Training 5 LGBMRegressor models (one per forecast week) ...
+    Week 1: best_iter=5000  val_MAE=0.5009
+    Week 2: best_iter=5000  val_MAE=0.5029
+    Week 3: best_iter=4999  val_MAE=0.5099
+    Week 4: best_iter=5000  val_MAE=0.5044
+    Week 5: best_iter=5000  val_MAE=0.5152
+
+  [Fold 3] Week MAEs : W1=0.5009  W2=0.5029  W3=0.5099  W4=0.5044  W5=0.5152
+  [Fold 3] Mean Val MAE : 0.5067
+  Fold scaler saved -> /home/sean/文件/NYCU/114-2/Data Mining/FinalProject/models/scaler_fold_3.pkl
+
+=====================================================================================
+FOLD 5 / 5  [v23 LightGBM 13-Week Flat – Direct Multi-Step]
+  train_groups: 1,798  |  val_groups: 450
+=====================================================================================
+  [OOF TE] Train regions in fold: 1798
+  [OOF TE]  Val regions in fold : 450
+  [OOF TE] global_mean_score=0.8363  global_zero_prob=0.5953
+  feat_cols available: 39 / 39
+
+  [V23 Tabular Flattening] Flattening all 13 context weeks ...
+  Expected flat width: 13 weeks x 39 feats = 507 cols
+  X_train : (1371874, 507)  |  y_train : (1371874, 5)
+  X_val   : (343350, 507)    |  y_val   : (343350, 5)
+
+  [OOF Scaler] Fitting StandardScaler on 1,371,874 training rows (507 flat features) ...
+  X_test  : (2248, 507)  (2248 test regions x 507 flat features)
+
+  Training 5 LGBMRegressor models (one per forecast week) ...
+    Week 1: best_iter=4999  val_MAE=0.4982
+    Week 2: best_iter=5000  val_MAE=0.5024
+    Week 3: best_iter=5000  val_MAE=0.5072
+    Week 4: best_iter=5000  val_MAE=0.5161
+    Week 5: best_iter=5000  val_MAE=0.5200
+
+  [Fold 4] Week MAEs : W1=0.4982  W2=0.5024  W3=0.5072  W4=0.5161  W5=0.5200
+  [Fold 4] Mean Val MAE : 0.5088
+  Fold scaler saved -> /home/sean/文件/NYCU/114-2/Data Mining/FinalProject/models/scaler_fold_4.pkl
+
+=====================================================================================
+5-Fold Cross-Validation Summary  [v23 13-Week Full Flat LightGBM]
+=====================================================================================
+  Fold 0: W1=0.4971  W2=0.5030  W3=0.5124  W4=0.5103  W5=0.5142  ->  Mean=0.5074
+  Fold 1: W1=0.4936  W2=0.5029  W3=0.5069  W4=0.5099  W5=0.5168  ->  Mean=0.5060
+  Fold 2: W1=0.4987  W2=0.5076  W3=0.5122  W4=0.5218  W5=0.5181  ->  Mean=0.5117
+  Fold 3: W1=0.5009  W2=0.5029  W3=0.5099  W4=0.5044  W5=0.5152  ->  Mean=0.5067
+  Fold 4: W1=0.4982  W2=0.5024  W3=0.5072  W4=0.5161  W5=0.5200  ->  Mean=0.5088
+
+  Overall CV MAE : 0.5081  +-  0.0020
+  Best Fold      : Fold 1 (MAE=0.5060)
+
+  Per-week CV MAE breakdown:
+    Week 1: mean=0.4977  std=0.0024
+    Week 2: mean=0.5038  std=0.0019
+    Week 3: mean=0.5097  std=0.0023
+    Week 4: mean=0.5125  std=0.0059
+    Week 5: mean=0.5168  std=0.0021
+
+[v23] Ensemble Blending (5-fold MEDIAN -- aligns with L1/MAE target) ...
+  No Hurdle gate. No Sigmoid. No manual thresholding.
+  np.median across folds replaces np.mean (v22) for L1-consistent blending.
+  preds_stack shape  : (5, 2248, 5)
+  median_preds shape : (2248, 5)
+  median_preds stats : mean=1.3975  std=0.9565  min=-0.0282  max=4.3809
+
+[Submission Prediction Diagnostics]
+  n=11,240  mean=1.3975  std=0.9565
+  p50=1.2368  p75=2.0542  p90=2.8098  p95=3.2003  p99=3.7620  max=4.3809
+  zero-fraction (exact 0.0): 0.0002
+  v p99 >= 2.0 -- prediction diversity is healthy.
+  Train zero-inflation was 0.5964
+
+Formatting submission.csv ...
+  v Submission assertion passed: 2248 rows, 6 columns.
+  v No NaN values in submission.
+  v Train/test regions match (2248).
+  v All predictions in [0, 5]  (np.clip guard enforced).
+
+  submission.csv -> /home/sean/文件/NYCU/114-2/Data Mining/FinalProject/submission.csv
+  Rows (excl. header): 2248
+  Columns: ['region_id', 'pred_week1', 'pred_week2', 'pred_week3', 'pred_week4', 'pred_week5']
+
+  Preview:
+region_id  pred_week1  pred_week2  pred_week3  pred_week4  pred_week5
+       R1    0.747465    0.788950    0.659545    0.612118    0.800214
+    R1001    1.462207    1.200030    1.095683    0.718419    0.575044
+    R1002    1.323612    1.303046    0.963313    1.036778    0.612344
+    R1005    1.925208    1.779303    1.501898    1.055899    1.032758
+    R1006    2.484604    2.454950    2.263528    1.983452    1.939081
+
+Total elapsed: 12338.0s  (205.6 min)

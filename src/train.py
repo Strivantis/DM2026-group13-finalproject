@@ -1,63 +1,69 @@
 """
-train.py -- Drought Score Forecasting Pipeline (v22 – Tabular LightGBM)
-========================================================================
+train.py -- Drought Score Forecasting Pipeline (v23 – 13-Week Full Tabular Flattening)
+========================================================================================
 Usage:
     python src/train.py
 
 Outputs:
-    submission.csv                  -- Kaggle submission (2248 rows × 6 cols)
-    models/lgbm_fold{k}_week{w}.txt -- Best LGBM model per fold × week (25 total)
+    submission.csv                  -- Kaggle submission (2248 rows x 6 cols)
+    models/lgbm_fold{k}_week{w}.txt -- Best LGBM model per fold x week (25 total)
     models/scaler_fold_{k}.pkl      -- StandardScaler per fold (5 total)
-    _training_log_22nd.txt          -- Full console log
+    _training_log_23rd.txt          -- Full console log
 
-Key improvements (v22 – Extreme Tabular Simplification)
----------------------------------------------------------
-  1. PyTorch ABOLISHED:
+Key improvements (v23 – 13-Week Full Tabular Flattening + Median Ensemble)
+---------------------------------------------------------------------------
+  1. 13-Week Full Tabular Flattening:
+       Input shape changes from (N_samples, 39) [v22 single-row] to
+       (N_samples, 507) [v23: 13 weeks x 39 features wide matrix].
+       ALL 13 rows of each sliding window are flattened row-major into a
+       single wide feature vector. Column names follow <feat>_w1 .. <feat>_w13
+       so LightGBM can construct temporal split paths across the full history.
+
+  2. Expanded Tree Budget:
+       n_estimators raised from 1500 to 5000 to allow deep feature interaction
+       over the expanded 507-dimensional feature space.
+       learning_rate lowered from 0.04 to 0.02 for stable convergence.
+
+  3. Median Ensemble Blending:
+       Post-fold ensembling switches from np.mean to np.median, aligning
+       the blending operation with the L1 (MAE) optimization target.
+       All manual thresholding abolished. np.clip(pred, 0.0, 5.0) retained
+       as final safety guard only.
+
+  4. PyTorch ABOLISHED (carried over from v22):
        No BiLSTM, no TCN, no DataLoaders, no AMP, no gradient clipping,
        no CosineAnnealing.  Pure NumPy + Scikit-Learn + LightGBM pipeline.
 
-  2. Tabular Flattening (3D → 2D):
-       Input shape changes from (N, 13, 40) → (N_samples, 39).
-       For each sliding window [i, i+13), only the 13th week (last row)
-       is extracted as the feature vector.
-       Rolling statistics (_roll_sum_4w, _week_max/min/std) inside that
-       row already encode all 13-week historical momentum.
-
-  3. Feature Pruning (v22 adversarial guard):
+  5. Feature Pruning (v22 adversarial guard, unchanged):
        DROP  wind_max  (collinearity > 0.95 with wind)
        DROP  dow_sin   (lowest permutation importance)
        DROP  dp_tmp    (collinearity > 0.9999 with tmp, v19 guard retained)
        DROP  wb_tmp    (same)
-       RESULT: 39 retained features.
+       RESULT: 39 base features -> 507 flat columns after 13-week expansion.
 
-  4. Direct Multi-Step LightGBM Regressors:
+  6. Direct Multi-Step LightGBM Regressors (unchanged from v22):
        For each of the 5 CV folds, train 5 independent LGBMRegressors
-       (one per forecast week: pred_week1 … pred_week5).
-       objective='regression_l1'  →  fits Conditional Median natively.
+       (one per forecast week: pred_week1 ... pred_week5).
+       objective='regression_l1'  ->  fits Conditional Median natively.
        MAE is the Kaggle evaluation metric; L1 objective aligns perfectly.
        Early stopping patience = 50 rounds on per-fold OOF validation MAE.
 
-  5. StratifiedGroupKFold CV (5-Fold):  UNCHANGED from v21.
+  7. StratifiedGroupKFold CV (5-Fold):  UNCHANGED from v21/v22.
        Group  = region_id  (atomic unit).
        Strata = 10-quantile bins of per-region historical mean score.
        Train  = 80% of regions; Val = 20% of regions (held-out geography).
 
-  6. OOF Scaler Alignment:
+  8. OOF Scaler Alignment (unchanged):
        StandardScaler fitted ONLY on training fold rows, then applied to
        val rows and the final test matrix.  No data leakage.
-
-  7. Ensemble Inference (No Hurdle Gate):
-       For each target week, average predictions across the 5 folds.
-       NO Sigmoid multiplication, NO probability hard-clamping.
-       np.clip(final_pred, 0.0, 5.0) as final safety guard.
 
 LightGBM Hyperparameters (per-week model)
 -----------------------------------------
     objective    = 'regression_l1'   # MAE/median fitting; handles 60% zeroes
-    learning_rate= 0.04
+    learning_rate= 0.02              # v23: lowered from 0.04 for stable deep learning
     colsample_bytree = 0.75          # feature sub-sampling vs. covariate shift
     subsample    = 0.75              # row sub-sampling for variance reduction
-    n_estimators = 1500              # large budget with early stopping
+    n_estimators = 5000              # v23: expanded from 1500 for 507-dim feature space
     random_state = 42
     n_jobs       = -1                # maximise i9 CPU core utilisation
     early_stopping_rounds = 50       # patience on OOF val MAE
@@ -84,6 +90,7 @@ from src.dataset import (
     build_stratified_group_cv_folds,
     build_tabular_dataset,
     build_tabular_test,
+    make_flat_col_names,
     FEATURE_COLS,
     WINDOW_SIZE,
     HORIZON,
@@ -111,11 +118,14 @@ MODELS_DIR    = os.path.join(ROOT, "models")
 os.makedirs(MODELS_DIR, exist_ok=True)
 
 N_FOLDS             = 5     # StratifiedGroupKFold 5-folds
-LGBM_N_ESTIMATORS   = 1500  # max trees (early stopping will reduce)
-LGBM_LR             = 0.04
+LGBM_N_ESTIMATORS   = 5000  # v23: expanded from 1500 for 507-dim feature space
+LGBM_LR             = 0.02  # v23: lowered from 0.04 for stable deep convergence
 LGBM_COLSAMPLE      = 0.75
 LGBM_SUBSAMPLE      = 0.75
 LGBM_EARLY_STOP     = 50    # patience (rounds without improvement)
+
+# v23: 39 base features x 13 weeks = 507 flat columns
+N_FLAT_FEATURES     = WINDOW_SIZE * len(FEATURE_COLS)   # 507
 
 
 # ---------------------------------------------------------------------------
@@ -185,43 +195,39 @@ def main():
 
     # -- 0. Pipeline description -----------------------------------------------
     log("=" * 85)
-    log("Drought Forecasting Pipeline  v22")
-    log("Extreme Tabular Simplification  |  Direct Multi-Step LightGBM Regressors")
+    log("Drought Forecasting Pipeline  v23")
+    log("13-Week Full Tabular Flattening (507 features)  |  Median Ensemble")
     log("StratifiedGroupKFold CV  |  L1 (MAE) Objective  |  OOF StandardScaler")
     log("=" * 85)
     log("")
-    log("Paradigm Shift (v22):")
-    log("  V21 : BiLSTM + TCN Hurdle model, PyTorch 3D tensors (B, 13, 40).")
-    log("  V22 : Tabular flattening to (N_samples, 39) — only 13th week extracted.")
-    log("        5 independent LGBMRegressors per fold, one per forecast week.")
-    log("        Objective = regression_l1 → Conditional Median → native MAE.")
-    log("        No Hurdle gate, no probability sigmoid, no BCE loss.")
-    log("")
-    log("Feature Pruning (v22 adversarial guard):")
-    log("  DROPPED wind_max  (collinearity > 0.95 with wind)")
-    log("  DROPPED dow_sin   (lowest permutation importance)")
-    log("  DROPPED dp_tmp / wb_tmp  (collinearity > 0.9999 with tmp, v19 guard)")
-    log("  RETAINED 39 features: _roll_sum_4w, _week_max/min/std dominant.")
+    log("v23 Changes over v22:")
+    log("  [1] Tabular flattening expanded: (N, 39) -> (N, 507).")
+    log("      ALL 13 context weeks flattened into wide feature matrix.")
+    log("      Column names: <feat>_w1 ... <feat>_w13 (13 x 39 = 507).")
+    log("  [2] n_estimators: 1500 -> 5000  (deep budget for 507-dim space).")
+    log("  [3] learning_rate: 0.04 -> 0.02  (stable convergence over wide matrix).")
+    log("  [4] Ensemble blending: np.mean -> np.median  (aligns with L1 target).")
+    log("  [5] No manual thresholding. np.clip(pred, 0.0, 5.0) safety guard only.")
     log("")
     log("LGBM Hyperparameters per-week model:")
-    log(f"  objective      = 'regression_l1'")
-    log(f"  learning_rate  = {LGBM_LR}")
+    log(f"  objective        = 'regression_l1'")
+    log(f"  learning_rate    = {LGBM_LR}")
     log(f"  colsample_bytree = {LGBM_COLSAMPLE}")
-    log(f"  subsample      = {LGBM_SUBSAMPLE}")
-    log(f"  n_estimators   = {LGBM_N_ESTIMATORS}  (early stopping patience={LGBM_EARLY_STOP})")
-    log(f"  n_jobs         = -1  (all CPU cores)")
-    log(f"  random_state   = 42")
+    log(f"  subsample        = {LGBM_SUBSAMPLE}")
+    log(f"  n_estimators     = {LGBM_N_ESTIMATORS}  (early stopping patience={LGBM_EARLY_STOP})")
+    log(f"  n_jobs           = -1  (all CPU cores)")
+    log(f"  random_state     = 42")
     log("")
-    log("CV Strategy  : 5-Fold StratifiedGroupKFold (unchanged from v21)")
+    log("CV Strategy  : 5-Fold StratifiedGroupKFold (unchanged from v21/v22)")
     log(f"  N_FOLDS      : {N_FOLDS}")
     log(f"  Group        : region_id")
     log(f"  Strata       : 10-quantile bins of per-region historical mean score")
     log(f"  Train        : 80% of regions per fold (geography-unseen)")
     log(f"  Val          : 20% of regions per fold (completely held-out)")
     log("")
-    log("Inference    : Average predictions across 5 folds (per week).")
+    log("Inference    : MEDIAN across 5 folds (per week) -- aligns with L1.")
     log("               np.clip(final_pred, 0.0, 5.0) safety guard applied.")
-    log("               NO Sigmoid gate, NO hurdle multiplication.")
+    log("               NO Sigmoid gate, NO hurdle multiplication, NO thresholding.")
 
     # -- 1. Load data ----------------------------------------------------------
     log("\nLoading processed data ...")
@@ -242,7 +248,7 @@ def main():
     assert n_test_regions  == 2248, f"Expected 2248 test regions,  got {n_test_regions}"
 
     # -- 1b. Feature Validation ------------------------------------------------
-    log("\n[v22 Feature Validation]")
+    log("\n[v23 Feature Validation]")
     assert "week_sin" in train_raw.columns, "week_sin missing -- run preprocess.py first"
     assert "week_cos" in train_raw.columns, "week_cos missing -- run preprocess.py first"
     log("  v week_sin, week_cos present.")
@@ -305,18 +311,18 @@ def main():
         log(f"  score > {thresh:.1f}: {frac:.2f}%  [{int((all_scores > thresh).sum()):,} samples]")
 
     # -- 5. Feature columns and input shape ------------------------------------
-    log("\n[v22] Feature columns ...")
+    log("\n[v23] Feature columns and flat input shape ...")
     base_feat_cols = [c for c in FEATURE_COLS
                       if c in train_df.columns
                       and c not in ("region_mean_score", "region_zero_prob")]
     log(f"  Base features (excl. TE): {len(base_feat_cols)}")
     log(f"  Total with TE: {len(FEATURE_COLS)}")
-    input_size = len(FEATURE_COLS)
-    log(f"  input_size = {input_size}  (tabular row width; expected 39)")
+    log(f"  v23 flat input_size = {N_FLAT_FEATURES}  "
+        f"(WINDOW_SIZE={WINDOW_SIZE} x FEATURE_COLS={len(FEATURE_COLS)} = 507)")
 
     # -- 6. Build 5-Fold StratifiedGroupKFold CV splits -----------------------
     log(f"\n{'='*85}")
-    log(f"5-Fold StratifiedGroupKFold CV  [v22 – Tabular LightGBM]")
+    log(f"5-Fold StratifiedGroupKFold CV  [v23 – 13-Week Full Tabular LightGBM]")
     log(f"  Group  : region_id")
     log(f"  Strata : 10-quantile bins of per-region historical mean drought score")
     log(f"  Train  : 80% of regions per fold (geographically unseen)")
@@ -335,7 +341,7 @@ def main():
     for fold_k, (raw_train_groups, raw_val_groups) in enumerate(folds):
 
         log(f"\n{'='*85}")
-        log(f"FOLD {fold_k + 1} / {N_FOLDS}  [v22 LightGBM Tabular – Direct Multi-Step]")
+        log(f"FOLD {fold_k + 1} / {N_FOLDS}  [v23 LightGBM 13-Week Flat – Direct Multi-Step]")
         log(f"  train_groups: {len(raw_train_groups):,}  |  "
             f"val_groups: {len(raw_val_groups):,}")
         log(f"{'='*85}")
@@ -369,42 +375,49 @@ def main():
         feat_cols = [c for c in FEATURE_COLS if c in _sample_group.columns]
         log(f"  feat_cols available: {len(feat_cols)} / {len(FEATURE_COLS)}")
 
-        # -- 7d. Build tabular matrices (V22: 13th-week row extraction) --------
-        log(f"\n  [V22 Tabular Flattening] Extracting 13th-week row per window ...")
+        # -- 7d. Build tabular matrices (V23: full 13-week flattening) ---------
+        n_flat = WINDOW_SIZE * len(feat_cols)
+        log(f"\n  [V23 Tabular Flattening] Flattening all {WINDOW_SIZE} context weeks ...")
+        log(f"  Expected flat width: {WINDOW_SIZE} weeks x {len(feat_cols)} feats = {n_flat} cols")
         X_train, y_train, _ = build_tabular_dataset(aug_train_groups, feat_cols)
         X_val,   y_val,   _ = build_tabular_dataset(aug_val_groups,   feat_cols)
 
         log(f"  X_train : {X_train.shape}  |  y_train : {y_train.shape}")
         log(f"  X_val   : {X_val.shape}    |  y_val   : {y_val.shape}")
-        assert X_train.shape[1] == len(feat_cols), \
+        assert X_train.shape[1] == n_flat, \
             f"Feature column mismatch: X_train has {X_train.shape[1]} cols, " \
-            f"expected {len(feat_cols)}"
+            f"expected {n_flat}"
         assert y_train.shape[1] == HORIZON, \
             f"Target shape mismatch: expected {HORIZON} weeks, got {y_train.shape[1]}"
 
-        # -- 7e. Fit fold-specific StandardScaler (on train rows ONLY) --------
+        # -- 7e. Build flat column names for LightGBM feature name tracking ---
+        flat_col_names = make_flat_col_names(feat_cols, window=WINDOW_SIZE)
+        assert len(flat_col_names) == n_flat, \
+            f"Flat col name count mismatch: {len(flat_col_names)} vs {n_flat}"
+
+        # -- 7f. Fit fold-specific StandardScaler (on train rows ONLY) --------
         log(f"\n  [OOF Scaler] Fitting StandardScaler on {X_train.shape[0]:,} "
-            f"training rows ({X_train.shape[1]} features) ...")
+            f"training rows ({X_train.shape[1]} flat features) ...")
         fold_scaler   = StandardScaler()
         X_train_sc    = fold_scaler.fit_transform(X_train)
         X_val_sc      = fold_scaler.transform(X_val)
 
-        # -- 7f. Build test tabular matrix for this fold ----------------------
+        # -- 7g. Build test tabular matrix for this fold ----------------------
         test_df_fold  = _merge_te_to_df(test_df, te_map_fold, gm_fold, gzp_fold)
         X_test, test_region_ids = build_tabular_test(test_df_fold, feat_cols)
         X_test_sc     = fold_scaler.transform(X_test)
-        log(f"  X_test  : {X_test_sc.shape}  (2248 test regions)")
+        log(f"  X_test  : {X_test_sc.shape}  (2248 test regions x {n_flat} flat features)")
 
-        # -- 7g. Train 5 independent LGBMRegressors (one per forecast week) ---
+        # -- 7h. Train 5 independent LGBMRegressors (one per forecast week) ---
         log(f"\n  Training 5 LGBMRegressor models (one per forecast week) ...")
         fold_val_maes        = []
         fold_test_week_preds = []      # list of (n_test_regions,) arrays, length 5
 
-        # Convert to pandas DataFrame so LightGBM carries feature names through
-        # predict() and eliminates the "X does not have valid feature names" warning.
-        X_train_df = pd.DataFrame(X_train_sc, columns=feat_cols)
-        X_val_df   = pd.DataFrame(X_val_sc,   columns=feat_cols)
-        X_test_df  = pd.DataFrame(X_test_sc,  columns=feat_cols)
+        # Wrap in DataFrame with explicit flat column names so LightGBM
+        # carries feature names through predict() without warnings.
+        X_train_df = pd.DataFrame(X_train_sc, columns=flat_col_names)
+        X_val_df   = pd.DataFrame(X_val_sc,   columns=flat_col_names)
+        X_test_df  = pd.DataFrame(X_test_sc,  columns=flat_col_names)
 
         for week_idx in range(HORIZON):
             # .copy() avoids LightGBM "np.ndarray subset" peak-memory warning
@@ -412,14 +425,14 @@ def main():
             y_val_w = y_val[:,   week_idx].copy()   # (N_val,)   contiguous
 
             lgbm_model = LGBMRegressor(
-                objective      = "regression_l1",
-                learning_rate  = LGBM_LR,
+                objective        = "regression_l1",
+                learning_rate    = LGBM_LR,
                 colsample_bytree = LGBM_COLSAMPLE,
-                subsample      = LGBM_SUBSAMPLE,
-                n_estimators   = LGBM_N_ESTIMATORS,
-                random_state   = 42,
-                n_jobs         = -1,
-                verbose        = -1,
+                subsample        = LGBM_SUBSAMPLE,
+                n_estimators     = LGBM_N_ESTIMATORS,
+                random_state     = 42,
+                n_jobs           = -1,
+                verbose          = -1,
             )
 
             lgbm_model.fit(
@@ -457,10 +470,10 @@ def main():
         log(f"  [Fold {fold_k}] Mean Val MAE : {mean_fold_mae:.4f}")
         fold_results.append((fold_k, fold_val_maes, mean_fold_mae))
 
-        # -- 7h. Stack test predictions: (n_test_regions, 5) -----------------
+        # -- 7i. Stack test predictions: (n_test_regions, 5) -----------------
         fold_test_pred_matrix = np.stack(fold_test_week_preds, axis=1)
         # fold_test_week_preds: list of 5 arrays shape (n_test_regions,)
-        # → stack along axis=1 → (n_test_regions, 5)
+        # -> stack along axis=1 -> (n_test_regions, 5)
         fold_test_preds.append({
             "preds":      fold_test_pred_matrix,
             "region_ids": test_region_ids,
@@ -474,17 +487,17 @@ def main():
 
     # -- 8. Cross-fold summary -------------------------------------------------
     log(f"\n{'='*85}")
-    log(f"5-Fold Cross-Validation Summary  [v22 Direct Multi-Step LightGBM]")
+    log(f"5-Fold Cross-Validation Summary  [v23 13-Week Full Flat LightGBM]")
     log(f"{'='*85}")
     mean_cv_maes = []
     for fold_k, week_maes, mean_mae in fold_results:
         week_str = "  ".join(f"W{i+1}={m:.4f}" for i, m in enumerate(week_maes))
-        log(f"  Fold {fold_k}: {week_str}  →  Mean={mean_mae:.4f}")
+        log(f"  Fold {fold_k}: {week_str}  ->  Mean={mean_mae:.4f}")
         mean_cv_maes.append(mean_mae)
 
     overall_mean = float(np.mean(mean_cv_maes))
     overall_std  = float(np.std(mean_cv_maes))
-    log(f"\n  Overall CV MAE : {overall_mean:.4f}  ±  {overall_std:.4f}")
+    log(f"\n  Overall CV MAE : {overall_mean:.4f}  +-  {overall_std:.4f}")
     log(f"  Best Fold      : Fold {int(np.argmin(mean_cv_maes))} "
         f"(MAE={min(mean_cv_maes):.4f})")
 
@@ -495,9 +508,10 @@ def main():
         log(f"    Week {week_idx + 1}: mean={np.mean(week_maes_all):.4f}  "
             f"std={np.std(week_maes_all):.4f}")
 
-    # -- 9. Ensemble Inference (average across 5 folds) -----------------------
-    log(f"\n[v22] Ensemble Blending ({N_FOLDS}-fold simple average) ...")
-    log(f"  No Hurdle gate. No Sigmoid. Direct MAE regressor output averaged.")
+    # -- 9. Ensemble Inference (MEDIAN across 5 folds) -------------------------
+    log(f"\n[v23] Ensemble Blending ({N_FOLDS}-fold MEDIAN -- aligns with L1/MAE target) ...")
+    log(f"  No Hurdle gate. No Sigmoid. No manual thresholding.")
+    log(f"  np.median across folds replaces np.mean (v22) for L1-consistent blending.")
 
     # All folds predict the same 2248 regions in the same order (groupby sorts)
     all_region_ids = fold_test_preds[0]["region_ids"]
@@ -509,17 +523,17 @@ def main():
         [fp["preds"] for fp in fold_test_preds], axis=0
     )
 
-    # Simple average across folds
-    mean_preds = np.mean(preds_stack, axis=0)   # (n_regions, HORIZON)
+    # Median across folds (axis=0) - aligns with regression_l1 MAE objective
+    median_preds = np.median(preds_stack, axis=0)   # (n_regions, HORIZON)
 
-    log(f"  preds_stack shape : {preds_stack.shape}")
-    log(f"  mean_preds shape  : {mean_preds.shape}")
-    log(f"  mean_preds stats  : mean={mean_preds.mean():.4f}  "
-        f"std={mean_preds.std():.4f}  "
-        f"min={mean_preds.min():.4f}  max={mean_preds.max():.4f}")
+    log(f"  preds_stack shape  : {preds_stack.shape}")
+    log(f"  median_preds shape : {median_preds.shape}")
+    log(f"  median_preds stats : mean={median_preds.mean():.4f}  "
+        f"std={median_preds.std():.4f}  "
+        f"min={median_preds.min():.4f}  max={median_preds.max():.4f}")
 
     # Final safety clip: [0.0, 5.0]
-    final_preds = np.clip(mean_preds, 0.0, 5.0)
+    final_preds = np.clip(median_preds, 0.0, 5.0)
 
     # -- 10. Submission prediction diagnostics ---------------------------------
     log("\n[Submission Prediction Diagnostics]")
@@ -591,7 +605,7 @@ def main():
     elapsed = time.time() - t0
     log(f"\nTotal elapsed: {elapsed:.1f}s  ({elapsed/60:.1f} min)")
 
-    log_path = os.path.join(ROOT, "_training_log_22nd.txt")
+    log_path = os.path.join(ROOT, "_training_log_23rd.txt")
     with open(log_path, "w") as f:
         f.write("\n".join(log_lines))
     print(f"\nTraining log saved -> {log_path}")
@@ -600,7 +614,7 @@ def main():
         "fold_results":     fold_results,
         "overall_cv_mae":   overall_mean,
         "std_cv_mae":       overall_std,
-        "input_size":       input_size,
+        "input_size":       N_FLAT_FEATURES,
         "submission":       submission,
         "sub_p99":          p99,
         "zero_frac_final":  zero_frac_final,

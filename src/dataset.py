@@ -5,22 +5,33 @@ Custom tabular data builder for drought score multi-step forecasting.
 
 Design
 ------
-- V22 PARADIGM SHIFT: Tabular Flattening & Multi-Step LightGBM Regressors.
-  The 3D tensor (B, 13, 40) is completely abandoned.  For every historical
-  sliding window, ONLY the 13th week (most recent row) is extracted as the
-  feature vector.  This yields a standard 2D spreadsheet (N_samples, F).
+- V23 PARADIGM SHIFT: 13-Week Full Tabular Flattening.
+  The complete 13-week context window (all 39 features x 13 weeks) is
+  flattened into a wide 2D spreadsheet of shape (N_samples, 507).
+  Column names follow the pattern `<feature>_w1` through `<feature>_w13`
+  so LightGBM can construct split paths over the full temporal dimension.
 
 - Multi-step target: the next H=5 weekly `score` values (Y), stored as a
-  (N_samples, 5) matrix — one column per target week.
+  (N_samples, 5) matrix - one column per target week.
 
-- Region boundaries are strictly respected – windows NEVER cross regions.
+- Region boundaries are strictly respected - windows NEVER cross regions.
 - Feature pruning, log1p precipitation transform, and Drought Index
   (PET-based deficit 4-week rolling sum) are applied in refine_features().
+
+v23 Changes (13-Week Full Tabular Flattening)
+----------------------------------------------
+EXPAND: Instead of extracting only the 13th row, flatten ALL 13 rows of
+  each sliding window into a single wide feature vector of length 507
+  (13 weeks x 39 features).  Column naming: `<feat>_w1` through `<feat>_w13`.
+
+- build_tabular_dataset() now returns X of shape (N, 507).
+- build_tabular_test() now returns X of shape (2248, 507).
+- v22 feature pruning (39 retained features) is preserved unchanged.
 
 v22 Changes (Tabular Flattening + LightGBM)
 --------------------------------------------
 PARADIGM SHIFT: Abolish 3D sliding-window PyTorch Datasets.  Replace with
-  build_tabular_dataset() that extracts ONLY the 13th row (index 12) from
+  build_tabular_dataset() that extracted ONLY the 13th row (index 12) from
   each (i, i+13) window.  No DataLoader, no tensor wrappers.
 
 - NEW DROP_COLS pruning additions (v22 adversarial guard):
@@ -28,33 +39,20 @@ PARADIGM SHIFT: Abolish 3D sliding-window PyTorch Datasets.  Replace with
     dow_sin    : lowest permutation importance, seasonal encoding artefact.
   (dp_tmp, wb_tmp were already pruned in v19/v21 via DROP_COLS.)
 
-- FEATURE_COLS reduced from 40 → 39 (wind_max removed).
-
-- NEW primary builder: build_tabular_dataset(region_groups, feat_cols)
-    Input  : list of (group_df, i_min, i_max) entries (from fold builder)
-    Output : X (N, 39), y (N, 5), region_ids (N,)
-    Key    : For window starting at i, feature row = group_df.iloc[i+12]
-             (the 13th / last row of the 13-week context window).
-
-- NEW test builder: build_tabular_test(test_df, feat_cols)
-    Output : X (2248, 39), region_ids (2248,)
-    Key    : Per region, take last 13 rows; feature row = the 13th row.
-
-- DroughtDataset PyTorch class is RETAINED as a legacy stub so that any
-  residual imports do not crash (it simply raises NotImplementedError on use).
+- FEATURE_COLS reduced from 40 to 39 (wind_max removed).
 
 v21 Changes (Pure Continuous-Time Prediction + StratifiedGroupKFold CV)
 ------------------------------------------------------------------------
 ABOLISHED: all Gap mechanisms.  V21 gap = 0.
 NEW: build_stratified_group_cv_folds() (5-Fold StratifiedGroupKFold).
 
-v19 Changes (Tweedie Paradigm Shift – Enriched Features + Time-Decay)
+v19 Changes (Tweedie Paradigm Shift - Enriched Features + Time-Decay)
 ----------------------------------------------------------------------
-FEATURE_COLS expanded: 29 → 40 enriched weekly statistics.
+FEATURE_COLS expanded: 29 to 40 enriched weekly statistics.
 
-v16 Changes (Preprocessing Overhaul – Sequence Grouping & 13-Week Bounds)
+v16 Changes (Preprocessing Overhaul - Sequence Grouping & 13-Week Bounds)
 --------------------------------------------------------------------------
-WINDOW_SIZE reduced 26 → 13.  8w/13w rolling features removed.
+WINDOW_SIZE reduced 26 to 13.  8w/13w rolling features removed.
 """
 
 import numpy as np
@@ -92,7 +90,7 @@ DROP_COLS = ["wb_tmp", "dp_tmp", "surf_tmp", "wind_max", "dow_sin"]
 
 # Precipitation columns to log1p-transform (handle right-skew)
 # v16: removed prec_roll_sum_8w, prec_roll_sum_13w (features deleted)
-# v19: added prec_week_max (extreme event peak – also right-skewed)
+# v19: added prec_week_max (extreme event peak - also right-skewed)
 PREC_COLS = [
     "prec",
     "prec_week_max",
@@ -135,13 +133,33 @@ FEATURE_COLS = [
 
 
 # ---------------------------------------------------------------------------
+# V23 Flat Column Names: <feat>_w1 ... <feat>_w13  (507 total)
+# ---------------------------------------------------------------------------
+def make_flat_col_names(feat_cols: list, window: int = WINDOW_SIZE) -> list:
+    """
+    Generate the 507 flat column names used by the v23 wide matrix.
+    Order: feat_w1, feat_w2, ..., feat_w13 for each feat in feat_cols.
+    i.e.  [f0_w1, f0_w2, ..., f0_w13, f1_w1, ..., f38_w13]
+    Actually the ordering is week-major: all features for week 1, then week 2...
+    We use feat-major ordering to match numpy reshape(window * n_feats):
+      row.reshape(-1) after stacking window rows = [f0_w1,..,f38_w1, f0_w2,..,f38_w2, ...]
+    We name them accordingly: for week_idx w (1-indexed), feat f -> f_w{w}.
+    """
+    names = []
+    for w in range(1, window + 1):
+        for feat in feat_cols:
+            names.append(f"{feat}_w{w}")
+    return names
+
+
+# ---------------------------------------------------------------------------
 # Feature refinement
 # ---------------------------------------------------------------------------
 def refine_features(df: pd.DataFrame, is_train: bool = True) -> pd.DataFrame:
     """
     1. Compute Drought Index (PET/deficit 4w) BEFORE log1p (uses raw prec).
     2. Drop adversarial / collinear columns (wb_tmp, dp_tmp, surf_tmp,
-       wind_max, dow_sin – v22 expanded pruning).
+       wind_max, dow_sin - v22 expanded pruning).
     3. Apply log1p to all precipitation-related columns.
     4. Handle NaN rows:
        - Train: drop rows where any FEATURE_COL is NaN (lag head: first 2/region).
@@ -154,28 +172,28 @@ def refine_features(df: pd.DataFrame, is_train: bool = True) -> pd.DataFrame:
     """
     df = df.copy()
 
-    # Step 0 – drought index (must be before log1p of prec)
+    # Step 0 - drought index (must be before log1p of prec)
     df = add_drought_index(df, is_train=is_train)
 
-    # Step 1 – drop collinear / adversarial columns (v22: expanded)
+    # Step 1 - drop collinear / adversarial columns (v22: expanded)
     df.drop(columns=[c for c in DROP_COLS if c in df.columns], inplace=True)
 
-    # Step 2 – log1p precipitation (clip negatives to 0 first)
+    # Step 2 - log1p precipitation (clip negatives to 0 first)
     for col in PREC_COLS:
         if col in df.columns:
             df[col] = np.log1p(df[col].clip(lower=0))
 
-    # Step 3 – NaN handling (only on features present in df, excl. TE cols)
+    # Step 3 - NaN handling (only on features present in df, excl. TE cols)
     present_feats = [
         c for c in FEATURE_COLS
         if c in df.columns and c not in ("region_mean_score", "region_zero_prob")
     ]
 
     if is_train:
-        # Step 3a – drop NaN rows (the first 2 rows per region due to lag-2)
+        # Step 3a - drop NaN rows (the first 2 rows per region due to lag-2)
         df = df.dropna(subset=present_feats).reset_index(drop=True)
     else:
-        # Step 3b – ffill then zero-fill within each region
+        # Step 3b - ffill then zero-fill within each region
         for col in present_feats:
             df[col] = (
                 df.groupby("region_id")[col]
@@ -186,7 +204,7 @@ def refine_features(df: pd.DataFrame, is_train: bool = True) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# V22 Primary: Tabular Dataset Builders
+# V23 Primary: Tabular Dataset Builders (13-Week Full Flattening)
 # ---------------------------------------------------------------------------
 def build_tabular_dataset(
     region_groups: list,
@@ -195,8 +213,12 @@ def build_tabular_dataset(
     horizon: int = HORIZON,
 ):
     """
-    V22 Tabular Flattening: extract ONLY the 13th-week (last) row of each
-    sliding window as a feature vector.
+    V23 Tabular Flattening: flatten ALL `window` rows of each sliding window
+    into a single wide feature vector of length (window * len(feat_cols)) = 507.
+
+    For each window [i, i+window), the full matrix of shape (window, F) is
+    flattened row-major (week-major) into a 1D vector of shape (window*F,).
+    Column naming convention: feat_w1, feat_w2, ..., feat_w13 per feature.
 
     Parameters
     ----------
@@ -209,7 +231,8 @@ def build_tabular_dataset(
 
     Returns
     -------
-    X          : np.ndarray of shape (N_samples, len(feat_cols)), float32
+    X          : np.ndarray of shape (N_samples, window * len(feat_cols)), float32
+                 i.e. (N_samples, 507) with default settings
     y          : np.ndarray of shape (N_samples, horizon), float32, or None
     region_ids : np.ndarray of shape (N_samples,)
     """
@@ -228,7 +251,7 @@ def build_tabular_dataset(
 
         # Extract column arrays
         cols_present = [c for c in feat_cols if c in group.columns]
-        X_mat         = group[cols_present].values.astype(np.float32)   # (n, F)
+        X_mat = group[cols_present].values.astype(np.float32)   # (n, F)
 
         y_arr = (
             group["score"].values.astype(np.float32)
@@ -246,24 +269,27 @@ def build_tabular_dataset(
             if tgt_end > n:
                 break
 
-            # V22 KEY: extract ONLY the 13th (last) week of the context window
-            last_row = X_mat[end_feat - 1]       # shape (F,)
-            X_rows.append(last_row)
+            # V23 KEY: flatten ALL window rows into a single wide row
+            # X_mat[i:end_feat] has shape (window, F) -> reshape to (window*F,)
+            window_block = X_mat[i:end_feat]          # (window, F)
+            flat_row     = window_block.reshape(-1)   # (window*F,) = (507,)
+            X_rows.append(flat_row)
 
             if y_arr is not None:
                 y_rows.append(y_arr[tgt_start:tgt_end])  # (H,)
 
             region_id_lst.append(rid)
 
+    n_flat = window * len(feat_cols)
+
     if not X_rows:
-        n_feats = len(feat_cols)
         return (
-            np.empty((0, n_feats), dtype=np.float32),
+            np.empty((0, n_flat), dtype=np.float32),
             None,
             np.empty(0),
         )
 
-    X = np.array(X_rows, dtype=np.float32)                           # (N, F)
+    X = np.array(X_rows, dtype=np.float32)                           # (N, 507)
     y = np.array(y_rows, dtype=np.float32) if y_rows else None       # (N, H)
     region_ids = np.array(region_id_lst)
 
@@ -276,23 +302,24 @@ def build_tabular_test(
     window: int = WINDOW_SIZE,
 ):
     """
-    V22 Tabular Test Extractor.
+    V23 Tabular Test Extractor.
 
     For each region in test_df, take the LAST `window` rows (padding at front
-    if the region has fewer than `window` historical rows), then extract the
-    LAST (13th) row as the feature vector.
+    if the region has fewer than `window` historical rows), then flatten ALL
+    `window` rows into a single wide feature vector of length (window * F) = 507.
 
     This gives exactly one row per region (2248 rows for the competition).
 
     Parameters
     ----------
     test_df   : pd.DataFrame with refined features + TE columns
-    feat_cols : list of str — must match the scaler's fitted column order
+    feat_cols : list of str - must match the scaler's fitted column order
     window    : int, context window size (default 13)
 
     Returns
     -------
-    X          : np.ndarray of shape (n_regions, len(feat_cols)), float32
+    X          : np.ndarray of shape (n_regions, window * len(feat_cols)), float32
+                 i.e. (2248, 507) with default settings
     region_ids : np.ndarray of shape (n_regions,)
     """
     X_rows     = []
@@ -304,16 +331,19 @@ def build_tabular_test(
 
         # Pad at front if region is shorter than window
         if n < window:
-            pad_n   = window - n
-            pad_df  = pd.concat([group.iloc[[0]]] * pad_n + [group], ignore_index=True)
-            group   = pad_df
+            pad_n  = window - n
+            pad_df = pd.concat([group.iloc[[0]]] * pad_n + [group], ignore_index=True)
+            group  = pad_df
 
-        # Take the last `window` rows -> 13th row = last row
-        win_df  = group.iloc[-window:]
+        # Take the last `window` rows
+        win_df       = group.iloc[-window:]
         cols_present = [c for c in feat_cols if c in win_df.columns]
-        last_row = win_df[cols_present].values.astype(np.float32)[-1]   # (F,)
 
-        X_rows.append(last_row)
+        # V23 KEY: flatten all window rows into a single wide row
+        window_block = win_df[cols_present].values.astype(np.float32)  # (window, F)
+        flat_row     = window_block.reshape(-1)                         # (window*F,)
+
+        X_rows.append(flat_row)
         region_ids.append(region_id)
 
     X = np.array(X_rows, dtype=np.float32)
@@ -321,14 +351,14 @@ def build_tabular_test(
 
 
 # ---------------------------------------------------------------------------
-# V21 Primary CV: 5-Fold StratifiedGroupKFold builder (RETAINED for V22)
+# V21 Primary CV: 5-Fold StratifiedGroupKFold builder (RETAINED for V23)
 # ---------------------------------------------------------------------------
 def build_stratified_group_cv_folds(
     df: pd.DataFrame,
     n_splits: int = 5,
 ):
     """
-    V21/V22 Primary CV: 5-Fold StratifiedGroupKFold.
+    V21/V22/V23 Primary CV: 5-Fold StratifiedGroupKFold.
 
     Strategy:
     ---------
@@ -343,14 +373,14 @@ def build_stratified_group_cv_folds(
     Train sample construction (per region):
     ----------------------------------------
     ALL valid sliding windows with gap = 0:
-      X[i : i+WINDOW_SIZE]  →  Y[i+WINDOW_SIZE : i+WINDOW_SIZE+HORIZON]
+      X[i : i+WINDOW_SIZE]  ->  Y[i+WINDOW_SIZE : i+WINDOW_SIZE+HORIZON]
     i ranges from 0 to n - WINDOW_SIZE - HORIZON (inclusive).
 
     Val sample construction (per region):
     ---------------------------------------
     ALL valid sliding windows (same treatment as training regions).
 
-    Note: gap = 0 throughout (V21/V22 paradigm).
+    Note: gap = 0 throughout (V21/V22/V23 paradigm).
 
     Parameters
     ----------
@@ -424,14 +454,14 @@ def build_stratified_group_cv_folds(
 
 
 # ---------------------------------------------------------------------------
-# Helper – build full-train group list (train on ALL data for final model)
+# Helper - build full-train group list (train on ALL data for final model)
 # ---------------------------------------------------------------------------
 def build_full_train_groups(df: pd.DataFrame, actual_gaps: dict = None):
     """
     Build region groups using ALL rows (no held-out validation period).
     Used for final model training after CV is complete.
 
-    V21/V22: gap=0 throughout.  actual_gaps parameter retained for backward
+    V21/V22/V23: gap=0 throughout.  actual_gaps parameter retained for backward
     compat but is ignored.
     """
     train_groups = []
@@ -449,15 +479,15 @@ def build_full_train_groups(df: pd.DataFrame, actual_gaps: dict = None):
 
 
 # ---------------------------------------------------------------------------
-# Legacy PyTorch DroughtDataset stub  (V22: raises NotImplementedError)
+# Legacy PyTorch DroughtDataset stub  (V22+: raises NotImplementedError)
 # Retained so that any stale imports from older train.py versions do not crash
 # at module-load time.  Attempting to instantiate will raise clearly.
 # ---------------------------------------------------------------------------
 class DroughtDataset:
     """
-    V22 STUB: PyTorch DroughtDataset is ABOLISHED.
+    V22+ STUB: PyTorch DroughtDataset is ABOLISHED.
 
-    The V22 pipeline uses build_tabular_dataset() and build_tabular_test()
+    The V22/V23 pipeline uses build_tabular_dataset() and build_tabular_test()
     for pure NumPy/Pandas tabular matrices.  LightGBM does not use DataLoaders.
 
     Retained for import compatibility only.  Instantiation raises NotImplementedError.
@@ -465,7 +495,7 @@ class DroughtDataset:
 
     def __init__(self, *args, **kwargs):
         raise NotImplementedError(
-            "DroughtDataset (PyTorch 3D sliding window) is abolished in V22. "
+            "DroughtDataset (PyTorch 3D sliding window) is abolished in V22+. "
             "Use build_tabular_dataset() / build_tabular_test() instead."
         )
 
@@ -475,7 +505,7 @@ class DroughtDataset:
 # ---------------------------------------------------------------------------
 def compute_actual_gaps(train_df: pd.DataFrame, test_df: pd.DataFrame) -> dict:
     """
-    V21/V22 STUB: Gap computation is abolished.  Returns a dict mapping every
+    V21/V22/V23 STUB: Gap computation is abolished.  Returns a dict mapping every
     region_id to 0.  Retained for import compatibility with older train.py.
     """
     all_ids = set(train_df["region_id"].unique()) | set(test_df["region_id"].unique())
@@ -490,7 +520,7 @@ def build_temporal_shift_cv_folds(
     shift_weeks: int = TS_SHIFT_WEEKS,
 ):
     """
-    V21/V22 STUB: Temporal Shift CV is abolished.
+    V21/V22/V23 STUB: Temporal Shift CV is abolished.
     Delegates to build_stratified_group_cv_folds().
     Retained for import compatibility.
     """
@@ -503,7 +533,7 @@ def build_region_group_cv_folds(
     n_splits: int = 5,
 ):
     """
-    V18/V19 builder – now identical to V21/V22 primary builder.
+    V18/V19 builder - now identical to V21/V22/V23 primary builder.
     Retained for import compatibility.
     """
     return build_stratified_group_cv_folds(df, n_splits=n_splits)
@@ -514,7 +544,7 @@ def build_single_fold(df: pd.DataFrame, actual_gaps: dict = None):
     V15 legacy stub.  Returns (train_groups, val_groups) from first fold of
     StratifiedGroupKFold.
 
-    V21/V22: gap=0. actual_gaps ignored.
+    V21/V22/V23: gap=0. actual_gaps ignored.
     """
     folds = build_stratified_group_cv_folds(df, n_splits=5)
     if folds:
@@ -525,7 +555,7 @@ def build_single_fold(df: pd.DataFrame, actual_gaps: dict = None):
 def build_gap_replay_folds(df: pd.DataFrame, actual_gaps: dict = None):
     """
     V14 legacy stub. Returns StratifiedGroupKFold folds.
-    V21/V22: gap=0. actual_gaps ignored.
+    V21/V22/V23: gap=0. actual_gaps ignored.
     """
     return build_stratified_group_cv_folds(df, n_splits=WF_NUM_FOLDS)
 
