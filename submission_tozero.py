@@ -19,7 +19,7 @@ def process_submission(file_path, output_path):
 
 # 執行程式
 if __name__ == "__main__":
-    input_file = 'submission_22nd.csv'
-    output_file = 'submission_22nd_processed.csv'
+    input_file = 'submission_27th.csv'
+    output_file = 'submission_27th_processed.csv'
     
     process_submission(input_file, output_file)

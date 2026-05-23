@@ -18,6 +18,20 @@ Design
 - Feature pruning, log1p precipitation transform, and Drought Index
   (PET-based deficit) are applied in refine_features().
 
+v27 Changes (The Tweedie-Hurdle Paradigm)
+------------------------------------------
+EXPAND: Append 27 explicit trend differential features (w13 - w1) onto the
+  351-dimensional flat matrix, upgrading the input dimension to 378.
+
+  For each sequence row, the direct physical derivative is computed as:
+    feature_delta = feature_w13 - feature_w1
+  for all 27 pure meteorological and intra-week statistics.
+
+  Column naming: <feat>_delta  (27 columns appended after the 351 flat cols).
+
+- build_tabular_dataset() now returns X of shape (N_samples, 378) in v27.
+- build_tabular_test() now returns X of shape (2248, 378) in v27.
+
 v26 Changes (The Clean Slate -- Feature Purge)
 ----------------------------------------------
 PURGE: All lag features (tmp_lag1w/2w, humidity_lag1w/2w, prec_lag1w/2w,
@@ -142,22 +156,29 @@ FEATURE_COLS = [
 
 # ---------------------------------------------------------------------------
 # V23 Flat Column Names: <feat>_w1 ... <feat>_w13  (351 total in v26)
+# V27 Delta Column Names: <feat>_delta              (27 total in v27)
+# Combined: 351 + 27 = 378 total columns in v27
 # ---------------------------------------------------------------------------
 def make_flat_col_names(feat_cols: list, window: int = WINDOW_SIZE) -> list:
     """
     Generate the flat column names used by the v23+ wide matrix.
     v26: 27 features x 13 weeks = 351 columns.
+    v27: additionally appends 27 delta columns -> 378 total.
     Order: feat_w1, feat_w2, ..., feat_w13 for each feat in feat_cols.
     i.e.  [f0_w1, f0_w2, ..., f0_w13, f1_w1, ..., f26_w13]
     Week-major ordering matches numpy reshape(window * n_feats):
       row.reshape(-1) after stacking window rows =
         [f0_w1,..,f26_w1, f0_w2,..,f26_w2, ...]
     For week_idx w (1-indexed), feat f -> f_w{w}.
+    v27 delta columns appended as: [f0_delta, f1_delta, ..., f26_delta]
     """
     names = []
     for w in range(1, window + 1):
         for feat in feat_cols:
             names.append(f"{feat}_w{w}")
+    # v27: append explicit trend delta column names
+    for feat in feat_cols:
+        names.append(f"{feat}_delta")
     return names
 
 
@@ -227,9 +248,15 @@ def build_tabular_dataset(
     into a single wide feature vector of length (window * len(feat_cols)).
     v26: 27 features x 13 weeks = 351 columns.
 
+    V27 EXPAND: Append 27 explicit trend differential features (w13 - w1)
+    directly after the 351-dim flat vector, yielding 378 dimensions total.
+    Delta computation:  feature_delta = feature_w13 - feature_w1
+    for each of the 27 features (feat_cols order is preserved).
+
     For each window [i, i+window), the full matrix of shape (window, F) is
-    flattened row-major (week-major) into a 1D vector of shape (window*F,).
-    Column naming convention: feat_w1, feat_w2, ..., feat_w13 per feature.
+    flattened row-major (week-major) into a 1D vector of shape (window*F,),
+    then the F delta values are concatenated -> (window*F + F,) = (378,) in v27.
+    Column naming convention: feat_w1, feat_w2, ..., feat_w13, feat_delta.
 
     Parameters
     ----------
@@ -242,8 +269,8 @@ def build_tabular_dataset(
 
     Returns
     -------
-    X          : np.ndarray of shape (N_samples, window * len(feat_cols)), float32
-                 i.e. (N_samples, 351) with v26 27-feature set
+    X          : np.ndarray of shape (N_samples, window * len(feat_cols) + len(feat_cols)), float32
+                 i.e. (N_samples, 378) with v27 27-feature set + 27 deltas
     y          : np.ndarray of shape (N_samples, horizon), float32, or None
     region_ids : np.ndarray of shape (N_samples,)
     """
@@ -284,23 +311,32 @@ def build_tabular_dataset(
             # X_mat[i:end_feat] has shape (window, F) -> reshape to (window*F,)
             window_block = X_mat[i:end_feat]          # (window, F)
             flat_row     = window_block.reshape(-1)   # (window*F,) = (351,) in v26
-            X_rows.append(flat_row)
+
+            # V27 KEY: compute explicit trend deltas (w13 - w1) for all F features
+            # window_block[-1] = week 13 values (shape F,)
+            # window_block[0]  = week 1  values (shape F,)
+            delta_row = window_block[-1] - window_block[0]   # (F,) = (27,) in v27
+
+            # Horizontal concatenation: 351 + 27 = 378 dimensions
+            full_row = np.concatenate([flat_row, delta_row])  # (378,)
+            X_rows.append(full_row)
 
             if y_arr is not None:
                 y_rows.append(y_arr[tgt_start:tgt_end])  # (H,)
 
             region_id_lst.append(rid)
 
-    n_flat = window * len(feat_cols)
+    n_flat_cols = len(feat_cols)
+    n_out = window * n_flat_cols + n_flat_cols  # 351 + 27 = 378
 
     if not X_rows:
         return (
-            np.empty((0, n_flat), dtype=np.float32),
+            np.empty((0, n_out), dtype=np.float32),
             None,
             np.empty(0),
         )
 
-    X = np.array(X_rows, dtype=np.float32)                           # (N, 351)
+    X = np.array(X_rows, dtype=np.float32)                           # (N, 378)
     y = np.array(y_rows, dtype=np.float32) if y_rows else None       # (N, H)
     region_ids = np.array(region_id_lst)
 
@@ -320,6 +356,10 @@ def build_tabular_test(
     `window` rows into a single wide feature vector of length (window * F).
     v26: 27 features x 13 weeks = 351.
 
+    V27 EXPAND: Append 27 explicit trend differential features (w13 - w1)
+    directly after the 351-dim flat vector, yielding 378 dimensions total.
+    Delta computation:  feature_delta = feature_w13 - feature_w1.
+
     This gives exactly one row per region (2248 rows for the competition).
 
     Parameters
@@ -330,8 +370,8 @@ def build_tabular_test(
 
     Returns
     -------
-    X          : np.ndarray of shape (n_regions, window * len(feat_cols)), float32
-                 i.e. (2248, 351) with v26 27-feature set
+    X          : np.ndarray of shape (n_regions, window * len(feat_cols) + len(feat_cols)), float32
+                 i.e. (2248, 378) with v27 27-feature set + 27 deltas
     region_ids : np.ndarray of shape (n_regions,)
     """
     X_rows     = []
@@ -355,7 +395,13 @@ def build_tabular_test(
         window_block = win_df[cols_present].values.astype(np.float32)  # (window, F)
         flat_row     = window_block.reshape(-1)                         # (window*F,)
 
-        X_rows.append(flat_row)
+        # V27 KEY: compute explicit trend deltas (w13 - w1) for all F features
+        delta_row = window_block[-1] - window_block[0]                  # (F,)
+
+        # Horizontal concatenation: 351 + 27 = 378 dimensions
+        full_row = np.concatenate([flat_row, delta_row])                # (378,)
+
+        X_rows.append(full_row)
         region_ids.append(region_id)
 
     X = np.array(X_rows, dtype=np.float32)
@@ -363,14 +409,14 @@ def build_tabular_test(
 
 
 # ---------------------------------------------------------------------------
-# V21 Primary CV: 5-Fold StratifiedGroupKFold builder (RETAINED for V26)
+# V21 Primary CV: 5-Fold StratifiedGroupKFold builder (RETAINED for V27)
 # ---------------------------------------------------------------------------
 def build_stratified_group_cv_folds(
     df: pd.DataFrame,
     n_splits: int = 5,
 ):
     """
-    V21/V22/V23/V26 Primary CV: 5-Fold StratifiedGroupKFold.
+    V21/V22/V23/V26/V27 Primary CV: 5-Fold StratifiedGroupKFold.
 
     Strategy:
     ---------
@@ -392,7 +438,7 @@ def build_stratified_group_cv_folds(
     ---------------------------------------
     ALL valid sliding windows (same treatment as training regions).
 
-    Note: gap = 0 throughout (V21/V22/V23/V26 paradigm).
+    Note: gap = 0 throughout (V21/V22/V23/V26/V27 paradigm).
 
     Parameters
     ----------
@@ -473,7 +519,7 @@ def build_full_train_groups(df: pd.DataFrame, actual_gaps: dict = None):
     Build region groups using ALL rows (no held-out validation period).
     Used for final model training after CV is complete.
 
-    V21/V22/V23/V26: gap=0 throughout.  actual_gaps parameter retained for
+    V21/V22/V23/V26/V27: gap=0 throughout.  actual_gaps parameter retained for
     backward compat but is ignored.
     """
     train_groups = []
@@ -499,7 +545,7 @@ class DroughtDataset:
     """
     V22+ STUB: PyTorch DroughtDataset is ABOLISHED.
 
-    The V22/V23/V26 pipeline uses build_tabular_dataset() and build_tabular_test()
+    The V22/V23/V26/V27 pipeline uses build_tabular_dataset() and build_tabular_test()
     for pure NumPy/Pandas tabular matrices.  LightGBM does not use DataLoaders.
 
     Retained for import compatibility only.  Instantiation raises NotImplementedError.
@@ -556,7 +602,7 @@ def build_single_fold(df: pd.DataFrame, actual_gaps: dict = None):
     V15 legacy stub.  Returns (train_groups, val_groups) from first fold of
     StratifiedGroupKFold.
 
-    V21/V22/V23/V26: gap=0. actual_gaps ignored.
+    V21/V22/V23/V26/V27: gap=0. actual_gaps ignored.
     """
     folds = build_stratified_group_cv_folds(df, n_splits=5)
     if folds:
@@ -567,7 +613,7 @@ def build_single_fold(df: pd.DataFrame, actual_gaps: dict = None):
 def build_gap_replay_folds(df: pd.DataFrame, actual_gaps: dict = None):
     """
     V14 legacy stub. Returns StratifiedGroupKFold folds.
-    V21/V22/V23/V26: gap=0. actual_gaps ignored.
+    V21/V22/V23/V26/V27: gap=0. actual_gaps ignored.
     """
     return build_stratified_group_cv_folds(df, n_splits=WF_NUM_FOLDS)
 

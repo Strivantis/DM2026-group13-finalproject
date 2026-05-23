@@ -1,57 +1,66 @@
 """
-train.py -- Drought Score Forecasting Pipeline (v26 -- The Clean Slate)
-=======================================================================
+train.py -- Drought Score Forecasting Pipeline (v27 -- The Tweedie-Hurdle Paradigm)
+====================================================================================
 Usage:
     python src/train.py
 
 Outputs:
     submission.csv                  -- Kaggle submission (2248 rows x 6 cols)
     models/lgbm_fold{k}_week{w}.pkl -- LightGBM checkpoint per fold x week (25 total)
-    _training_log_26th.txt          -- Full console log
+    _training_log_27th.txt          -- Full console log
 
-v26 Changes (The Clean Slate)
-------------------------------
-  ABOLISHED: PyTorch MLP (FlatDroughtMLP), Pinball Loss, AdamW, DataLoader,
-             CUDA tensor staging, StandardScaler.
+v27 Changes (The Tweedie-Hurdle Paradigm)
+------------------------------------------
+  EXPAND (dataset.py): 27 explicit trend differential features (w13 - w1)
+    appended to the 351-dimensional flat matrix -> 378 dimensions total.
+    feature_delta = feature_w13 - feature_w1  for all 27 meteorological features.
 
-  REASON: Adversarial Validation AUC = 1.0 in v25. Root cause identified as
-    cross-week rolling metrics and lag features creating artificial distribution
-    boundaries between Train and Test sets. With 13-Week Full Tabular Flattening,
-    week 12 IS the 1-week lag of week 13 -- lag features are redundant and harmful.
+  TRANSITION: LightGBM objective switched from regression_l1 to Compound
+    Poisson-Gamma Tweedie loss (objective='tweedie', tweedie_variance_power=1.5).
+    This natively models zero-inflated continuous targets by construction,
+    collapsing low-mass fractional noise into absolute zeroes mathematically.
 
-  FIX 1 -- Feature Purge (dataset.py):
-    All 8 lag tokens (tmp/humidity/prec/wind _lag1w/_lag2w) and 4 cross-week
-    rolling tokens (prec_roll_sum_4w, tmp_roll_mean_4w, humidity_roll_mean_4w,
-    deficit_roll_cum_4w) purged. FEATURE_COLS: 39 -> 27. Flat dim: 507 -> 351.
+  EXPAND: Tree capacity budget increased from 10,000 to 20,000 estimators.
+    Learning rate scaled down from 0.03 to 0.015 to protect against gradient
+    step explosion across the wider estimator budget.
+    num_leaves expanded from 31 to 63 to capture high-order interactions.
+    min_child_samples=100 for deep leaf regularization.
 
-  FIX 2 -- GPU LightGBM Mega-Tree:
-    5 independent LGBMRegressor models per fold (one per target week).
-    objective='regression_l1' natively tracks conditional median to handle
-    zero-inflation. device='gpu' offloads tree building to CUDA cores.
-    n_estimators=10000 with early_stopping(stopping_rounds=150).
+  EARLY STOPPING: stopping_rounds=250 (adjusted for slow lr=0.015 convergence).
+    eval_metric='mae' -- competition native metric prevents premature halting
+    on mathematical deviance divergence.
 
-  FIX 3 -- Post-Ensemble Median + Snap-to-Zero:
-    5-fold predictions blended via np.median (robust to fold outliers).
-    Snap-to-Zero gate: final_preds[final_preds < 0.15] = 0.0 -- eliminates
-    fractional floating-point noise while preserving true light drought signal.
+  ABOLISH: Manual Snap-to-Zero micro-wiper gate (< 0.15) completely removed.
+    Trust the integrated Tweedie exponential dispersion model to natively
+    collapse low-mass fractions without hand-crafted clamping constraints.
+
+  RETAIN: Pure np.median blending across 5 independent CV folds.
+    Final np.clip(0.0, 5.0) physical safety boundary restriction.
 
 Architecture / Optimization
 -----------------------------
     LGBMRegressor x 5 per fold (one per future week)
-    objective    : regression_l1  (MAE / conditional median)
-    device       : gpu
-    n_estimators : 10000
-    learning_rate: 0.03
-    colsample_bytree: 0.75
-    subsample    : 0.75
-    Early stop   : stopping_rounds=150, eval_metric='mae'
-    CV           : 5-Fold StratifiedGroupKFold, group=region_id
+    objective              : tweedie  (Compound Poisson-Gamma)
+    tweedie_variance_power : 1.5      (equal Poisson-Gamma balance)
+    device                 : gpu
+    n_estimators           : 15000
+    learning_rate          : 0.015
+    num_leaves             : 63
+    min_child_samples      : 100
+    colsample_bytree       : 0.75
+    subsample              : 0.75
+    Early stop             : stopping_rounds=250, eval_metric='mae'
+    CV                     : 5-Fold StratifiedGroupKFold, group=region_id
+
+Feature Space
+--------------
+    v27: 27 features x 13 weeks (351) + 27 explicit trend deltas = 378 dimensions
 
 Post-Processing
 ---------------
     Ensemble : np.median across 5 folds
-    Gate     : values < 0.15 snapped to 0.0
     Clip     : np.clip(0.0, 5.0) physical safety guard
+    (Snap-to-Zero gate abolished -- Tweedie handles this natively)
 """
 
 import os
@@ -67,6 +76,7 @@ import numpy as np
 import pandas as pd
 from lightgbm import LGBMRegressor
 from sklearn.preprocessing import StandardScaler
+import gc
 
 # -- project root on sys.path --------------------------------------------------
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -107,8 +117,8 @@ os.makedirs(MODELS_DIR, exist_ok=True)
 # Cross-validation
 N_FOLDS = 5
 
-# v26: 27 features x 13 weeks = 351 flat columns
-N_FLAT_FEATURES = WINDOW_SIZE * len(FEATURE_COLS)   # 351
+# v27: 27 features x 13 weeks (351) + 27 explicit trend deltas = 378 flat columns
+N_FLAT_FEATURES = WINDOW_SIZE * len(FEATURE_COLS) + len(FEATURE_COLS)   # 378
 
 
 # ---------------------------------------------------------------------------
@@ -173,33 +183,41 @@ def main():
 
     # -- 0. Pipeline description -----------------------------------------------
     log("=" * 90)
-    log("Drought Forecasting Pipeline  v26  (The Clean Slate)")
-    log("GPU LightGBM Mega-Tree  |  objective=regression_l1  |  n_estimators=10000")
-    log("Feature Purge: 39 -> 27 features (lags + cross-week rolling abolished)")
-    log("Post-Ensemble: np.median across 5 folds + Snap-to-Zero gate (< 0.15)")
+    log("Drought Forecasting Pipeline  v27  (The Tweedie-Hurdle Paradigm)")
+    log("GPU LightGBM Mega-Tree  |  objective=tweedie (p=1.5)  |  n_estimators=15000")
+    log("Feature Space: 27 features x 13 weeks (351) + 27 explicit deltas = 378 dims")
+    log("Post-Ensemble: np.median across 5 folds  |  Snap-to-Zero gate ABOLISHED")
     log("5-Fold StratifiedGroupKFold  |  5 LGBMRegressors per fold (one per week)")
     log("=" * 90)
     log("")
-    log("v26 Changes over v25.1:")
-    log("  [PURGE] All lag features (lag1w/lag2w for tmp/humidity/prec/wind) removed.")
-    log("  [PURGE] All cross-week rolling features (prec_roll_sum_4w, tmp_roll_mean_4w,")
-    log("          humidity_roll_mean_4w, deficit_roll_cum_4w) removed.")
-    log("  [REASON] 13-Week Full Tabular Flattening makes lags redundant.")
-    log("           Rolling features overflow boundaries at weeks 1-3 (domain shift).")
-    log("  [NEW] GPU LightGBM: objective=regression_l1, device=gpu, n_estimators=10000.")
-    log("  [NEW] Post-ensemble np.median blend + Snap-to-Zero (< 0.15 -> 0.0).")
+    log("v27 Changes over v26:")
+    log("  [EXPAND] 27 explicit trend deltas (feature_w13 - feature_w1) appended.")
+    log("           Flat input dimension: 351 -> 378  (27 x 13 + 27 deltas).")
+    log("  [TRANSITION] objective: regression_l1 -> tweedie (variance_power=1.5).")
+    log("               Compound Poisson-Gamma formulation natively handles zero-")
+    log("               inflated continuous targets without manual gating.")
+    log("  [EXPAND] n_estimators: 10000 -> 15000  (prevent underfitting with lr=0.015).")
+    log("  [EXPAND] num_leaves: 31 -> 63  (capture high-order feature interactions).")
+    log("           min_child_samples: 100  (deep leaf regularization).")
+    log("  [ADJUST] learning_rate: 0.03 -> 0.015  (protect against gradient explosion).")
+    log("  [ADJUST] early_stopping: 150 -> 250 rounds  (slow lr=0.015 convergence).")
+    log("  [ABOLISH] Snap-to-Zero gate (< 0.15) completely removed.")
+    log("            Tweedie exponential dispersion model handles this natively.")
     log("")
     log(f"Training Config:")
-    log(f"  LGBM objective     = regression_l1  (MAE / conditional median)")
-    log(f"  LGBM device        = gpu")
-    log(f"  n_estimators       = 10000")
-    log(f"  learning_rate      = 0.03")
-    log(f"  colsample_bytree   = 0.75")
-    log(f"  subsample          = 0.75")
-    log(f"  early_stopping     = 150 rounds (eval_metric=mae)")
-    log(f"  N_FOLDS            = {N_FOLDS}")
-    log(f"  N_FLAT_FEATURES    = {N_FLAT_FEATURES}  "
-        f"(WINDOW_SIZE={WINDOW_SIZE} x FEAT={len(FEATURE_COLS)})")
+    log(f"  LGBM objective         = tweedie  (Compound Poisson-Gamma)")
+    log(f"  tweedie_variance_power = 1.5      (equal Poisson-Gamma balance)")
+    log(f"  LGBM device            = gpu")
+    log(f"  n_estimators           = 15000")
+    log(f"  learning_rate          = 0.015")
+    log(f"  num_leaves             = 63")
+    log(f"  min_child_samples      = 100")
+    log(f"  colsample_bytree       = 0.75")
+    log(f"  subsample              = 0.75")
+    log(f"  early_stopping         = 250 rounds (eval_metric=mae)")
+    log(f"  N_FOLDS                = {N_FOLDS}")
+    log(f"  N_FLAT_FEATURES        = {N_FLAT_FEATURES}  "
+        f"(WINDOW_SIZE={WINDOW_SIZE} x FEAT={len(FEATURE_COLS)} + {len(FEATURE_COLS)} deltas)")
 
     # -- 1. Load data ----------------------------------------------------------
     log("\nLoading processed data ...")
@@ -220,7 +238,7 @@ def main():
     assert n_test_regions  == 2248, f"Expected 2248 test regions,  got {n_test_regions}"
 
     # -- 1b. Feature Validation ------------------------------------------------
-    log("\n[v26 Feature Validation]")
+    log("\n[v27 Feature Validation]")
     assert "week_sin" in train_raw.columns, "week_sin missing -- run preprocess.py first"
     assert "week_cos" in train_raw.columns, "week_cos missing -- run preprocess.py first"
     log("  v week_sin, week_cos present.")
@@ -235,8 +253,9 @@ def main():
     if lag_cols_check:
         log(f"  [INFO] Lag columns present in raw CSV (will be excluded from FEATURE_COLS): "
             f"{lag_cols_check[:6]}{'...' if len(lag_cols_check) > 6 else ''}")
-    log(f"  v26 FEATURE_COLS: {len(FEATURE_COLS)} features (lag/rolling purged).")
-    log(f"  Flat input dim  : {N_FLAT_FEATURES}  (27 x 13 = 351)")
+    log(f"  v27 FEATURE_COLS: {len(FEATURE_COLS)} base features (lag/rolling purged).")
+    log(f"  v27 flat input dim: {N_FLAT_FEATURES}  "
+        f"(27 x 13 = 351 + 27 explicit deltas = 378)")
 
     # -- 2. Feature refinement -------------------------------------------------
     log("\nRefining features (drought proxy index + log1p prec + v22/v26 pruning) ...")
@@ -260,14 +279,15 @@ def main():
     log(f"  Zero-inflation: {zero_frac:.2%} of training scores == 0.0")
 
     # -- 5. Feature columns ----------------------------------------------------
-    log(f"\n[v26] Feature columns and flat input shape ...")
+    log(f"\n[v27] Feature columns and flat input shape ...")
     log(f"  FEATURE_COLS ({len(FEATURE_COLS)}): {FEATURE_COLS}")
     log(f"  flat input_size = {N_FLAT_FEATURES}  "
-        f"(WINDOW_SIZE={WINDOW_SIZE} x FEATURE_COLS={len(FEATURE_COLS)} = {N_FLAT_FEATURES})")
+        f"(WINDOW_SIZE={WINDOW_SIZE} x FEATURE_COLS={len(FEATURE_COLS)} + "
+        f"{len(FEATURE_COLS)} deltas = {N_FLAT_FEATURES})")
 
     # -- 6. Build 5-Fold StratifiedGroupKFold CV splits -----------------------
     log(f"\n{'='*90}")
-    log(f"5-Fold StratifiedGroupKFold CV  [v26 -- GPU LightGBM Mega-Tree]")
+    log(f"5-Fold StratifiedGroupKFold CV  [v27 -- GPU LightGBM Tweedie Mega-Tree]")
     log(f"  Group  : region_id  |  Strata : 10-quantile bins of per-region mean score")
     log(f"{'='*90}")
 
@@ -278,10 +298,10 @@ def main():
 
     # -- 7. 5-Fold LightGBM Training Loop --------------------------------------
     log(f"\n{'='*90}")
-    log("5-Fold LightGBM Training  [v26 GPU Mega-Tree]")
+    log("5-Fold LightGBM Training  [v27 GPU Tweedie Mega-Tree]")
     log("  5 independent LGBMRegressors per fold (one per target week).")
-    log("  objective=regression_l1  |  device=gpu  |  n_estimators=10000")
-    log("  Early stopping: 150 rounds  |  eval_metric=mae")
+    log("  objective=tweedie (p=1.5)  |  device=gpu  |  n_estimators=15000")
+    log("  num_leaves=63  |  learning_rate=0.015  |  early_stopping=250 rounds")
     log(f"{'='*90}")
 
     fold_results    = []
@@ -290,7 +310,7 @@ def main():
     for fold_k, (raw_train_groups, raw_val_groups) in enumerate(folds):
 
         log(f"\n{'='*90}")
-        log(f"FOLD {fold_k + 1} / {N_FOLDS}  [v26 LightGBM]")
+        log(f"FOLD {fold_k + 1} / {N_FOLDS}  [v27 LightGBM Tweedie]")
         log(f"  train_groups: {len(raw_train_groups):,}  |  "
             f"val_groups: {len(raw_val_groups):,}")
         log(f"{'='*90}")
@@ -324,16 +344,28 @@ def main():
         feat_cols = [c for c in FEATURE_COLS if c in _sample_group.columns]
         log(f"  feat_cols available: {len(feat_cols)} / {len(FEATURE_COLS)}")
 
-        # -- 7d. Build tabular matrices (13-week full flattening) --------------
+        # -- 7d. Build tabular matrices (13-week full flattening + 27 deltas) -
         X_train_np, y_train_np, _ = build_tabular_dataset(aug_train_groups, feat_cols)
         X_val_np,   y_val_np,   _ = build_tabular_dataset(aug_val_groups,   feat_cols)
+        X_train_np = np.asfortranarray(X_train_np)
+        X_val_np   = np.asfortranarray(X_val_np)
 
         log(f"  X_train: {X_train_np.shape}  |  y_train: {y_train_np.shape}")
         log(f"  X_val  : {X_val_np.shape}    |  y_val  : {y_val_np.shape}")
 
+        # Verify 378-dim feature space
+        expected_dim = WINDOW_SIZE * len(feat_cols) + len(feat_cols)
+        assert X_train_np.shape[1] == expected_dim, (
+            f"Feature dim mismatch: got {X_train_np.shape[1]}, "
+            f"expected {expected_dim} (351 flat + 27 deltas)"
+        )
+        log(f"  v Feature dim = {X_train_np.shape[1]}  "
+            f"(351 flat + 27 explicit deltas = 378)")
+
         # -- 7e. Build test tabular matrix for this fold ----------------------
         test_df_fold = _merge_te_to_df(test_df, te_map_fold, gm_fold, gzp_fold)
         X_test_np, test_region_ids = build_tabular_test(test_df_fold, feat_cols)
+        X_test_np = np.asfortranarray(X_test_np)
         log(f"  X_test: {X_test_np.shape}")
 
         # -- 7f. Train 5 LGBMRegressors (one per target week) -----------------
@@ -345,16 +377,46 @@ def main():
             y_train_w = y_train_np[:, week_idx]   # (N_train,)
             y_val_w   = y_val_np[:,   week_idx]   # (N_val,)
 
+            ckpt_path = os.path.join(
+                MODELS_DIR, f"lgbm_fold{fold_k}_week{week_idx}.pkl"
+            )
+
+            # -- CHECKPOINT RESUME: skip training if a valid pkl already exists
+            if os.path.exists(ckpt_path):
+                log(f"    [RESUME] Checkpoint found: {ckpt_path}  -- loading, skip training.")
+                try:
+                    with open(ckpt_path, "rb") as fh:
+                        model = pickle.load(fh)
+                    best_iter   = model.best_iteration_
+                    val_pred_w  = model.predict(X_val_np)
+                    test_pred_w = model.predict(X_test_np)
+
+                    fold_val_preds[:, week_idx] = val_pred_w
+                    fold_test_pred[:, week_idx] = test_pred_w.astype(np.float32)
+                    fold_week_models.append(model)
+
+                    w_mae = float(np.mean(np.abs(val_pred_w - y_val_w)))
+                    log(f"    Week {week_idx + 1}: best_iter={best_iter}  val_MAE={w_mae:.4f}  [LOADED FROM CHECKPOINT]")
+                    continue
+                except Exception as e:
+                    log(f"    [WARN] Checkpoint corrupted ({e}), deleting and retraining: {ckpt_path}")
+                    os.remove(ckpt_path)
+            # -----------------------------------------------------------------
+
             model = LGBMRegressor(
-                objective        = "regression_l1",  # Conditional median, handles zero-inflation
-                device           = "gpu",             # Offload tree building to CUDA cores
-                n_estimators     = 10000,             # Expanded budget to eliminate underfitting
-                learning_rate    = 0.03,              # Stable controlled learning rate
-                colsample_bytree = 0.75,              # Feature sub-sampling vs distribution drift
-                subsample        = 0.75,              # Row sub-sampling for variance suppression
-                random_state     = 42,
-                n_jobs           = -1,
-                verbose          = -1,
+                objective              = "tweedie",  # Compound Poisson-Gamma for zero-inflated targets
+                tweedie_variance_power = 1.5,        # Equal Poisson-Gamma balance (locked exponent)
+                device                 = "gpu",      # Leverage CUDA tensor cores for deep split evals
+                n_estimators           = 15000,      # Expanded budget to completely prevent underfitting
+                learning_rate          = 0.015,       # Scale down to protect against gradient step explosion
+                num_leaves             = 63,        # Expand to capture high-order feature interactions
+                min_child_samples      = 100,        # Deep leaf regularization for generalization boundary
+                colsample_bytree       = 0.75,       # Column sub-sampling vs covariate shift
+                subsample              = 0.75,       # Row sub-sampling for split variance reduction
+                random_state           = 42,
+                n_jobs                 = 16,
+                verbose                = -1,
+                max_bin                = 127,
             )
 
             model.fit(
@@ -362,7 +424,7 @@ def main():
                 eval_set      = [(X_val_np, y_val_w)],
                 eval_metric   = "mae",
                 callbacks     = [
-                    lightgbm.early_stopping(stopping_rounds=150, verbose=False),
+                    lightgbm.early_stopping(stopping_rounds=250, verbose=False),
                     lightgbm.log_evaluation(period=500),
                 ],
             )
@@ -379,11 +441,12 @@ def main():
             log(f"    Week {week_idx + 1}: best_iter={best_iter}  val_MAE={w_mae:.4f}")
 
             # Save model checkpoint
-            ckpt_path = os.path.join(
-                MODELS_DIR, f"lgbm_fold{fold_k}_week{week_idx}.pkl"
-            )
             with open(ckpt_path, "wb") as fh:
                 pickle.dump(model, fh)
+            log(f"    [SAVED] {ckpt_path}")
+            del model
+            gc.collect()
+
 
         fold_elapsed = time.time() - fold_t0
 
@@ -403,10 +466,12 @@ def main():
             "preds":      fold_test_pred,
             "region_ids": test_region_ids,
         })
+        del X_train_np, y_train_np, X_val_np, y_val_np, fold_week_models
+        gc.collect()
 
     # -- 8. Cross-fold summary -------------------------------------------------
     log(f"\n{'='*90}")
-    log(f"5-Fold Cross-Validation Summary  [v26 GPU LightGBM Mega-Tree]")
+    log(f"5-Fold Cross-Validation Summary  [v27 GPU LightGBM Tweedie Mega-Tree]")
     log(f"{'='*90}")
     mean_cv_maes = []
     for fold_k, week_maes, mean_mae in fold_results:
@@ -426,9 +491,10 @@ def main():
         log(f"    Week {week_idx + 1}: mean={np.mean(week_maes_all):.4f}  "
             f"std={np.std(week_maes_all):.4f}")
 
-    # -- 9. Post-Ensemble Median Blending (PHASE 3) ----------------------------
-    log(f"\n[v26] Post-Ensemble Median Blending ({N_FOLDS}-fold)")
+    # -- 9. Pure Median Ensemble Blending (PHASE 3) ----------------------------
+    log(f"\n[v27] Pure Median Ensemble Blending ({N_FOLDS}-fold)")
     log(f"  Method: np.median across all {N_FOLDS} fold prediction matrices.")
+    log(f"  Snap-to-Zero gate ABOLISHED: Tweedie natively collapses low-mass fractions.")
     log(f"  Protects ensemble against individual fold outlier fluctuations.")
 
     all_region_ids = fold_test_preds[0]["region_ids"]
@@ -437,33 +503,19 @@ def main():
 
     # Stack: (N_FOLDS, n_regions, HORIZON)
     preds_stack  = np.stack([fp["preds"] for fp in fold_test_preds], axis=0)
-    # Absolute median reduction across fold axis
+    # Strict mathematical median reduction across fold axis
     final_preds  = np.median(preds_stack, axis=0)   # (n_regions, HORIZON)
 
     log(f"  preds_stack shape  : {preds_stack.shape}")
     log(f"  median_preds shape : {final_preds.shape}")
-    log(f"  pre-gate stats     : mean={final_preds.mean():.4f}  "
+    log(f"  pre-clip stats     : mean={final_preds.mean():.4f}  "
         f"std={final_preds.std():.4f}  "
         f"min={final_preds.min():.4f}  max={final_preds.max():.4f}")
 
-    # -- 10. Snap-to-Zero Micro-Wiper (PHASE 3) --------------------------------
-    log(f"\n[v26] Snap-to-Zero Micro-Wiper (threshold = 0.15)")
-    log(f"  Wipes fractional floating-point noise under 0.15 generated by")
-    log(f"  tree ensemble blending. Restores ~60% absolute-zero target footprint.")
-
-    pre_zero_frac = float((final_preds == 0.0).mean())
-    log(f"  pre-gate  zero fraction : {pre_zero_frac:.4f}")
-
-    # Apply Snap-to-Zero gate
-    final_preds = np.where(final_preds < 0.15, 0.0, final_preds)
-
-    post_zero_frac = float((final_preds == 0.0).mean())
-    log(f"  post-gate zero fraction : {post_zero_frac:.4f}")
-
-    # Physical safety clip [0, 5]
+    # Physical safety boundary restriction [0, 5] -- no snap-to-zero gate
     final_preds = np.clip(final_preds, 0.0, 5.0)
 
-    # -- 11. Submission prediction diagnostics ---------------------------------
+    # -- 10. Submission prediction diagnostics ---------------------------------
     log("\n[Submission Prediction Diagnostics]")
     all_sub_preds   = final_preds.ravel()
     zero_frac_final = float((all_sub_preds == 0.0).mean())
@@ -483,7 +535,7 @@ def main():
     else:
         log("  v p99 >= 2.0 -- prediction diversity is healthy.")
 
-    # -- 12. Format & save submission.csv -------------------------------------
+    # -- 11. Format & save submission.csv -------------------------------------
     log("\nFormatting submission.csv ...")
     rows = []
     for i, region_id in enumerate(all_region_ids):
@@ -501,7 +553,7 @@ def main():
     sub_path   = os.path.join(ROOT, "submission.csv")
     submission.to_csv(sub_path, index=False)
 
-    # -- 13. Sanity checks -----------------------------------------------------
+    # -- 12. Sanity checks -----------------------------------------------------
     assert len(submission) == 2248, f"Expected 2248 rows, got {len(submission)}"
     assert list(submission.columns) == [
         "region_id", "pred_week1", "pred_week2",
@@ -527,11 +579,11 @@ def main():
     log(f"  Columns: {list(submission.columns)}")
     log(f"\n  Preview:\n{submission.head(5).to_string(index=False)}")
 
-    # -- 14. Total elapsed time ------------------------------------------------
+    # -- 13. Total elapsed time ------------------------------------------------
     elapsed = time.time() - t0
     log(f"\nTotal elapsed: {elapsed:.1f}s  ({elapsed/60:.1f} min)")
 
-    log_path = os.path.join(ROOT, "_training_log_26th.txt")
+    log_path = os.path.join(ROOT, "_training_log_27th.txt")
     with open(log_path, "w") as fh:
         fh.write("\n".join(log_lines))
     print(f"\nTraining log saved -> {log_path}")
