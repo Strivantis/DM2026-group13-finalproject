@@ -1,385 +1,222 @@
 """
-DroughtLSTM
-===========
-Calibrated Dual-Head Hurdle Model for drought score multi-step forecasting.
+FlatDroughtMLP
+==============
+v25 Multi-Quantile Flat MLP for drought score multi-step forecasting.
 
-Architecture (v21 – Pure Continuous-Time Prediction, Gap-Gate Abolished)
---------------------------------------------------------------------------
+Architecture (v25 – Adversarial Weighting + Multi-Quantile Pinball Loss)
+-------------------------------------------------------------------------
 
-  v21 Paradigm Shift: Gap-Gate & Gap Embedding Abolished
-  --------------------------------------------------------
-  Problem (v20): The Exponential Decay Gap-Gate was designed to handle a
-    perceived "input-to-prediction gap".  This was a conceptual error: the
-    Dataset Gap (train/test temporal discontinuity) is NOT the same as an
-    input-to-prediction gap.  V21 predicts IMMEDIATELY after the last input
-    week (gap = 0 at model design time), so the gate has no physical meaning
-    and only adds noise and complexity.
+  v25 Paradigm Shift: Hurdle Abolished, Pure Quantile Regression
+  ---------------------------------------------------------------
+  Problem (v24): Dual-Head Hurdle architecture (BCE + SmoothL1) with manual
+    post-processing thresholding creates calibration distortions. Adversarial
+    Validation revealed AUC ~ 0.94 covariate shift between Train and Test sets.
 
-  Solution (v21) – Clean Hurdle Architecture:
-    Remove gap_lambda (nn.Parameter) entirely.
-    Remove gap_embed (Linear 1→16) entirely.
-    Forward signature simplifies to forward(x, target_time).
-    branch_in = 256 + 128 + 32 + 2 = 418  (was 434; no more gap(16)).
+  Solution (v25) – FlatDroughtMLP + Multi-Quantile Pinball:
+    1. Replace BiLSTM + TCN with a wide MLP on flattened 13-week feature vectors.
+    2. Abolish dual-head (BCE + Regression). Use a single Quantile Head outputting
+       (B, 5, 3) covering q in [0.1, 0.5, 0.9] for 5 forecast weeks.
+    3. Softplus on the quantile head ensures all outputs >= 0 (physical constraint).
+    4. Training uses Weighted Multi-Quantile Pinball Loss with adversarial sample
+       weights from a LGBMClassifier (P_test = probability a row belongs to Test).
+    5. Inference: extract strictly the q=0.5 (median) channel; no thresholding.
 
-Architecture Detail (v21: input_size=40, window=13)
-----------------------------------------------------
-  Input x (B, 13, 40)
+Architecture Detail (v25: input_dim = WINDOW_SIZE * len(FEATURE_COLS) = 507)
+------------------------------------------------------------------------------
+  Input x (B, input_dim)   -- flattened 13-week x 39-feature vector
 
-  == LSTM Stream ==
-    -> LayerNorm(40)                               (B, 13, 40)
-    -> BiLSTM (hidden=128, layers=3, dropout=0.4)  (B, 13, 256)
-    -> Temporal Attention (Linear(256->1) softmax over time dim=13)
-       lstm_context = weighted sum                  (B, 256)
-    -> Dropout(0.4)
-    -> expand to                                   (B, 5, 256)
+  == Shared Backbone ==
+    -> Linear(input_dim -> 512)
+    -> LayerNorm(512)
+    -> GELU()
+    -> Dropout(0.3)
+    -> Linear(512 -> 256)
+    -> LayerNorm(256)
+    -> GELU()
+    -> Dropout(0.3)
+    -> backbone_out: (B, 256)
 
-  == Dilated TCN Stream ==
-    -> x.permute(0,2,1)                            (B, 40, 13)
-    -> Conv1d(40->128, k=3, d=1, pad=1) + GELU     (B, 128, 13)
-    -> Conv1d(128->128, k=3, d=2, pad=2) + GELU    (B, 128, 13)
-    -> Conv1d(128->128, k=3, d=4, pad=4) + GELU    (B, 128, 13)
-    -> AdaptiveAvgPool1d(1)                         (B, 128, 1)
-    -> squeeze(-1)   tcn_context                   (B, 128)
-    -> expand to                                   (B, 5, 128)
-
-  == Horizon / Time Embeddings ==
-    -> horizon_ids [0..4] -> Embedding(5,32) -> expand (B, 5, 32)
-    -> target_time input                           (B, 5, 2)
-
-  == Fusion ==
-    -> cat([lstm(256), tcn(128), h_emb(32), tt(2)], dim=-1)
-       encoded_state                               (B, 5, 418)
-    NOTE: branch_in = 256+128+32+2 = 418 INVARIANT to input_size.
-
-  == Branch A: Probability Logits Head ==
-    Linear(418->128) -> GELU -> Dropout(0.2) -> Linear(128->1) -> squeeze(-1)
-    -> (B, 5)  raw, unbounded logits (NO Sigmoid applied in model)
-
-  == Branch B: Severity Regressor Head ==
-    Linear(418->128) -> GELU -> Dropout(0.2) -> Linear(128->1) -> squeeze(-1)
-    -> Softplus()
-    -> (B, 5)  strictly non-negative severity magnitudes (>= 0.0)
+  == Multi-Quantile Head ==
+    -> Linear(256 -> 5 * 3)    -- 15 raw outputs: 5 weeks x 3 quantiles
+    -> Softplus()              -- guarantees all quantile boundaries >= 0.0
+    -> reshape(B, 5, 3)
+    -> quantile_outputs: (B, 5, 3)
+       dim[-1] index 0 -> q=0.1  (Lower / Pessimistic edge)
+       dim[-1] index 1 -> q=0.5  (Conditional Median -- used in inference)
+       dim[-1] index 2 -> q=0.9  (Upper / Severe drought edge)
 
   Forward Signature:
-    forward(self, x, target_time) -> (logits_output, severity_output)
-      logits_output   : (B, 5)  raw BCE logits  (no Sigmoid, no clamp)
-      severity_output : (B, 5)  non-negative severity via Softplus
+    forward(self, x) -> quantile_outputs
+      quantile_outputs : (B, 5, 3)  strictly non-negative via Softplus
 
-Changes from v20
+Changes from v24
 ----------------
-  [v21] Exponential Decay Gap-Gate ABOLISHED:
-        Removed gap_lambda nn.Parameter (was init=5.0).
-        Removed G = exp(-|gap_lambda|*gap_size) multiplication on streams.
-  [v21] Gap Embedding ABOLISHED:
-        Removed gap_embed Linear(1, 16).
-        gap_size parameter removed from forward() signature entirely.
-  [v21] branch_in: 434 → 418  (256+128+32+2; gap(16) dropped)
-  [v21] Forward signature: forward(x, target_time)  [no gap_size]
+  [v25] Hurdle Architecture ABOLISHED: no head_prob (BCE), no head_sev (SmoothL1).
+  [v25] BiLSTM + Dilated TCN ABOLISHED: replaced by wide flat MLP backbone.
+  [v25] Single Quantile Head: Linear(256->15) + Softplus + reshape(B,5,3).
+  [v25] input accepts (B, input_dim): flat 507-dim vector (13w x 39 feats).
+  [v25] forward(x) -- no target_time argument needed.
+  [v25] Softplus on quantile head natively enforces non-negativity.
+  [v25] Multi-Quantile output: q=[0.1, 0.5, 0.9] for uncertainty quantification.
 
-Retained from v20
------------------
-  [v20] Dual-Head Hurdle: head_prob (Branch A) + head_sev (Branch B)
-        Forward returns (logits, severity) tuple
-  [v20] Branch A: raw logits -> BCEWithLogitsLoss in train.py
-  [v20] Branch B: Softplus -> non-negative severity (>= 0.0)
-  [v19] input_size: 40 enriched features retained
-  [v16] BiLSTM hidden_size: 128/dir → 256 effective
-  [v16] Dilated TCN (d=1,2,4); receptive field = 29 weeks
+Retained from v24 (backbone philosophy)
+-----------------------------------------
+  [v24] Wide MLP configuration: 512 -> 256 with LayerNorm + GELU + Dropout(0.3).
+  [v24] Softplus enforces >= 0 physical constraint on predictions.
 """
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
-class DroughtLSTM(nn.Module):
+class FlatDroughtMLP(nn.Module):
     """
+    v25 Wide Flat MLP for Multi-Quantile drought forecasting.
+
     Parameters
     ----------
-    input_size  : number of features per time step (F = 40 in v21)
-    hidden_size : LSTM hidden dimensionality per direction (default 128)
-                  Effective LSTM output width = hidden_size * 2 = 256 (BiLSTM)
-    num_layers  : number of stacked LSTM layers (default 3)
-    dropout     : dropout probability (applied between LSTM layers and before head)
-    horizon     : number of future weeks to forecast simultaneously
+    input_dim : int
+        Flattened feature dimension (WINDOW_SIZE * len(FEATURE_COLS) = 507).
+    horizon   : int
+        Number of forecast weeks (default 5).
+    n_quantiles : int
+        Number of quantile levels to predict (default 3: q=0.1, 0.5, 0.9).
+    dropout   : float
+        Dropout probability in backbone (default 0.3).
     """
+
+    # Quantile levels (index -> quantile mapping)
+    QUANTILE_LEVELS = [0.1, 0.5, 0.9]   # index 0, 1, 2
 
     def __init__(
         self,
-        input_size: int,
-        hidden_size: int = 128,   # Effective output = hidden*2 = 256 (BiLSTM)
-        num_layers: int = 3,
-        dropout: float = 0.4,
+        input_dim: int,
         horizon: int = 5,
+        n_quantiles: int = 3,
+        dropout: float = 0.3,
     ):
         super().__init__()
-        self.hidden_size = hidden_size
-        self.num_layers  = num_layers
+        self.input_dim   = input_dim
         self.horizon     = horizon
-        self.input_size  = input_size
-
-        # Effective output dimension from BiLSTM (forward + backward)
-        lstm_out_size = hidden_size * 2  # 256
+        self.n_quantiles = n_quantiles
+        self.dropout_p   = dropout
 
         # ----------------------------------------------------------------
-        # LSTM Stream
+        # Shared Backbone
+        # Linear(input_dim -> 512) -> LN(512) -> GELU -> Dropout(0.3)
+        # -> Linear(512 -> 256) -> LN(256) -> GELU -> Dropout(0.3)
         # ----------------------------------------------------------------
-
-        # LayerNorm on raw inputs (concept-drift stabiliser)
-        self.input_norm = nn.LayerNorm(input_size)
-
-        # BiLSTM
-        self.lstm = nn.LSTM(
-            input_size=input_size,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            dropout=dropout if num_layers > 1 else 0.0,
-            batch_first=True,
-            bidirectional=True,
+        self.backbone = nn.Sequential(
+            nn.Linear(input_dim, 512),
+            nn.LayerNorm(512),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(512, 256),
+            nn.LayerNorm(256),
+            nn.GELU(),
+            nn.Dropout(dropout),
         )
 
-        # Temporal Attention
-        self.attention = nn.Linear(lstm_out_size, 1)
-
-        self.dropout = nn.Dropout(p=dropout)
-
         # ----------------------------------------------------------------
-        # Dilated TCN Stream
-        #
-        # Input: (B, input_size, 13)
-        # Symmetric padding preserves seq_len = 13:
-        #   Dilation 1: padding = 1*(3-1)//2 = 1
-        #   Dilation 2: padding = 2*(3-1)//2 = 2
-        #   Dilation 4: padding = 4*(3-1)//2 = 4
-        # Receptive field = 1 + 2*(3-1) + 4*(3-1) + 8*(3-1) = 29 weeks
-        # Output: (B, 128, 13) -> AdaptiveAvgPool1d(1) -> (B, 128)
+        # Multi-Quantile Head
+        # Linear(256 -> horizon * n_quantiles) + Softplus
+        # Output (B, 15) -> reshape (B, horizon, n_quantiles)
+        # Softplus: guarantees all quantile boundaries >= 0 (physical constraint)
         # ----------------------------------------------------------------
-        self.tcn_stream = nn.Sequential(
-            nn.Conv1d(input_size, 128, kernel_size=3, padding=1, dilation=1),
-            nn.GELU(),
-            nn.Conv1d(128, 128, kernel_size=3, padding=2, dilation=2),
-            nn.GELU(),
-            nn.Conv1d(128, 128, kernel_size=3, padding=4, dilation=4),
-            nn.GELU(),
+        self.quantile_head = nn.Sequential(
+            nn.Linear(256, horizon * n_quantiles),
+            nn.Softplus(),
         )
-        # Global average pool: (B, 128, 13) -> (B, 128, 1)
-        self.global_pool = nn.AdaptiveAvgPool1d(1)
-
-        # ----------------------------------------------------------------
-        # Horizon / Time Embeddings
-        # ----------------------------------------------------------------
-
-        # Learnable Horizon Embedding
-        self.horizon_embed = nn.Embedding(num_embeddings=5, embedding_dim=32)
-
-        # ----------------------------------------------------------------
-        # Dual-Head Architecture  (v20/v21)
-        # After concatenating:
-        #   lstm_context (256) + tcn_context (128)
-        #   + horizon_embed (32)
-        #   + target_time (2)    [week_sin/cos of target weeks]
-        # branch_in = 256 + 128 + 32 + 2 = 418
-        # NOTE: branch_in does NOT depend on input_size or window length.
-        # ----------------------------------------------------------------
-        branch_in = lstm_out_size + 128 + 32 + 2  # = 418
-
-        # Branch A – Probability Logits Head
-        # Outputs raw, unbounded logits (B, 5). NO Sigmoid inside model.
-        # Sigmoid is applied externally: BCEWithLogitsLoss in train.py.
-        self.head_prob = nn.Sequential(
-            nn.Linear(branch_in, 128),
-            nn.GELU(),
-            nn.Dropout(0.2),
-            nn.Linear(128, 1),
-        )
-
-        # Branch B – Severity Regressor Head
-        # Outputs strictly non-negative severity via Softplus (>= 0.0).
-        self.head_sev = nn.Sequential(
-            nn.Linear(branch_in, 128),
-            nn.GELU(),
-            nn.Dropout(0.2),
-            nn.Linear(128, 1),
-        )
-        # Softplus guarantees severity >= 0 (weather-physical constraint)
-        self.softplus = nn.Softplus(beta=1)
 
         # Shape debug flag (prints once on first forward pass)
         self._printed_shape = False
 
     # -----------------------------------------------------------------------
-    def forward(
-        self,
-        x: torch.Tensor,
-        target_time: torch.Tensor,
-    ):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Parameters
         ----------
-        x           : (B, W, F)  -- input feature window
-                       v21: W=13, F=40
-        target_time : (B, 5, 2)  -- week_sin/cos of future target weeks
+        x : (B, input_dim)  -- flattened 13-week feature window
 
         Returns
         -------
-        logits_output   : (B, 5)
-            Raw, unbounded probability logits.
-            NO Sigmoid applied — use nn.BCEWithLogitsLoss() externally.
-
-        severity_output : (B, 5)
-            Strictly non-negative severity via Softplus.
-            No clamp is applied; absolute truncation is forbidden.
+        quantile_outputs : (B, horizon, n_quantiles)
+            Strictly non-negative multi-quantile predictions via Softplus.
+            dim[-1]:
+              index 0 -> q=0.1  (Lower bound / Pessimistic edge)
+              index 1 -> q=0.5  (Conditional Median -- used in inference)
+              index 2 -> q=0.9  (Upper bound / Severe drought edge)
         """
         B = x.size(0)
 
-        # ----------------------------------------------------------------
-        # LSTM Stream
-        # ----------------------------------------------------------------
-        x_norm = self.input_norm(x)                            # (B, W, F)
-        lstm_out, _ = self.lstm(x_norm)                        # (B, W, 256)
+        # Shared backbone: (B, input_dim) -> (B, 256)
+        backbone_out = self.backbone(x)      # (B, 256)
 
-        # Temporal Attention
-        attn_weights = self.attention(lstm_out)                # (B, W, 1)
-        attn_weights = torch.softmax(attn_weights, dim=1)      # softmax over time
-        context_vector = torch.sum(attn_weights * lstm_out, dim=1)   # (B, 256)
+        # Multi-quantile head: (B, 256) -> (B, horizon * n_quantiles)
+        raw_out = self.quantile_head(backbone_out)   # (B, 15)
 
-        lstm_context = self.dropout(context_vector)            # (B, 256)
-
-        # Expand across horizon steps
-        lstm_out_size = self.hidden_size * 2                   # 256
-        lstm_expanded = lstm_context.unsqueeze(1).expand(B, self.horizon, lstm_out_size)
-        # (B, 5, 256)
-
-        # ----------------------------------------------------------------
-        # Dilated TCN Stream
-        # ----------------------------------------------------------------
-        x_tcn = x.permute(0, 2, 1)                            # (B, F, W)
-        tcn_feat = self.tcn_stream(x_tcn)                     # (B, 128, W)
-        tcn_pooled = self.global_pool(tcn_feat)               # (B, 128, 1)
-        tcn_context = tcn_pooled.squeeze(-1)                  # (B, 128)
-
-        tcn_expanded = tcn_context.unsqueeze(1).expand(B, self.horizon, 128)
-        # (B, 5, 128)
-
-        # ----------------------------------------------------------------
-        # Horizon Embedding
-        # ----------------------------------------------------------------
-        horizon_ids = torch.arange(self.horizon, device=x.device, dtype=torch.long)
-        h_emb = self.horizon_embed(horizon_ids)               # (5, 32)
-        h_emb = h_emb.unsqueeze(0).expand(B, self.horizon, 32)    # (B, 5, 32)
-
-        # target_time is already (B, 5, 2)
-
-        # ----------------------------------------------------------------
-        # Feature Fusion
-        # [lstm(256) + tcn(128) + h_emb(32) + target_time(2)] = 418
-        # ----------------------------------------------------------------
-        encoded_state = torch.cat(
-            [lstm_expanded, tcn_expanded, h_emb, target_time],
-            dim=-1,
-        )
-        # (B, 5, 418)
-
-        # ----------------------------------------------------------------
-        # Branch A: Probability Logits  (v20/v21 Dual-Head)
-        # Raw unbounded logits — NO Sigmoid applied here.
-        # BCEWithLogitsLoss in train.py applies numerically stable sigmoid.
-        # ----------------------------------------------------------------
-        logits_output = self.head_prob(encoded_state).squeeze(-1)   # (B, 5)
-
-        # ----------------------------------------------------------------
-        # Branch B: Severity Regressor  (v20/v21 Dual-Head)
-        # Softplus applied for strict non-negativity (>= 0.0).
-        # NO clamp, NO internal truncation.
-        # ----------------------------------------------------------------
-        sev_raw = self.head_sev(encoded_state).squeeze(-1)           # (B, 5)
-        severity_output = self.softplus(sev_raw)                     # (B, 5), >= 0
+        # Reshape to (B, horizon, n_quantiles)
+        quantile_outputs = raw_out.view(B, self.horizon, self.n_quantiles)
+        # (B, 5, 3)
 
         # Shape debug – print once on first forward call
         if not self._printed_shape:
             print(
-                f"  [v21 Shape Debug] x: {tuple(x.shape)}  "
-                f"| lstm_context: {tuple(lstm_context.shape)}  "
-                f"| tcn_context: {tuple(tcn_context.shape)}  "
-                f"| encoded_state: {tuple(encoded_state.shape)}  "
-                f"| logits_output: {tuple(logits_output.shape)}  "
-                f"| severity_output: {tuple(severity_output.shape)}"
+                f"  [v25 Shape Debug] x: {tuple(x.shape)}  "
+                f"| backbone_out: {tuple(backbone_out.shape)}  "
+                f"| quantile_outputs: {tuple(quantile_outputs.shape)}  "
+                f"  (B, horizon={self.horizon}, quantiles={self.n_quantiles})"
             )
             self._printed_shape = True
 
-        # Strict return: (logits, severity) tuple — no internal multiplication
-        return logits_output, severity_output
+        return quantile_outputs   # (B, 5, 3)
 
     # -----------------------------------------------------------------------
     def count_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
-    def architecture_summary(self, input_size: int) -> str:
-        lstm_out_size = self.hidden_size * 2    # 256
-        branch_in     = lstm_out_size + 128 + 32 + 2   # 418
+    def architecture_summary(self) -> str:
+        h  = self.horizon
+        q  = self.n_quantiles
         lines = [
-            "DroughtLSTM Architecture (v21 – Pure Continuous-Time Hurdle Model)",
+            "FlatDroughtMLP Architecture (v25 – Multi-Quantile Pinball + Adversarial Weights)",
             "=" * 90,
-            f"  Input size   : {input_size}  (features per week; v21: 40 enriched features)",
-            f"  Window size  : 13 weeks  (v16: capped at test-set horizon)",
+            f"  Input dim    : {self.input_dim}  "
+            f"(WINDOW_SIZE={13} x FEATURE_COLS={self.input_dim // 13} = {self.input_dim})",
             "",
-            "  == LSTM Stream ==",
-            f"  LayerNorm    : LayerNorm({input_size})",
-            f"  BiLSTM       : hidden={self.hidden_size}/dir -> {lstm_out_size} effective  "
-            f"(layers={self.num_layers}, bidirectional=True)",
-            f"  Dropout      : {self.dropout.p}",
-            f"  Attn         : Linear({lstm_out_size}->1); softmax over time; weighted sum",
-            f"  lstm_context : (B, {lstm_out_size})",
-            f"  expand       : (B, 5, {lstm_out_size})",
+            "  == Shared Backbone ==",
+            f"  Linear({self.input_dim} -> 512) -> LayerNorm(512) -> GELU() -> Dropout({self.dropout_p})",
+            "  Linear(512 -> 256) -> LayerNorm(256) -> GELU() -> Dropout(0.3)",
+            "  backbone_out : (B, 256)",
             "",
-            "  == Dilated TCN Stream ==",
-            f"  Transpose    : (B, 13, {input_size}) -> (B, {input_size}, 13)",
-            f"  TCN Layer 1  : Conv1d({input_size}->128, k=3, d=1, pad=1) + GELU -> (B, 128, 13)",
-            "  TCN Layer 2  : Conv1d(128->128, k=3, d=2, pad=2) + GELU -> (B, 128, 13)",
-            "  TCN Layer 3  : Conv1d(128->128, k=3, d=4, pad=4) + GELU -> (B, 128, 13)",
-            "  Receptive field: 1+2*(3-1)+4*(3-1)+8*(3-1) = 29 weeks",
-            "  GlobalPool   : AdaptiveAvgPool1d(1) -> (B, 128, 1) -> squeeze -> (B, 128)",
-            "  expand       : (B, 5, 128)",
+            "  == Multi-Quantile Head ==",
+            f"  Linear(256 -> {h * q}) -> Softplus()  -- guarantees all outputs >= 0",
+            f"  reshape: (B, {h * q}) -> (B, {h}, {q})",
+            f"  quantile_outputs: (B, {h}, {q})",
+            "     dim[-1] index 0 -> q=0.1  (Lower / Pessimistic)",
+            "     dim[-1] index 1 -> q=0.5  (Conditional Median -- INFERENCE TARGET)",
+            "     dim[-1] index 2 -> q=0.9  (Upper / Severe drought)",
             "",
-            "  [v21] Gap-Gate ABOLISHED: No gap_lambda, no G multiplication.",
-            "  [v21] Gap Embedding ABOLISHED: No gap_embed Linear(1,16).",
+            "  == Forward Signature ==",
+            "  forward(x)  -- x: (B, input_dim)  [flat 507-dim vector]",
+            "  return quantile_outputs  (B, 5, 3)  strictly non-negative",
             "",
-            "  == Embeddings ==",
-            "  Learnable Horizon Embedding:",
-            "     horizon_ids [0,1,2,3,4] -> Embedding(5,32) -> (B, 5, 32)",
-            "  Target-Time Injection:",
-            "     target_time input (B, 5, 2)  -- week_sin/cos of 5 future target weeks",
-            "",
-            "  == Feature Fusion ==",
-            f"  Concat: [lstm({lstm_out_size}) + tcn(128) + h_emb(32) + tt(2)]",
-            f"     -> encoded_state (B, 5, {branch_in})",
-            "",
-            "  == Branch A: Probability Logits Head ==",
-            f"  Linear({branch_in}->128) -> GELU -> Dropout(0.2) -> Linear(128->1)",
-            "  squeeze(-1) -> (B,5)  raw, unbounded logits",
-            "  NO Sigmoid applied inside model (BCEWithLogitsLoss used externally)",
-            "",
-            "  == Branch B: Severity Regressor Head ==",
-            f"  Linear({branch_in}->128) -> GELU -> Dropout(0.2) -> Linear(128->1)",
-            "  squeeze(-1) -> (B,5)  -> Softplus() -> strictly non-negative severity",
-            "  NO clamp; absolute truncation forbidden",
-            "",
-            "  == Forward Return Signature ==",
-            "  forward(x, target_time) -> (logits_output, severity_output)",
-            "  return logits_output (B,5), severity_output (B,5)",
-            "  Two independent tensors; no internal prob*severity multiplication",
+            "  == Inference ==",
+            "  prediction = quantile_outputs[:, :, 1]  # q=0.5 median channel",
+            "  NO manual thresholding. NO Sigmoid gate. NO hurdle multiplication.",
             "-" * 90,
-            "  [v21] Gap-Gate (gap_lambda, G) ABOLISHED — no physical meaning at gap=0",
-            "  [v21] Gap Embedding (gap_embed Linear(1,16)) ABOLISHED",
-            "  [v21] branch_in: 434 → 418  (256+128+32+2; gap(16) dropped)",
-            "  [v21] Forward: forward(x, target_time)  [gap_size param removed]",
-            "  [v20] Dual-Head Hurdle: head_prob (Branch A) + head_sev (Branch B)",
-            "  [v20] Branch A: raw logits -> BCEWithLogitsLoss in train.py",
-            "  [v20] Branch B: Softplus -> non-negative severity (>= 0.0)",
-            "  [v19] input_size: 40 enriched features retained",
-            "  [v16] Dilated TCN (d=1,2,4): retained",
-            f"  [v21] branch_in: 418  (256+128+32+2): UPDATED",
+            "  [v25] Hurdle ABOLISHED: no head_prob (BCE), no head_sev (SmoothL1).",
+            "  [v25] BiLSTM + TCN ABOLISHED: replaced by flat MLP backbone.",
+            "  [v25] Quantile Head: q=[0.1, 0.5, 0.9]; Softplus non-negativity.",
+            "  [v25] forward(x) -- no target_time argument.",
+            "  [v24] Backbone config retained: 512->256, LN+GELU+Dropout(0.3).",
             "-" * 90,
             f"  Total params : {self.count_parameters():,}",
         ]
         return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Legacy stub: DroughtLSTM renamed but alias kept for backward-compat imports
+# ---------------------------------------------------------------------------
+DroughtLSTM = FlatDroughtMLP   # v25: alias for any stale imports

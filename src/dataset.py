@@ -6,8 +6,8 @@ Custom tabular data builder for drought score multi-step forecasting.
 Design
 ------
 - V23 PARADIGM SHIFT: 13-Week Full Tabular Flattening.
-  The complete 13-week context window (all 39 features x 13 weeks) is
-  flattened into a wide 2D spreadsheet of shape (N_samples, 507).
+  The complete 13-week context window (all 27 features x 13 weeks) is
+  flattened into a wide 2D spreadsheet of shape (N_samples, 351).
   Column names follow the pattern `<feature>_w1` through `<feature>_w13`
   so LightGBM can construct split paths over the full temporal dimension.
 
@@ -16,17 +16,35 @@ Design
 
 - Region boundaries are strictly respected - windows NEVER cross regions.
 - Feature pruning, log1p precipitation transform, and Drought Index
-  (PET-based deficit 4-week rolling sum) are applied in refine_features().
+  (PET-based deficit) are applied in refine_features().
+
+v26 Changes (The Clean Slate -- Feature Purge)
+----------------------------------------------
+PURGE: All lag features (tmp_lag1w/2w, humidity_lag1w/2w, prec_lag1w/2w,
+  wind_lag1w/2w -- 8 tokens) and all cross-week rolling aggregates
+  (prec_roll_sum_4w, tmp_roll_mean_4w, humidity_roll_mean_4w,
+  deficit_roll_cum_4w -- 4 tokens) removed.
+
+  Rationale: With 13-Week Full Tabular Flattening, week 12 features ARE
+  the 1-week lag of week 13; lag columns are perfectly redundant and create
+  artificial Train/Test distribution boundaries (adversarial AUC=1.0).
+  Cross-week rolling sums overflow boundaries during weeks 1-3 of each
+  sequence, causing additional domain shift.
+
+RETAIN: raw weekly baseline meteorological variables + intra-week
+  aggregation summaries (_week_max, _week_min, _week_std).
+  These statistics never bleed across week indices.
+
+- FEATURE_COLS: 39 -> 27  (12 tokens purged)
+- Flat feature dimension: 507 -> 351  (27 x 13)
 
 v23 Changes (13-Week Full Tabular Flattening)
 ----------------------------------------------
-EXPAND: Instead of extracting only the 13th row, flatten ALL 13 rows of
-  each sliding window into a single wide feature vector of length 507
-  (13 weeks x 39 features).  Column naming: `<feat>_w1` through `<feat>_w13`.
+EXPAND: Flatten ALL 13 rows of each sliding window into a single wide
+  feature vector.  Column naming: <feat>_w1 through <feat>_w13.
 
-- build_tabular_dataset() now returns X of shape (N, 507).
-- build_tabular_test() now returns X of shape (2248, 507).
-- v22 feature pruning (39 retained features) is preserved unchanged.
+- build_tabular_dataset() now returns X of shape (N, 351) in v26.
+- build_tabular_test() now returns X of shape (2248, 351) in v26.
 
 v22 Changes (Tabular Flattening + LightGBM)
 --------------------------------------------
@@ -38,8 +56,6 @@ PARADIGM SHIFT: Abolish 3D sliding-window PyTorch Datasets.  Replace with
     wind_max   : collinearity > 0.95 with baseline `wind`.
     dow_sin    : lowest permutation importance, seasonal encoding artefact.
   (dp_tmp, wb_tmp were already pruned in v19/v21 via DROP_COLS.)
-
-- FEATURE_COLS reduced from 40 to 39 (wind_max removed).
 
 v21 Changes (Pure Continuous-Time Prediction + StratifiedGroupKFold CV)
 ------------------------------------------------------------------------
@@ -89,23 +105,22 @@ TS_SHIFT_WEEKS = 26
 DROP_COLS = ["wb_tmp", "dp_tmp", "surf_tmp", "wind_max", "dow_sin"]
 
 # Precipitation columns to log1p-transform (handle right-skew)
-# v16: removed prec_roll_sum_8w, prec_roll_sum_13w (features deleted)
-# v19: added prec_week_max (extreme event peak - also right-skewed)
+# v26: prec_roll_sum_4w, prec_lag1w, prec_lag2w removed (cross-week bleed purge)
 PREC_COLS = [
     "prec",
     "prec_week_max",
-    "prec_roll_sum_4w",
-    "prec_lag1w", "prec_lag2w",
 ]
 
 # Feature columns fed to the model (order matters for scaler alignment)
-# v22: 39 features = 10 base weather (wind_max removed) + 11 enriched weekly stats
-#      + 2 cyclic + 3 rolling-4w + 4 lag1 + 4 lag2 + 3 drought-4w + 2 TE
-#
-# Count breakdown:
+# v26 Clean Slate: 27 features
 #   base weather (10) + enriched weekly stats (11) + cyclic calendar (2)
-#   + rolling 4w (3) + lag-1 (4) + lag-2 (4) + drought 4w (3)
-#   + target encoding (2) = 39
+#   + drought proxy (2) + target encoding (2) = 27
+#
+# PURGED vs v25 (12 tokens removed):
+#   prec_roll_sum_4w, tmp_roll_mean_4w, humidity_roll_mean_4w  (3 cross-week rolling)
+#   tmp_lag1w, humidity_lag1w, prec_lag1w, wind_lag1w           (4 lag-1)
+#   tmp_lag2w, humidity_lag2w, prec_lag2w, wind_lag2w           (4 lag-2)
+#   deficit_roll_cum_4w                                          (1 cross-week rolling)
 FEATURE_COLS = [
     # --- base weather (10) [v22: wind_max removed] ---
     "prec", "surf_pre", "humidity",
@@ -118,32 +133,26 @@ FEATURE_COLS = [
     "prec_week_max", "surf_pre_week_max",
     # --- cyclical calendar (2) [v9: replaces month + week_of_year] ---
     "week_sin", "week_cos",
-    # --- rolling aggregates 4w only (3) [v16: removed 8w and 13w] ---
-    "prec_roll_sum_4w",  "tmp_roll_mean_4w",  "humidity_roll_mean_4w",
-    # --- lag-1 (4) ---
-    "tmp_lag1w", "humidity_lag1w", "prec_lag1w", "wind_lag1w",
-    # --- lag-2 (4) ---
-    "tmp_lag2w", "humidity_lag2w", "prec_lag2w", "wind_lag2w",
-    # --- drought proxy index 4w only (3) [v16: removed 8w and 13w] ---
+    # --- drought proxy index (2) [v26: deficit_roll_cum_4w purged] ---
     "pet", "deficit",
-    "deficit_roll_cum_4w",
     # --- target encoding (2) [v9: leakage-free region stats, injected in train.py] ---
     "region_mean_score", "region_zero_prob",
-]   # total = 39 features
+]   # total = 27 features  |  flat dim = 27 x 13 = 351
 
 
 # ---------------------------------------------------------------------------
-# V23 Flat Column Names: <feat>_w1 ... <feat>_w13  (507 total)
+# V23 Flat Column Names: <feat>_w1 ... <feat>_w13  (351 total in v26)
 # ---------------------------------------------------------------------------
 def make_flat_col_names(feat_cols: list, window: int = WINDOW_SIZE) -> list:
     """
-    Generate the 507 flat column names used by the v23 wide matrix.
+    Generate the flat column names used by the v23+ wide matrix.
+    v26: 27 features x 13 weeks = 351 columns.
     Order: feat_w1, feat_w2, ..., feat_w13 for each feat in feat_cols.
-    i.e.  [f0_w1, f0_w2, ..., f0_w13, f1_w1, ..., f38_w13]
-    Actually the ordering is week-major: all features for week 1, then week 2...
-    We use feat-major ordering to match numpy reshape(window * n_feats):
-      row.reshape(-1) after stacking window rows = [f0_w1,..,f38_w1, f0_w2,..,f38_w2, ...]
-    We name them accordingly: for week_idx w (1-indexed), feat f -> f_w{w}.
+    i.e.  [f0_w1, f0_w2, ..., f0_w13, f1_w1, ..., f26_w13]
+    Week-major ordering matches numpy reshape(window * n_feats):
+      row.reshape(-1) after stacking window rows =
+        [f0_w1,..,f26_w1, f0_w2,..,f26_w2, ...]
+    For week_idx w (1-indexed), feat f -> f_w{w}.
     """
     names = []
     for w in range(1, window + 1):
@@ -157,13 +166,13 @@ def make_flat_col_names(feat_cols: list, window: int = WINDOW_SIZE) -> list:
 # ---------------------------------------------------------------------------
 def refine_features(df: pd.DataFrame, is_train: bool = True) -> pd.DataFrame:
     """
-    1. Compute Drought Index (PET/deficit 4w) BEFORE log1p (uses raw prec).
+    1. Compute Drought Index (PET/deficit) BEFORE log1p (uses raw prec).
     2. Drop adversarial / collinear columns (wb_tmp, dp_tmp, surf_tmp,
        wind_max, dow_sin - v22 expanded pruning).
-    3. Apply log1p to all precipitation-related columns.
+    3. Apply log1p to precipitation columns (v26: prec and prec_week_max only).
     4. Handle NaN rows:
-       - Train: drop rows where any FEATURE_COL is NaN (lag head: first 2/region).
-       - Test:  forward-fill then zero-fill lag NaN so we keep all rows.
+       - Train: drop rows where any FEATURE_COL is NaN.
+       - Test:  forward-fill then zero-fill so we keep all rows.
 
     NOTE: `region_mean_score` and `region_zero_prob` are NOT added here.
     They are injected by train.py (leakage-free, per-fold) AFTER this call.
@@ -179,6 +188,7 @@ def refine_features(df: pd.DataFrame, is_train: bool = True) -> pd.DataFrame:
     df.drop(columns=[c for c in DROP_COLS if c in df.columns], inplace=True)
 
     # Step 2 - log1p precipitation (clip negatives to 0 first)
+    # v26: only prec and prec_week_max (lag/rolling prec cols purged)
     for col in PREC_COLS:
         if col in df.columns:
             df[col] = np.log1p(df[col].clip(lower=0))
@@ -190,7 +200,7 @@ def refine_features(df: pd.DataFrame, is_train: bool = True) -> pd.DataFrame:
     ]
 
     if is_train:
-        # Step 3a - drop NaN rows (the first 2 rows per region due to lag-2)
+        # Step 3a - drop NaN rows (v26: no lag cols so minimal head-NaN rows)
         df = df.dropna(subset=present_feats).reset_index(drop=True)
     else:
         # Step 3b - ffill then zero-fill within each region
@@ -214,7 +224,8 @@ def build_tabular_dataset(
 ):
     """
     V23 Tabular Flattening: flatten ALL `window` rows of each sliding window
-    into a single wide feature vector of length (window * len(feat_cols)) = 507.
+    into a single wide feature vector of length (window * len(feat_cols)).
+    v26: 27 features x 13 weeks = 351 columns.
 
     For each window [i, i+window), the full matrix of shape (window, F) is
     flattened row-major (week-major) into a 1D vector of shape (window*F,).
@@ -232,7 +243,7 @@ def build_tabular_dataset(
     Returns
     -------
     X          : np.ndarray of shape (N_samples, window * len(feat_cols)), float32
-                 i.e. (N_samples, 507) with default settings
+                 i.e. (N_samples, 351) with v26 27-feature set
     y          : np.ndarray of shape (N_samples, horizon), float32, or None
     region_ids : np.ndarray of shape (N_samples,)
     """
@@ -272,7 +283,7 @@ def build_tabular_dataset(
             # V23 KEY: flatten ALL window rows into a single wide row
             # X_mat[i:end_feat] has shape (window, F) -> reshape to (window*F,)
             window_block = X_mat[i:end_feat]          # (window, F)
-            flat_row     = window_block.reshape(-1)   # (window*F,) = (507,)
+            flat_row     = window_block.reshape(-1)   # (window*F,) = (351,) in v26
             X_rows.append(flat_row)
 
             if y_arr is not None:
@@ -289,7 +300,7 @@ def build_tabular_dataset(
             np.empty(0),
         )
 
-    X = np.array(X_rows, dtype=np.float32)                           # (N, 507)
+    X = np.array(X_rows, dtype=np.float32)                           # (N, 351)
     y = np.array(y_rows, dtype=np.float32) if y_rows else None       # (N, H)
     region_ids = np.array(region_id_lst)
 
@@ -306,7 +317,8 @@ def build_tabular_test(
 
     For each region in test_df, take the LAST `window` rows (padding at front
     if the region has fewer than `window` historical rows), then flatten ALL
-    `window` rows into a single wide feature vector of length (window * F) = 507.
+    `window` rows into a single wide feature vector of length (window * F).
+    v26: 27 features x 13 weeks = 351.
 
     This gives exactly one row per region (2248 rows for the competition).
 
@@ -319,7 +331,7 @@ def build_tabular_test(
     Returns
     -------
     X          : np.ndarray of shape (n_regions, window * len(feat_cols)), float32
-                 i.e. (2248, 507) with default settings
+                 i.e. (2248, 351) with v26 27-feature set
     region_ids : np.ndarray of shape (n_regions,)
     """
     X_rows     = []
@@ -351,14 +363,14 @@ def build_tabular_test(
 
 
 # ---------------------------------------------------------------------------
-# V21 Primary CV: 5-Fold StratifiedGroupKFold builder (RETAINED for V23)
+# V21 Primary CV: 5-Fold StratifiedGroupKFold builder (RETAINED for V26)
 # ---------------------------------------------------------------------------
 def build_stratified_group_cv_folds(
     df: pd.DataFrame,
     n_splits: int = 5,
 ):
     """
-    V21/V22/V23 Primary CV: 5-Fold StratifiedGroupKFold.
+    V21/V22/V23/V26 Primary CV: 5-Fold StratifiedGroupKFold.
 
     Strategy:
     ---------
@@ -380,7 +392,7 @@ def build_stratified_group_cv_folds(
     ---------------------------------------
     ALL valid sliding windows (same treatment as training regions).
 
-    Note: gap = 0 throughout (V21/V22/V23 paradigm).
+    Note: gap = 0 throughout (V21/V22/V23/V26 paradigm).
 
     Parameters
     ----------
@@ -461,8 +473,8 @@ def build_full_train_groups(df: pd.DataFrame, actual_gaps: dict = None):
     Build region groups using ALL rows (no held-out validation period).
     Used for final model training after CV is complete.
 
-    V21/V22/V23: gap=0 throughout.  actual_gaps parameter retained for backward
-    compat but is ignored.
+    V21/V22/V23/V26: gap=0 throughout.  actual_gaps parameter retained for
+    backward compat but is ignored.
     """
     train_groups = []
     for _, group in df.groupby("region_id"):
@@ -487,7 +499,7 @@ class DroughtDataset:
     """
     V22+ STUB: PyTorch DroughtDataset is ABOLISHED.
 
-    The V22/V23 pipeline uses build_tabular_dataset() and build_tabular_test()
+    The V22/V23/V26 pipeline uses build_tabular_dataset() and build_tabular_test()
     for pure NumPy/Pandas tabular matrices.  LightGBM does not use DataLoaders.
 
     Retained for import compatibility only.  Instantiation raises NotImplementedError.
@@ -544,7 +556,7 @@ def build_single_fold(df: pd.DataFrame, actual_gaps: dict = None):
     V15 legacy stub.  Returns (train_groups, val_groups) from first fold of
     StratifiedGroupKFold.
 
-    V21/V22/V23: gap=0. actual_gaps ignored.
+    V21/V22/V23/V26: gap=0. actual_gaps ignored.
     """
     folds = build_stratified_group_cv_folds(df, n_splits=5)
     if folds:
@@ -555,7 +567,7 @@ def build_single_fold(df: pd.DataFrame, actual_gaps: dict = None):
 def build_gap_replay_folds(df: pd.DataFrame, actual_gaps: dict = None):
     """
     V14 legacy stub. Returns StratifiedGroupKFold folds.
-    V21/V22/V23: gap=0. actual_gaps ignored.
+    V21/V22/V23/V26: gap=0. actual_gaps ignored.
     """
     return build_stratified_group_cv_folds(df, n_splits=WF_NUM_FOLDS)
 
