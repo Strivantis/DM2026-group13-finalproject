@@ -1,0 +1,533 @@
+==========================================================================================
+Drought Forecasting Pipeline  v29  (The Tweedie-Hurdle Paradigm Refinement)
+Decoupled Dual-Tree Hurdle  |  Model A: regression_l1 (masked y>0)  |  Model B: binary
+Feature Space: 27 features x 13 weeks (351) + 27 explicit deltas = 378 dims
+OOF Gate : per-week dynamic threshold from OOF grid-search [0.1, 0.9]
+Test Blend: Model A -> np.median (5 folds)  |  Model B -> np.mean (5 folds)
+Final Gate: vectorized best_thresholds[week_idx]  |  clip [0, 5]
+5-Fold StratifiedGroupKFold  |  5 model pairs per fold (one pair per week)
+==========================================================================================
+
+v29 Architectural Changes over v28:
+  [PHASE 1] Pure Conditional Severity Training (Model A Masking):
+            Model A trains ONLY on active drought rows (y_train_w > 0).
+            Zero-mass samples excluded from .fit() to prevent scale corruption.
+            OOF predictions generated on FULL X_val (shape alignment preserved).
+            Model B unchanged: trains on ALL rows with binary target (y > 0).
+  [PHASE 2] Capacity Release & Hyperparameter Re-Calibration:
+            max_depth ABOLISHED (no constraint) for both Model A and Model B.
+            num_leaves      : 31  --> 63
+            learning_rate   : 0.02 --> 0.015
+            min_child_samples: <new> = 100
+            n_estimators_A  : 10000 --> 15000
+            n_estimators_B  : 5000  --> 10000
+            early_stop_rounds: 150 --> 250
+  [PHASE 3] Post-CV OOF Dynamic Threshold Sweep:
+            Independent per-week grid-search over np.linspace(0.1, 0.9, 100).
+            Minimizes OOF MAE for each of the 5 future weeks independently.
+            best_thresholds[5] replaces hardcoded 0.5 everywhere.
+  [PHASE 4] Test Inference Pipeline: vectorized best_thresholds application.
+  [RETAIN]  378-dim flat tabular layout from v27/v28.
+            Binned Error Matrix diagnostic layer from v28.
+
+Training Config:
+  Model A (Regressor)  objective       = regression_l1  [trains on y>0 only]
+  Model B (Classifier) objective       = binary          [trains on all rows]
+  LGBM device                          = gpu
+  max_depth                            = <ABOLISHED -- no constraint>
+  num_leaves                           = 63
+  colsample_bytree                     = 0.5
+  min_child_samples                    = 100
+  learning_rate                        = 0.015
+  n_estimators (Model A)               = 15000
+  n_estimators (Model B)               = 10000
+  early_stopping_rounds                = 250
+  eval_metric (Model A)                = mae
+  eval_metric (Model B)                = binary_logloss
+  N_FOLDS                              = 5
+  N_FLAT_FEATURES                      = 378  (WINDOW_SIZE=13 x FEAT=27 + 27 deltas)
+
+Loading processed data ...
+  train raw: (1757936, 43)  |  test raw: (29224, 40)
+  train regions: 2248  |  test regions: 2248
+
+[v29 Feature Validation]
+  v week_sin, week_cos present.
+  v No 8w/13w rolling features (domain-shift columns absent).
+  [INFO] Lag columns present in raw CSV (excluded from FEATURE_COLS): ['tmp_lag1w', 'tmp_lag2w', 'humidity_lag1w', 'humidity_lag2w', 'prec_lag1w', 'prec_lag2w']...
+  v29 FEATURE_COLS: 27 base features (lag/rolling purged).
+  v29 flat input dim: 378  (27 x 13 = 351 + 27 explicit deltas = 378)
+
+Refining features (drought proxy index + log1p prec + v22/v26 pruning) ...
+  train after refinement: (1757936, 44)  |  test: (29224, 41)
+
+[Training Target Distribution]
+  mean=0.8357  std=1.2615  min=0.00  max=5.00
+  Zero-inflation: 59.63% of training scores == 0.0
+  --> Hurdle classifier target: 709,603 positives (40.37%) vs 1,048,333 zeroes (59.63%)
+
+[v29] Feature columns and flat input shape ...
+  FEATURE_COLS (27): ['prec', 'surf_pre', 'humidity', 'tmp', 'tmp_max', 'tmp_min', 'tmp_range', 'wind', 'wind_min', 'wind_range', 'tmp_week_max', 'tmp_week_min', 'tmp_week_std', 'humidity_week_max', 'humidity_week_min', 'humidity_week_std', 'wind_week_max', 'wind_week_min', 'wind_week_std', 'prec_week_max', 'surf_pre_week_max', 'week_sin', 'week_cos', 'pet', 'deficit', 'region_mean_score', 'region_zero_prob']
+  flat input_size = 378  (WINDOW_SIZE=13 x FEATURE_COLS=27 + 27 deltas = 378)
+
+==========================================================================================
+5-Fold StratifiedGroupKFold CV  [v29 -- Pure Conditional Hurdle]
+  Group  : region_id  |  Strata : 10-quantile bins of per-region mean score
+==========================================================================================
+
+  Folds built: 5
+  Fold 0: train_groups=1,798  val_groups=450
+  Fold 1: train_groups=1,798  val_groups=450
+  Fold 2: train_groups=1,798  val_groups=450
+  Fold 3: train_groups=1,798  val_groups=450
+  Fold 4: train_groups=1,800  val_groups=448
+
+==========================================================================================
+5-Fold Dual-Tree Hurdle Training  [v29]
+  Per fold x week: Model A (L1 Regressor, masked y>0) + Model B (Binary Classifier)
+  Model A: max_depth abolished, num_leaves=63, lr=0.015, n_estimators=15000
+  Model B: max_depth abolished, num_leaves=63, lr=0.015, n_estimators=10000
+  OOF output: per-week dynamic threshold applied post-sweep (not hardcoded 0.5)
+==========================================================================================
+
+==========================================================================================
+FOLD 1 / 5  [v29 Pure Conditional Hurdle]
+  train_groups: 1,798  |  val_groups: 450
+==========================================================================================
+  [OOF TE] Train regions: 1,798  | Val regions: 450
+  feat_cols available: 27 / 27
+  X_train: (1375470, 378)  |  y_train: (1375470, 5)
+  X_val  : (344250, 378)    |  y_val  : (344250, 5)
+  v Feature dim = 378  (351 flat + 27 explicit deltas = 378)
+  X_test: (2248, 378)
+
+  --- Week 1 ---
+    [Mask-A] Active drought rows: train=557,503/1,375,470  val=139,467/344,250
+    [Model A] best_iter=15000  val_MAE(full)=0.9944
+    [SAVED-A] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_a_fold0_week0.pkl
+    [Model B] best_iter=10000
+    [SAVED-B] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_b_fold0_week0.pkl
+    [OOF Gate] HurdleMAE=0.3699  zero-gated=60.22%  (temp 0.5 threshold; final per-week sweep post-CV)
+
+  --- Week 2 ---
+    [Mask-A] Active drought rows: train=556,999/1,375,470  val=139,362/344,250
+    [Model A] best_iter=15000  val_MAE(full)=1.0133
+    [SAVED-A] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_a_fold0_week1.pkl
+    [Model B] best_iter=10000
+    [SAVED-B] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_b_fold0_week1.pkl
+    [OOF Gate] HurdleMAE=0.3752  zero-gated=60.32%  (temp 0.5 threshold; final per-week sweep post-CV)
+
+  --- Week 3 ---
+    [Mask-A] Active drought rows: train=556,471/1,375,470  val=139,246/344,250
+    [Model A] best_iter=15000  val_MAE(full)=1.0098
+    [SAVED-A] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_a_fold0_week2.pkl
+    [Model B] best_iter=10000
+    [SAVED-B] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_b_fold0_week2.pkl
+    [OOF Gate] HurdleMAE=0.3748  zero-gated=60.32%  (temp 0.5 threshold; final per-week sweep post-CV)
+
+  --- Week 4 ---
+    [Mask-A] Active drought rows: train=555,917/1,375,470  val=139,113/344,250
+    [Model A] best_iter=15000  val_MAE(full)=1.0232
+    [SAVED-A] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_a_fold0_week3.pkl
+    [Model B] best_iter=10000
+    [SAVED-B] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_b_fold0_week3.pkl
+    [OOF Gate] HurdleMAE=0.3761  zero-gated=60.46%  (temp 0.5 threshold; final per-week sweep post-CV)
+
+  --- Week 5 ---
+    [Mask-A] Active drought rows: train=555,413/1,375,470  val=138,986/344,250
+    [Model A] best_iter=15000  val_MAE(full)=1.0257
+    [SAVED-A] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_a_fold0_week4.pkl
+    [Model B] best_iter=10000
+    [SAVED-B] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_b_fold0_week4.pkl
+    [OOF Gate] HurdleMAE=0.3740  zero-gated=60.94%  (temp 0.5 threshold; final per-week sweep post-CV)
+
+  [Fold 0] Week MAEs (Model A raw L1) : W1=0.9944  W2=1.0133  W3=1.0098  W4=1.0232  W5=1.0257
+  [Fold 0] Week MAEs (Hurdle-Gated)   : W1=0.3699  W2=0.3752  W3=0.3748  W4=0.3761  W5=0.3740
+  [Fold 0] Mean Val MAE (raw L1)      : 1.0133
+  [Fold 0] Mean Val MAE (hurdle gate) : 0.3740
+  [Fold 0] Elapsed                    : 3949.4s
+
+  ================================================================================
+  BINNED ERROR MATRIX  --  Fold 0  (OOF Hurdle-Gated Predictions)
+  ================================================================================
+  Interval                                              Count   AvgTrue   AvgPred       MAE
+  ------------------------------------------------------------------------------
+  Interval 0  [Absolute Zero     y == 0.0       ]     1,025,076    0.0000    0.1556    0.1556
+  Interval 1  [Mild Drought      0.0 < y <= 1.0 ]     299,981    1.0000    1.1540    0.7215
+  Interval 2  [Moderate Drought  1.0 < y <= 2.0 ]     181,361    2.0000    1.8622    0.4863
+  Interval 3  [Severe Drought    2.0 < y <= 3.0 ]     118,791    3.0000    2.4821    0.6788
+  Interval 4  [Extreme Drought   3.0 < y <= 4.0 ]      66,541    4.0000    3.1051    0.9730
+  Interval 5  [Exceptional       4.0 < y <= 5.0 ]      29,500    5.0000    3.8738    1.1605
+  ================================================================================
+
+
+==========================================================================================
+FOLD 2 / 5  [v29 Pure Conditional Hurdle]
+  train_groups: 1,798  |  val_groups: 450
+==========================================================================================
+  [OOF TE] Train regions: 1,798  | Val regions: 450
+  feat_cols available: 27 / 27
+  X_train: (1375470, 378)  |  y_train: (1375470, 5)
+  X_val  : (344250, 378)    |  y_val  : (344250, 5)
+  v Feature dim = 378  (351 flat + 27 explicit deltas = 378)
+  X_test: (2248, 378)
+
+  --- Week 1 ---
+    [Mask-A] Active drought rows: train=556,349/1,375,470  val=140,621/344,250
+    [Model A] best_iter=5892  val_MAE(full)=1.0331
+    [SAVED-A] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_a_fold1_week0.pkl
+    [Model B] best_iter=10000
+    [SAVED-B] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_b_fold1_week0.pkl
+    [OOF Gate] HurdleMAE=0.3908  zero-gated=60.71%  (temp 0.5 threshold; final per-week sweep post-CV)
+
+  --- Week 2 ---
+    [Mask-A] Active drought rows: train=555,862/1,375,470  val=140,499/344,250
+    [Model A] best_iter=5502  val_MAE(full)=1.0474
+    [SAVED-A] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_a_fold1_week1.pkl
+    [Model B] best_iter=10000
+    [SAVED-B] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_b_fold1_week1.pkl
+    [OOF Gate] HurdleMAE=0.3932  zero-gated=60.74%  (temp 0.5 threshold; final per-week sweep post-CV)
+
+  --- Week 3 ---
+    [Mask-A] Active drought rows: train=555,347/1,375,470  val=140,370/344,250
+    [Model A] best_iter=15000  val_MAE(full)=1.0008
+    [SAVED-A] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_a_fold1_week2.pkl
+    [Model B] best_iter=10000
+    [SAVED-B] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_b_fold1_week2.pkl
+    [OOF Gate] HurdleMAE=0.3738  zero-gated=60.97%  (temp 0.5 threshold; final per-week sweep post-CV)
+
+  --- Week 4 ---
+    [Mask-A] Active drought rows: train=554,790/1,375,470  val=140,240/344,250
+    [Model A] best_iter=12631  val_MAE(full)=1.0124
+    [SAVED-A] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_a_fold1_week3.pkl
+    [Model B] best_iter=10000
+    [SAVED-B] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_b_fold1_week3.pkl
+    [OOF Gate] HurdleMAE=0.3769  zero-gated=61.19%  (temp 0.5 threshold; final per-week sweep post-CV)
+
+  --- Week 5 ---
+    [Mask-A] Active drought rows: train=554,283/1,375,470  val=140,116/344,250
+    [Model A] best_iter=14998  val_MAE(full)=1.0190
+    [SAVED-A] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_a_fold1_week4.pkl
+    [Model B] best_iter=10000
+    [SAVED-B] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_b_fold1_week4.pkl
+    [OOF Gate] HurdleMAE=0.3771  zero-gated=61.35%  (temp 0.5 threshold; final per-week sweep post-CV)
+
+  [Fold 1] Week MAEs (Model A raw L1) : W1=1.0331  W2=1.0474  W3=1.0008  W4=1.0124  W5=1.0190
+  [Fold 1] Week MAEs (Hurdle-Gated)   : W1=0.3908  W2=0.3932  W3=0.3738  W4=0.3769  W5=0.3771
+  [Fold 1] Mean Val MAE (raw L1)      : 1.0225
+  [Fold 1] Mean Val MAE (hurdle gate) : 0.3824
+  [Fold 1] Elapsed                    : 3423.5s
+
+  ================================================================================
+  BINNED ERROR MATRIX  --  Fold 1  (OOF Hurdle-Gated Predictions)
+  ================================================================================
+  Interval                                              Count   AvgTrue   AvgPred       MAE
+  ------------------------------------------------------------------------------
+  Interval 0  [Absolute Zero     y == 0.0       ]     1,019,404    0.0000    0.1426    0.1426
+  Interval 1  [Mild Drought      0.0 < y <= 1.0 ]     303,316    1.0000    1.1263    0.7211
+  Interval 2  [Moderate Drought  1.0 < y <= 2.0 ]     183,538    2.0000    1.8026    0.5023
+  Interval 3  [Severe Drought    2.0 < y <= 3.0 ]     118,371    3.0000    2.3545    0.7568
+  Interval 4  [Extreme Drought   3.0 < y <= 4.0 ]      65,856    4.0000    2.9272    1.1239
+  Interval 5  [Exceptional       4.0 < y <= 5.0 ]      30,765    5.0000    3.7821    1.2427
+  ================================================================================
+
+
+==========================================================================================
+FOLD 3 / 5  [v29 Pure Conditional Hurdle]
+  train_groups: 1,798  |  val_groups: 450
+==========================================================================================
+  [OOF TE] Train regions: 1,798  | Val regions: 450
+  feat_cols available: 27 / 27
+  X_train: (1375470, 378)  |  y_train: (1375470, 5)
+  X_val  : (344250, 378)    |  y_val  : (344250, 5)
+  v Feature dim = 378  (351 flat + 27 explicit deltas = 378)
+  X_test: (2248, 378)
+
+  --- Week 1 ---
+    [Mask-A] Active drought rows: train=557,411/1,375,470  val=139,559/344,250
+    [Model A] best_iter=12347  val_MAE(full)=0.9995
+    [SAVED-A] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_a_fold2_week0.pkl
+    [Model B] best_iter=10000
+    [SAVED-B] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_b_fold2_week0.pkl
+    [OOF Gate] HurdleMAE=0.3719  zero-gated=59.41%  (temp 0.5 threshold; final per-week sweep post-CV)
+
+  --- Week 2 ---
+    [Mask-A] Active drought rows: train=556,934/1,375,470  val=139,427/344,250
+    [Model A] best_iter=15000  val_MAE(full)=1.0021
+    [SAVED-A] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_a_fold2_week1.pkl
+    [Model B] best_iter=10000
+    [SAVED-B] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_b_fold2_week1.pkl
+    [OOF Gate] HurdleMAE=0.3682  zero-gated=59.59%  (temp 0.5 threshold; final per-week sweep post-CV)
+
+  --- Week 3 ---
+    [Mask-A] Active drought rows: train=556,425/1,375,470  val=139,292/344,250
+    [Model A] best_iter=15000  val_MAE(full)=1.0039
+    [SAVED-A] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_a_fold2_week2.pkl
+    [Model B] best_iter=10000
+    [SAVED-B] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_b_fold2_week2.pkl
+    [OOF Gate] HurdleMAE=0.3678  zero-gated=59.68%  (temp 0.5 threshold; final per-week sweep post-CV)
+
+  --- Week 4 ---
+    [Mask-A] Active drought rows: train=555,876/1,375,470  val=139,154/344,250
+    [Model A] best_iter=15000  val_MAE(full)=1.0108
+    [SAVED-A] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_a_fold2_week3.pkl
+    [Model B] best_iter=10000
+    [SAVED-B] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_b_fold2_week3.pkl
+    [OOF Gate] HurdleMAE=0.3666  zero-gated=60.13%  (temp 0.5 threshold; final per-week sweep post-CV)
+
+  --- Week 5 ---
+    [Mask-A] Active drought rows: train=555,371/1,375,470  val=139,028/344,250
+    [Model A] best_iter=15000  val_MAE(full)=1.0247
+    [SAVED-A] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_a_fold2_week4.pkl
+    [Model B] best_iter=10000
+    [SAVED-B] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_b_fold2_week4.pkl
+    [OOF Gate] HurdleMAE=0.3684  zero-gated=60.34%  (temp 0.5 threshold; final per-week sweep post-CV)
+
+  [Fold 2] Week MAEs (Model A raw L1) : W1=0.9995  W2=1.0021  W3=1.0039  W4=1.0108  W5=1.0247
+  [Fold 2] Week MAEs (Hurdle-Gated)   : W1=0.3719  W2=0.3682  W3=0.3678  W4=0.3666  W5=0.3684
+  [Fold 2] Mean Val MAE (raw L1)      : 1.0082
+  [Fold 2] Mean Val MAE (hurdle gate) : 0.3686
+  [Fold 2] Elapsed                    : 3851.5s
+
+  ================================================================================
+  BINNED ERROR MATRIX  --  Fold 2  (OOF Hurdle-Gated Predictions)
+  ================================================================================
+  Interval                                              Count   AvgTrue   AvgPred       MAE
+  ------------------------------------------------------------------------------
+  Interval 0  [Absolute Zero     y == 0.0       ]     1,024,790    0.0000    0.1561    0.1561
+  Interval 1  [Mild Drought      0.0 < y <= 1.0 ]     300,358    1.0000    1.1702    0.7024
+  Interval 2  [Moderate Drought  1.0 < y <= 2.0 ]     181,954    2.0000    1.9067    0.4618
+  Interval 3  [Severe Drought    2.0 < y <= 3.0 ]     113,193    3.0000    2.4722    0.6695
+  Interval 4  [Extreme Drought   3.0 < y <= 4.0 ]      67,836    4.0000    3.1528    0.9252
+  Interval 5  [Exceptional       4.0 < y <= 5.0 ]      33,119    5.0000    3.8009    1.2359
+  ================================================================================
+
+
+==========================================================================================
+FOLD 4 / 5  [v29 Pure Conditional Hurdle]
+  train_groups: 1,798  |  val_groups: 450
+==========================================================================================
+  [OOF TE] Train regions: 1,798  | Val regions: 450
+  feat_cols available: 27 / 27
+  X_train: (1375470, 378)  |  y_train: (1375470, 5)
+  X_val  : (344250, 378)    |  y_val  : (344250, 5)
+  v Feature dim = 378  (351 flat + 27 explicit deltas = 378)
+  X_test: (2248, 378)
+
+  --- Week 1 ---
+    [Mask-A] Active drought rows: train=557,569/1,375,470  val=139,401/344,250
+    [Model A] best_iter=15000  val_MAE(full)=0.9970
+    [SAVED-A] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_a_fold3_week0.pkl
+    [Model B] best_iter=9999
+    [SAVED-B] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_b_fold3_week0.pkl
+    [OOF Gate] HurdleMAE=0.3673  zero-gated=59.68%  (temp 0.5 threshold; final per-week sweep post-CV)
+
+  --- Week 2 ---
+    [Mask-A] Active drought rows: train=557,080/1,375,470  val=139,281/344,250
+    [Model A] best_iter=15000  val_MAE(full)=1.0007
+    [SAVED-A] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_a_fold3_week1.pkl
+    [Model B] best_iter=10000
+    [SAVED-B] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_b_fold3_week1.pkl
+    [OOF Gate] HurdleMAE=0.3680  zero-gated=59.52%  (temp 0.5 threshold; final per-week sweep post-CV)
+
+  --- Week 3 ---
+    [Mask-A] Active drought rows: train=556,562/1,375,470  val=139,155/344,250
+    [Model A] best_iter=15000  val_MAE(full)=1.0062
+    [SAVED-A] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_a_fold3_week2.pkl
+    [Model B] best_iter=10000
+    [SAVED-B] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_b_fold3_week2.pkl
+    [OOF Gate] HurdleMAE=0.3692  zero-gated=59.62%  (temp 0.5 threshold; final per-week sweep post-CV)
+
+  --- Week 4 ---
+    [Mask-A] Active drought rows: train=556,011/1,375,470  val=139,019/344,250
+    [Model A] best_iter=15000  val_MAE(full)=1.0184
+    [SAVED-A] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_a_fold3_week3.pkl
+    [Model B] best_iter=10000
+    [SAVED-B] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_b_fold3_week3.pkl
+    [OOF Gate] HurdleMAE=0.3687  zero-gated=59.96%  (temp 0.5 threshold; final per-week sweep post-CV)
+
+  --- Week 5 ---
+    [Mask-A] Active drought rows: train=555,505/1,375,470  val=138,894/344,250
+    [Model A] best_iter=15000  val_MAE(full)=1.0304
+    [SAVED-A] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_a_fold3_week4.pkl
+    [Model B] best_iter=10000
+    [SAVED-B] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_b_fold3_week4.pkl
+    [OOF Gate] HurdleMAE=0.3708  zero-gated=60.25%  (temp 0.5 threshold; final per-week sweep post-CV)
+
+  [Fold 3] Week MAEs (Model A raw L1) : W1=0.9970  W2=1.0007  W3=1.0062  W4=1.0184  W5=1.0304
+  [Fold 3] Week MAEs (Hurdle-Gated)   : W1=0.3673  W2=0.3680  W3=0.3692  W4=0.3687  W5=0.3708
+  [Fold 3] Mean Val MAE (raw L1)      : 1.0105
+  [Fold 3] Mean Val MAE (hurdle gate) : 0.3688
+  [Fold 3] Elapsed                    : 4085.8s
+
+  ================================================================================
+  BINNED ERROR MATRIX  --  Fold 3  (OOF Hurdle-Gated Predictions)
+  ================================================================================
+  Interval                                              Count   AvgTrue   AvgPred       MAE
+  ------------------------------------------------------------------------------
+  Interval 0  [Absolute Zero     y == 0.0       ]     1,025,500    0.0000    0.1533    0.1533
+  Interval 1  [Mild Drought      0.0 < y <= 1.0 ]     296,824    1.0000    1.1887    0.7063
+  Interval 2  [Moderate Drought  1.0 < y <= 2.0 ]     184,364    2.0000    1.8727    0.4674
+  Interval 3  [Severe Drought    2.0 < y <= 3.0 ]     114,192    3.0000    2.4702    0.6742
+  Interval 4  [Extreme Drought   3.0 < y <= 4.0 ]      68,452    4.0000    3.0943    0.9814
+  Interval 5  [Exceptional       4.0 < y <= 5.0 ]      31,918    5.0000    3.8569    1.1789
+  ================================================================================
+
+
+==========================================================================================
+FOLD 5 / 5  [v29 Pure Conditional Hurdle]
+  train_groups: 1,800  |  val_groups: 448
+==========================================================================================
+  [OOF TE] Train regions: 1,800  | Val regions: 448
+  feat_cols available: 27 / 27
+  X_train: (1377000, 378)  |  y_train: (1377000, 5)
+  X_val  : (342720, 378)    |  y_val  : (342720, 5)
+  v Feature dim = 378  (351 flat + 27 explicit deltas = 378)
+  X_test: (2248, 378)
+
+  --- Week 1 ---
+    [Mask-A] Active drought rows: train=559,048/1,377,000  val=137,922/342,720
+    [Model A] best_iter=15000  val_MAE(full)=0.9912
+    [SAVED-A] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_a_fold4_week0.pkl
+    [Model B] best_iter=10000
+    [SAVED-B] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_b_fold4_week0.pkl
+    [OOF Gate] HurdleMAE=0.3510  zero-gated=60.15%  (temp 0.5 threshold; final per-week sweep post-CV)
+
+  --- Week 2 ---
+    [Mask-A] Active drought rows: train=558,569/1,377,000  val=137,792/342,720
+    [Model A] best_iter=15000  val_MAE(full)=0.9956
+    [SAVED-A] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_a_fold4_week1.pkl
+    [Model B] best_iter=10000
+    [SAVED-B] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_b_fold4_week1.pkl
+    [OOF Gate] HurdleMAE=0.3516  zero-gated=60.36%  (temp 0.5 threshold; final per-week sweep post-CV)
+
+  --- Week 3 ---
+    [Mask-A] Active drought rows: train=558,063/1,377,000  val=137,654/342,720
+    [Model A] best_iter=15000  val_MAE(full)=1.0024
+    [SAVED-A] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_a_fold4_week2.pkl
+    [Model B] best_iter=10000
+    [SAVED-B] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_b_fold4_week2.pkl
+    [OOF Gate] HurdleMAE=0.3528  zero-gated=60.32%  (temp 0.5 threshold; final per-week sweep post-CV)
+
+  --- Week 4 ---
+    [Mask-A] Active drought rows: train=557,526/1,377,000  val=137,504/342,720
+    [Model A] best_iter=14999  val_MAE(full)=1.0033
+    [SAVED-A] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_a_fold4_week3.pkl
+    [Model B] best_iter=10000
+    [SAVED-B] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_b_fold4_week3.pkl
+    [OOF Gate] HurdleMAE=0.3510  zero-gated=60.67%  (temp 0.5 threshold; final per-week sweep post-CV)
+
+  --- Week 5 ---
+    [Mask-A] Active drought rows: train=557,024/1,377,000  val=137,375/342,720
+    [Model A] best_iter=15000  val_MAE(full)=1.0115
+    [SAVED-A] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_a_fold4_week4.pkl
+    [Model B] best_iter=10000
+    [SAVED-B] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_b_fold4_week4.pkl
+    [OOF Gate] HurdleMAE=0.3516  zero-gated=60.90%  (temp 0.5 threshold; final per-week sweep post-CV)
+
+  [Fold 4] Week MAEs (Model A raw L1) : W1=0.9912  W2=0.9956  W3=1.0024  W4=1.0033  W5=1.0115
+  [Fold 4] Week MAEs (Hurdle-Gated)   : W1=0.3510  W2=0.3516  W3=0.3528  W4=0.3510  W5=0.3516
+  [Fold 4] Mean Val MAE (raw L1)      : 1.0008
+  [Fold 4] Mean Val MAE (hurdle gate) : 0.3516
+  [Fold 4] Elapsed                    : 4163.4s
+
+  ================================================================================
+  BINNED ERROR MATRIX  --  Fold 4  (OOF Hurdle-Gated Predictions)
+  ================================================================================
+  Interval                                              Count   AvgTrue   AvgPred       MAE
+  ------------------------------------------------------------------------------
+  Interval 0  [Absolute Zero     y == 0.0       ]     1,025,353    0.0000    0.1389    0.1389
+  Interval 1  [Mild Drought      0.0 < y <= 1.0 ]     291,072    1.0000    1.1600    0.6934
+  Interval 2  [Moderate Drought  1.0 < y <= 2.0 ]     183,138    2.0000    1.8708    0.4462
+  Interval 3  [Severe Drought    2.0 < y <= 3.0 ]     113,435    3.0000    2.4570    0.6727
+  Interval 4  [Extreme Drought   3.0 < y <= 4.0 ]      67,659    4.0000    3.1300    0.9433
+  Interval 5  [Exceptional       4.0 < y <= 5.0 ]      32,943    5.0000    3.9314    1.1051
+  ================================================================================
+
+
+==========================================================================================
+5-Fold Cross-Validation Summary  [v29 Pure Conditional Hurdle]
+==========================================================================================
+  Fold 0 [Hurdle-Gated]: W1=0.3699  W2=0.3752  W3=0.3748  W4=0.3761  W5=0.3740  ->  Mean=0.3740
+  Fold 1 [Hurdle-Gated]: W1=0.3908  W2=0.3932  W3=0.3738  W4=0.3769  W5=0.3771  ->  Mean=0.3824
+  Fold 2 [Hurdle-Gated]: W1=0.3719  W2=0.3682  W3=0.3678  W4=0.3666  W5=0.3684  ->  Mean=0.3686
+  Fold 3 [Hurdle-Gated]: W1=0.3673  W2=0.3680  W3=0.3692  W4=0.3687  W5=0.3708  ->  Mean=0.3688
+  Fold 4 [Hurdle-Gated]: W1=0.3510  W2=0.3516  W3=0.3528  W4=0.3510  W5=0.3516  ->  Mean=0.3516
+
+  Overall CV MAE (Hurdle-Gated, temp 0.5 threshold) : 0.3691  +-  0.0101
+  Best Fold  : Fold 4 (MAE=0.3516)
+  Worst Fold : Fold 1 (MAE=0.3824)
+
+  Per-week CV MAE breakdown (Hurdle-Gated, temp 0.5 threshold):
+    Week 1: mean=0.3702  std=0.0127
+    Week 2: mean=0.3712  std=0.0134
+    Week 3: mean=0.3677  std=0.0079
+    Week 4: mean=0.3679  std=0.0094
+    Week 5: mean=0.3684  std=0.0089
+
+==========================================================================================
+[v29 PHASE 3] Post-CV OOF Dynamic Threshold Sweep
+  Goal: Replace hardcoded 0.5 with week-specific MAE-minimizing cutpoints.
+  Method: np.linspace(0.1, 0.9, 100) grid  |  independent per-week optimization
+  OOF matrix assembled by concatenating all 5 fold validation arrays.
+==========================================================================================
+  Assembled OOF matrices: oof_l1=(1719720, 5)  oof_prob=(1719720, 5)  y_true=(1719720, 5)
+  → Week 1 Optimized OOF Threshold: 0.5929  (MAE=0.3633)
+  → Week 2 Optimized OOF Threshold: 0.5929  (MAE=0.3635)
+  → Week 3 Optimized OOF Threshold: 0.5848  (MAE=0.3593)
+  → Week 4 Optimized OOF Threshold: 0.5848  (MAE=0.3598)
+  → Week 5 Optimized OOF Threshold: 0.5848  (MAE=0.3607)
+
+  Final best_thresholds: ['0.5929', '0.5929', '0.5848', '0.5848', '0.5848']
+
+  OOF MAE with Optimized Thresholds : 0.3613
+  OOF MAE improvement vs temp 0.5   : 0.0078
+
+==========================================================================================
+[v29 PHASE 4] Asymmetric Ensemble Compression  (5 folds)
+  Model A (L1 Regressor)  -> strict np.MEDIAN across 5 folds
+       Rationale: median is robust to individual fold outlier fluctuations.
+  Model B (Classifier)    -> np.MEAN  across 5 folds
+       Rationale: probability averaging stabilizes calibrated thresholds.
+  Zero-Gate: vectorized best_thresholds[week_idx] applied per column.
+==========================================================================================
+  preds_a_stack shape : (5, 2248, 5)
+  probs_b_stack shape : (5, 2248, 5)
+  l1_median  stats    : mean=1.9095  std=0.7109  min=0.5109  max=5.1287
+  prob_mean  stats    : mean=0.6604  std=0.2476  min=0.0095  max=0.9967
+  Week 1: threshold=0.5929  zero-gated=27.80%
+  Week 2: threshold=0.5929  zero-gated=30.52%
+  Week 3: threshold=0.5848  zero-gated=32.61%
+  Week 4: threshold=0.5848  zero-gated=36.57%
+  Week 5: threshold=0.5848  zero-gated=40.57%
+
+  Post-gate pre-clip stats:
+    mean=1.4551  std=1.1735  min=0.0000  max=5.1287
+    exact-zero fraction: 33.61%
+
+[Submission Prediction Diagnostics]
+  n=11,240  mean=1.4550  std=1.1734
+  p50=1.7273  p75=2.2914  p90=2.8862  p95=3.2469  p99=4.1469  max=5.0000
+  zero-fraction (exact 0.0): 0.3361  (training zero-baseline was 59.63%)
+  v p99 >= 2.0 -- prediction diversity is healthy.
+  *** WARNING: zero-fraction deviation > 15%  (pred=33.61% vs train=59.63%)
+
+Formatting submission.csv ...
+  v Submission assertion passed: 2248 rows, 6 columns.
+  v No NaN values in submission.
+  v Train/test regions match (2248).
+  v All predictions in [0, 5]  (np.clip physical guard enforced).
+
+  submission.csv -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/submission.csv
+  Rows (excl. header): 2248
+  Columns: ['region_id', 'pred_week1', 'pred_week2', 'pred_week3', 'pred_week4', 'pred_week5']
+
+  Preview:
+region_id  pred_week1  pred_week2  pred_week3  pred_week4  pred_week5
+       R1    2.196609    2.179943    0.000000    0.000000    2.248802
+    R1001    1.859429    1.662013    1.603332    1.660458    1.703159
+    R1002    0.000000    2.202918    0.000000    0.000000    0.000000
+    R1005    1.789984    1.987595    2.228063    2.239528    2.465887
+    R1006    2.125396    2.209338    2.407005    2.838063    2.847373
+
+Total elapsed: 19489.3s  (324.8 min)

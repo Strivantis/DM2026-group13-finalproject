@@ -1,6 +1,6 @@
 """
-train.py -- Drought Score Forecasting Pipeline (v28 -- The Calibrated Tabular Hurdle)
-======================================================================================
+train.py -- Drought Score Forecasting Pipeline (v29 -- The Tweedie-Hurdle Paradigm Refinement)
+===============================================================================================
 Usage:
     python src/train.py
 
@@ -8,59 +8,41 @@ Outputs:
     submission.csv                        -- Kaggle submission (2248 rows x 6 cols)
     models/lgbm_a_fold{k}_week{w}.pkl     -- Model A (L1 Regressor) checkpoint (25 total)
     models/lgbm_b_fold{k}_week{w}.pkl     -- Model B (Binary Classifier) checkpoint (25 total)
-    _training_log_28th.txt                -- Full console log
+    _training_log_29th.txt                -- Full console log
 
-v28 Changes (The Calibrated Tabular Hurdle)
--------------------------------------------
-  ABOLISH: Single-head Tweedie regressor (objective='tweedie') completely removed.
-           Tweedie exponential link cannot produce exact zeroes; zero-fraction in
-           submission was 0.0000 despite 59.63% zeros in training ground-truth.
+v29 Changes (The Tweedie-Hurdle Paradigm Refinement)
+------------------------------------------------------
+  PHASE 1 -- Pure Conditional Severity Training (Model A Masking):
+    Model A now trains ONLY on active drought records (y > 0) per fold x week.
+    Zero-mass samples are excluded from Model A's .fit() to prevent calibration
+    scale corruption.  train_mask = y_train_w > 0  |  val_mask = y_val_w > 0.
+    OOF predictions for threshold search are still generated on the FULL X_val
+    to maintain shape alignment with oof_prob.
+    Model B continues to train on ALL rows with binary target (y > 0).
 
-  IMPLEMENT: Decoupled Dual-Tree Hurdle Pipeline -- two distinct LightGBM models
-             trained in parallel inside each CV fold x week:
+  PHASE 2 -- Capacity Release & Hyperparameter Re-Calibration:
+    max_depth constraint ABOLISHED from both Model A and Model B.
+    num_leaves      : 31  --> 63   (doubled node capacity)
+    learning_rate   : 0.02 --> 0.015  (stabilized for high leaf density)
+    n_estimators_A  : 10000 --> 15000  (wider budget for masked L1 convergence)
+    n_estimators_B  : 5000  --> 10000  (wider budget for classifier boundary)
+    early_stop_rounds : 150 --> 250
 
-    Model A  (The Median Predictor):
-      objective='regression_l1'  -- Natively optimizes the Conditional Median (L1 Loss)
-      max_depth=5                 -- Strict depth ceiling to prevent memorizing deltas
-      num_leaves=31               -- Capacity matched to depth constraint
-      colsample_bytree=0.5        -- High feature regularization, alternative split paths
-      learning_rate=0.02          -- Stable, low-oscillation convergence step
-      n_estimators=10000          -- Wide budget controlled by early stopping
-      early_stop=150 rounds, eval_metric='mae'
+  PHASE 3 -- Post-CV OOF Dynamic Threshold Sweep:
+    After full 5-fold CV loop, a per-week grid search over [0.1, 0.9] (100 pts)
+    independently minimizes OOF MAE for each of the 5 future target weeks.
+    Result: best_thresholds[5]  (replaces hardcoded 0.5 boundary throughout).
 
-    Model B  (The Drought Probability Classifier):
-      objective='binary'          -- Pure binary cross-entropy probability tracking
-      max_depth=5                 -- Structural regularization synchronized with Model A
-      num_leaves=31               -- Capacity matched to depth constraint
-      colsample_bytree=0.5        -- Feature sub-sampling identical at 50%
-      learning_rate=0.02
-      n_estimators=5000           -- Focused tree budget for classification boundaries
-      early_stop=150 rounds, eval_metric='binary_logloss'
-      Target: (y > 0.0).astype(int)
+  PHASE 4 -- Updated Test Inference Pipeline:
+    Model A -> np.median across 5 folds (robust compression)
+    Model B -> np.mean  across 5 folds  (probability calibration)
+    Final gate: vectorized per-week application of best_thresholds[week_idx]
+    Safety clip: np.clip(0.0, 5.0)
 
-  OOF COMBINATION:
-      oof_final = np.where(oof_prob < 0.5, 0.0, oof_l1)
-      Zero-gate derived from calibrated classifier probability -- no hand-crafted threshold.
-
-  BINNED ERROR MATRIX:
-      6 physical drought intervals audited per fold:
-        Interval 0: Absolute Zero     (y == 0.0)
-        Interval 1: Mild Drought      (0.0 < y <= 1.0)
-        Interval 2: Moderate Drought  (1.0 < y <= 2.0)
-        Interval 3: Severe Drought    (2.0 < y <= 3.0)
-        Interval 4: Extreme Drought   (3.0 < y <= 4.0)
-        Interval 5: Exceptional Drought (4.0 < y <= 5.0)
-      Reports: count, avg_true, avg_pred, interval_MAE per bin.
-
-  TEST INFERENCE (Asymmetric Ensemble Compression):
-      Model A channel: strict np.median across 5 folds (robust to outlier folds)
-      Model B channel: np.mean across 5 folds (probability averaging for calibration)
-      Final gate: final_preds = np.where(prob_mean < 0.5, 0.0, l1_median)
-      Safety clip: np.clip(0.0, 5.0)
-
-  RETAIN: 378-dimensional flat tabular layout from v27 exactly.
+  RETAIN: 378-dimensional flat tabular layout from v27/v28 exactly.
           (27 features x 13 weeks = 351 + 27 explicit trend deltas = 378)
           5-Fold StratifiedGroupKFold, group=region_id.
+          Binned Error Matrix diagnostic layer from v28.
 
 Architecture
 -------------
@@ -69,24 +51,26 @@ Architecture
     objective_A        : regression_l1
     objective_B        : binary
     device             : gpu
-    max_depth          : 5
-    num_leaves         : 31
+    max_depth          : <REMOVED -- no constraint>
+    num_leaves         : 63
     colsample_bytree   : 0.5
-    learning_rate      : 0.02
-    n_estimators_A     : 10000
-    n_estimators_B     : 5000
-    early_stop_rounds  : 150
+    min_child_samples  : 100
+    learning_rate      : 0.015
+    n_estimators_A     : 15000
+    n_estimators_B     : 10000
+    early_stop_rounds  : 250
     CV                 : 5-Fold StratifiedGroupKFold, group=region_id
 
 Feature Space
 --------------
-    v28 retains v27: 27 features x 13 weeks (351) + 27 explicit deltas = 378 dimensions
+    v29 retains v27/v28: 27 features x 13 weeks (351) + 27 explicit deltas = 378 dimensions
 
 Post-Processing
 ---------------
     Model A ensemble : np.median across 5 folds
     Model B ensemble : np.mean  across 5 folds
-    Zero-gate        : np.where(prob_mean < 0.5, 0.0, l1_median)
+    Per-week dynamic threshold from OOF grid-search (best_thresholds[5])
+    Zero-gate        : np.where(prob_mean[:, w] < best_thresholds[w], 0.0, l1_median[:, w])
     Clip             : np.clip(0.0, 5.0) physical safety guard
 """
 
@@ -143,7 +127,7 @@ os.makedirs(MODELS_DIR, exist_ok=True)
 # Cross-validation
 N_FOLDS = 5
 
-# v28 retains v27 378-dim feature space exactly
+# v29 retains v27/v28 378-dim feature space exactly
 N_FLAT_FEATURES = WINDOW_SIZE * len(FEATURE_COLS) + len(FEATURE_COLS)   # 378
 
 
@@ -282,44 +266,49 @@ def main():
 
     # -- 0. Pipeline description -----------------------------------------------
     log("=" * 90)
-    log("Drought Forecasting Pipeline  v28  (The Calibrated Tabular Hurdle)")
-    log("Decoupled Dual-Tree Hurdle  |  Model A: regression_l1  |  Model B: binary")
+    log("Drought Forecasting Pipeline  v29  (The Tweedie-Hurdle Paradigm Refinement)")
+    log("Decoupled Dual-Tree Hurdle  |  Model A: regression_l1 (masked y>0)  |  Model B: binary")
     log("Feature Space: 27 features x 13 weeks (351) + 27 explicit deltas = 378 dims")
-    log("OOF Gate : np.where(oof_prob < 0.5, 0.0, oof_l1)")
+    log("OOF Gate : per-week dynamic threshold from OOF grid-search [0.1, 0.9]")
     log("Test Blend: Model A -> np.median (5 folds)  |  Model B -> np.mean (5 folds)")
-    log("Final Gate: np.where(prob_mean < 0.5, 0.0, l1_median)  |  clip [0, 5]")
+    log("Final Gate: vectorized best_thresholds[week_idx]  |  clip [0, 5]")
     log("5-Fold StratifiedGroupKFold  |  5 model pairs per fold (one pair per week)")
     log("=" * 90)
     log("")
-    log("v28 Architectural Changes over v27:")
-    log("  [ABOLISH] Tweedie single-head regressor completely removed.")
-    log("            Tweedie exp-link cannot produce exact zeroes -- zero-fraction")
-    log("            in v27 submission was 0.0000 vs 59.63% training zeros.")
-    log("  [IMPLEMENT] Decoupled Dual-Tree Hurdle Pipeline:")
-    log("    Model A -- LGBMRegressor(objective='regression_l1')")
-    log("               max_depth=5  num_leaves=31  colsample_bytree=0.5")
-    log("               lr=0.02  n_estimators=10000  early_stop=150 (eval=mae)")
-    log("    Model B -- LGBMClassifier(objective='binary')")
-    log("               max_depth=5  num_leaves=31  colsample_bytree=0.5")
-    log("               lr=0.02  n_estimators=5000   early_stop=150 (eval=binary_logloss)")
-    log("               target = (y > 0.0).astype(int)")
-    log("  [IMPLEMENT] Binned Error Matrix: 6 drought-interval calibration audit per fold.")
-    log("  [IMPLEMENT] Asymmetric Ensemble Compression:")
-    log("              Model A  -> np.median (robust to fold outliers)")
-    log("              Model B  -> np.mean   (probability averaging = calibration)")
-    log("  [RETAIN] 378-dim flat tabular layout from v27.")
+    log("v29 Architectural Changes over v28:")
+    log("  [PHASE 1] Pure Conditional Severity Training (Model A Masking):")
+    log("            Model A trains ONLY on active drought rows (y_train_w > 0).")
+    log("            Zero-mass samples excluded from .fit() to prevent scale corruption.")
+    log("            OOF predictions generated on FULL X_val (shape alignment preserved).")
+    log("            Model B unchanged: trains on ALL rows with binary target (y > 0).")
+    log("  [PHASE 2] Capacity Release & Hyperparameter Re-Calibration:")
+    log("            max_depth ABOLISHED (no constraint) for both Model A and Model B.")
+    log("            num_leaves      : 31  --> 63")
+    log("            learning_rate   : 0.02 --> 0.015")
+    log("            min_child_samples: <new> = 100")
+    log("            n_estimators_A  : 10000 --> 15000")
+    log("            n_estimators_B  : 5000  --> 10000")
+    log("            early_stop_rounds: 150 --> 250")
+    log("  [PHASE 3] Post-CV OOF Dynamic Threshold Sweep:")
+    log("            Independent per-week grid-search over np.linspace(0.1, 0.9, 100).")
+    log("            Minimizes OOF MAE for each of the 5 future weeks independently.")
+    log("            best_thresholds[5] replaces hardcoded 0.5 everywhere.")
+    log("  [PHASE 4] Test Inference Pipeline: vectorized best_thresholds application.")
+    log("  [RETAIN]  378-dim flat tabular layout from v27/v28.")
+    log("            Binned Error Matrix diagnostic layer from v28.")
     log("")
     log(f"Training Config:")
-    log(f"  Model A (Regressor)  objective       = regression_l1")
-    log(f"  Model B (Classifier) objective       = binary")
+    log(f"  Model A (Regressor)  objective       = regression_l1  [trains on y>0 only]")
+    log(f"  Model B (Classifier) objective       = binary          [trains on all rows]")
     log(f"  LGBM device                          = gpu")
-    log(f"  max_depth                            = 5")
-    log(f"  num_leaves                           = 31")
+    log(f"  max_depth                            = <ABOLISHED -- no constraint>")
+    log(f"  num_leaves                           = 63")
     log(f"  colsample_bytree                     = 0.5")
-    log(f"  learning_rate                        = 0.02")
-    log(f"  n_estimators (Model A)               = 10000")
-    log(f"  n_estimators (Model B)               = 5000")
-    log(f"  early_stopping_rounds                = 150")
+    log(f"  min_child_samples                    = 100")
+    log(f"  learning_rate                        = 0.015")
+    log(f"  n_estimators (Model A)               = 15000")
+    log(f"  n_estimators (Model B)               = 10000")
+    log(f"  early_stopping_rounds                = 250")
     log(f"  eval_metric (Model A)                = mae")
     log(f"  eval_metric (Model B)                = binary_logloss")
     log(f"  N_FOLDS                              = {N_FOLDS}")
@@ -345,7 +334,7 @@ def main():
     assert n_test_regions  == 2248, f"Expected 2248 test regions,  got {n_test_regions}"
 
     # -- 1b. Feature Validation ------------------------------------------------
-    log("\n[v28 Feature Validation]")
+    log("\n[v29 Feature Validation]")
     assert "week_sin" in train_raw.columns, "week_sin missing -- run preprocess.py first"
     assert "week_cos" in train_raw.columns, "week_cos missing -- run preprocess.py first"
     log("  v week_sin, week_cos present.")
@@ -360,8 +349,8 @@ def main():
     if lag_cols_check:
         log(f"  [INFO] Lag columns present in raw CSV (excluded from FEATURE_COLS): "
             f"{lag_cols_check[:6]}{'...' if len(lag_cols_check) > 6 else ''}")
-    log(f"  v28 FEATURE_COLS: {len(FEATURE_COLS)} base features (lag/rolling purged).")
-    log(f"  v28 flat input dim: {N_FLAT_FEATURES}  "
+    log(f"  v29 FEATURE_COLS: {len(FEATURE_COLS)} base features (lag/rolling purged).")
+    log(f"  v29 flat input dim: {N_FLAT_FEATURES}  "
         f"(27 x 13 = 351 + 27 explicit deltas = 378)")
 
     # -- 2. Feature refinement -------------------------------------------------
@@ -389,7 +378,7 @@ def main():
         f"{(all_scores == 0.0).sum():,} zeroes ({zero_frac:.2%})")
 
     # -- 5. Feature columns ----------------------------------------------------
-    log(f"\n[v28] Feature columns and flat input shape ...")
+    log(f"\n[v29] Feature columns and flat input shape ...")
     log(f"  FEATURE_COLS ({len(FEATURE_COLS)}): {FEATURE_COLS}")
     log(f"  flat input_size = {N_FLAT_FEATURES}  "
         f"(WINDOW_SIZE={WINDOW_SIZE} x FEATURE_COLS={len(FEATURE_COLS)} + "
@@ -397,7 +386,7 @@ def main():
 
     # -- 6. Build 5-Fold StratifiedGroupKFold CV splits -----------------------
     log(f"\n{'='*90}")
-    log(f"5-Fold StratifiedGroupKFold CV  [v28 -- Decoupled Dual-Tree Hurdle]")
+    log(f"5-Fold StratifiedGroupKFold CV  [v29 -- Pure Conditional Hurdle]")
     log(f"  Group  : region_id  |  Strata : 10-quantile bins of per-region mean score")
     log(f"{'='*90}")
 
@@ -408,20 +397,27 @@ def main():
 
     # -- 7. 5-Fold Dual-Tree Hurdle Training Loop ------------------------------
     log(f"\n{'='*90}")
-    log("5-Fold Dual-Tree Hurdle Training  [v28]")
-    log("  Per fold x week: Model A (L1 Regressor) + Model B (Binary Classifier)")
-    log("  Both use max_depth=5 for strict temporal regularization.")
-    log("  OOF output gated: oof_final = np.where(oof_prob < 0.5, 0.0, oof_l1)")
+    log("5-Fold Dual-Tree Hurdle Training  [v29]")
+    log("  Per fold x week: Model A (L1 Regressor, masked y>0) + Model B (Binary Classifier)")
+    log("  Model A: max_depth abolished, num_leaves=63, lr=0.015, n_estimators=15000")
+    log("  Model B: max_depth abolished, num_leaves=63, lr=0.015, n_estimators=10000")
+    log("  OOF output: per-week dynamic threshold applied post-sweep (not hardcoded 0.5)")
     log(f"{'='*90}")
 
     fold_results      = []   # (fold_k, week_maes_l1, week_maes_final, mean_mae_final)
     fold_test_preds_a = []   # list of {"preds": (n_regions, 5), "region_ids": [...]}
     fold_test_preds_b = []   # list of {"probs": (n_regions, 5), "region_ids": [...]}
 
+    # OOF accumulation arrays for dynamic threshold sweep (assembled across folds)
+    # We need to store per-fold val arrays keyed by fold index to reconstruct full OOF matrix.
+    # Strategy: store (val_indices, oof_l1_fold, oof_prob_fold, y_val_fold) per fold,
+    # then assemble after the loop using the ordering from folds.
+    oof_fold_data = []   # list of (oof_l1_fold, oof_prob_fold, y_val_fold) in fold order
+
     for fold_k, (raw_train_groups, raw_val_groups) in enumerate(folds):
 
         log(f"\n{'='*90}")
-        log(f"FOLD {fold_k + 1} / {N_FOLDS}  [v28 Decoupled Dual-Tree Hurdle]")
+        log(f"FOLD {fold_k + 1} / {N_FOLDS}  [v29 Pure Conditional Hurdle]")
         log(f"  train_groups: {len(raw_train_groups):,}  |  "
             f"val_groups: {len(raw_val_groups):,}")
         log(f"{'='*90}")
@@ -464,7 +460,7 @@ def main():
         log(f"  X_train: {X_train_np.shape}  |  y_train: {y_train_np.shape}")
         log(f"  X_val  : {X_val_np.shape}    |  y_val  : {y_val_np.shape}")
 
-        # Verify 378-dim feature space (retained from v27)
+        # Verify 378-dim feature space (retained from v27/v28)
         expected_dim = WINDOW_SIZE * len(feat_cols) + len(feat_cols)
         assert X_train_np.shape[1] == expected_dim, (
             f"Feature dim mismatch: got {X_train_np.shape[1]}, "
@@ -480,9 +476,9 @@ def main():
         log(f"  X_test: {X_test_np.shape}")
 
         # -- 7f. Train MODEL A + MODEL B per target week ----------------------
-        fold_val_preds_l1   = np.zeros_like(y_val_np)    # raw L1 regression outputs
-        fold_val_probs      = np.zeros_like(y_val_np)    # raw classifier probabilities
-        fold_val_final      = np.zeros_like(y_val_np)    # hurdle-gated OOF predictions
+        fold_val_preds_l1   = np.zeros_like(y_val_np)    # raw L1 regression outputs (full val)
+        fold_val_probs      = np.zeros_like(y_val_np)    # raw classifier probabilities (full val)
+        fold_val_final      = np.zeros_like(y_val_np)    # hurdle-gated OOF predictions (temp, 0.5)
         fold_test_pred_l1   = np.zeros((X_test_np.shape[0], HORIZON), dtype=np.float32)
         fold_test_prob      = np.zeros((X_test_np.shape[0], HORIZON), dtype=np.float32)
 
@@ -492,24 +488,35 @@ def main():
             y_train_b   = (y_train_w > 0.0).astype(int)        # (N_train,) binary
             y_val_b     = (y_val_w   > 0.0).astype(int)        # (N_val,)   binary
 
+            # -- PHASE 1: Conditional mask for Model A ------------------------
+            # Train Model A ONLY on active drought rows (y > 0)
+            train_mask = y_train_w > 0
+            val_mask   = y_val_w   > 0
+            X_train_masked = X_train_np[train_mask]
+            y_train_masked = y_train_w[train_mask]
+            X_val_masked   = X_val_np[val_mask]
+            y_val_masked   = y_val_w[val_mask]
+            log(f"\n  --- Week {week_idx + 1} ---")
+            log(f"    [Mask-A] Active drought rows: train={train_mask.sum():,}/{len(train_mask):,}"
+                f"  val={val_mask.sum():,}/{len(val_mask):,}")
+
             ckpt_a = os.path.join(MODELS_DIR, f"lgbm_a_fold{fold_k}_week{week_idx}.pkl")
             ckpt_b = os.path.join(MODELS_DIR, f"lgbm_b_fold{fold_k}_week{week_idx}.pkl")
 
-            log(f"\n  --- Week {week_idx + 1} ---")
-
             # ----------------------------------------------------------------
-            # MODEL A  (L1 Regressor -- Conditional Median)
+            # MODEL A  (L1 Regressor -- Conditional Median, masked y>0)
             # ----------------------------------------------------------------
             if os.path.exists(ckpt_a):
                 log(f"    [RESUME-A] Checkpoint found: {ckpt_a}  -- loading.")
                 try:
                     with open(ckpt_a, "rb") as fh:
                         model_a = pickle.load(fh)
+                    # Predict on FULL X_val to keep shape aligned with oof_prob
                     val_l1_w  = model_a.predict(X_val_np)
                     test_l1_w = model_a.predict(X_test_np)
                     best_a = model_a.best_iteration_
                     mae_a  = float(np.mean(np.abs(val_l1_w - y_val_w)))
-                    log(f"    [Model A] best_iter={best_a}  val_MAE={mae_a:.4f}  [LOADED]")
+                    log(f"    [Model A] best_iter={best_a}  val_MAE(full)={mae_a:.4f}  [LOADED]")
                 except Exception as e:
                     log(f"    [WARN-A] Checkpoint corrupted ({e}), deleting and retraining.")
                     os.remove(ckpt_a)
@@ -519,31 +526,34 @@ def main():
 
             if model_a is None:
                 model_a = LGBMRegressor(
-                    objective        = "regression_l1",  # Natively optimizes Conditional Median (L1)
-                    max_depth        = 5,                # Strict depth ceiling, prevents delta noise memorization
-                    num_leaves       = 31,               # Capacity matched with depth constraint
-                    colsample_bytree = 0.5,              # High feature regularization, alternative split paths
-                    learning_rate    = 0.02,             # Stable low-oscillation convergence step
-                    n_estimators     = 10000,            # Wide budget controlled by early stopping
-                    device           = "gpu",
-                    random_state     = 42,
-                    n_jobs           = -1,
-                    verbose          = -1,
+                    objective         = "regression_l1",  # Natively optimizes Conditional Median (L1)
+                    # max_depth ABOLISHED -- no constraint for v29
+                    num_leaves        = 63,               # Doubled capacity (31 -> 63)
+                    colsample_bytree  = 0.5,              # High feature regularization
+                    min_child_samples = 100,              # Minimum leaf data constraint
+                    learning_rate     = 0.015,            # Stabilized for high leaf density
+                    n_estimators      = 15000,            # Wide budget for masked L1 convergence
+                    device            = "gpu",
+                    random_state      = 42,
+                    n_jobs            = -1,
+                    verbose           = -1,
                 )
+                # PHASE 1: fit ONLY on active drought rows (y > 0)
                 model_a.fit(
-                    X_train_np, y_train_w,
-                    eval_set    = [(X_val_np, y_val_w)],
+                    X_train_masked, y_train_masked,
+                    eval_set    = [(X_val_masked, y_val_masked)],
                     eval_metric = "mae",
                     callbacks   = [
-                        lightgbm.early_stopping(stopping_rounds=150, verbose=False),
+                        lightgbm.early_stopping(stopping_rounds=250, verbose=False),
                         lightgbm.log_evaluation(period=500),
                     ],
                 )
+                # OOF Note: predict on FULL X_val so shape aligns with oof_prob
                 val_l1_w  = model_a.predict(X_val_np)
                 test_l1_w = model_a.predict(X_test_np)
                 best_a    = model_a.best_iteration_
                 mae_a     = float(np.mean(np.abs(val_l1_w - y_val_w)))
-                log(f"    [Model A] best_iter={best_a}  val_MAE={mae_a:.4f}")
+                log(f"    [Model A] best_iter={best_a}  val_MAE(full)={mae_a:.4f}")
                 with open(ckpt_a, "wb") as fh:
                     pickle.dump(model_a, fh)
                 log(f"    [SAVED-A] {ckpt_a}")
@@ -554,7 +564,7 @@ def main():
             gc.collect()
 
             # ----------------------------------------------------------------
-            # MODEL B  (Binary Classifier -- Drought Probability)
+            # MODEL B  (Binary Classifier -- Drought Probability, ALL rows)
             # ----------------------------------------------------------------
             if os.path.exists(ckpt_b):
                 log(f"    [RESUME-B] Checkpoint found: {ckpt_b}  -- loading.")
@@ -574,23 +584,25 @@ def main():
 
             if model_b is None:
                 model_b = LGBMClassifier(
-                    objective        = "binary",          # Pure binary cross-entropy probability tracking
-                    max_depth        = 5,                # Structural regularization synchronized with Model A
-                    num_leaves       = 31,               # Capacity matched with depth constraint
-                    colsample_bytree = 0.5,              # Feature sub-sampling identical at 50%
-                    learning_rate    = 0.02,
-                    n_estimators     = 5000,             # Focused tree budget for classification boundaries
-                    device           = "gpu",
-                    random_state     = 42,
-                    n_jobs           = -1,
-                    verbose          = -1,
+                    objective         = "binary",         # Pure binary cross-entropy probability tracking
+                    # max_depth ABOLISHED -- no constraint for v29
+                    num_leaves        = 63,               # Doubled capacity (31 -> 63)
+                    colsample_bytree  = 0.5,              # Feature sub-sampling identical at 50%
+                    min_child_samples = 100,              # Minimum leaf data constraint
+                    learning_rate     = 0.015,            # Stabilized for high leaf density
+                    n_estimators      = 10000,            # Wider budget for classification boundaries
+                    device            = "gpu",
+                    random_state      = 42,
+                    n_jobs            = -1,
+                    verbose           = -1,
                 )
+                # Model B trains on ALL rows with binary target
                 model_b.fit(
                     X_train_np, y_train_b,
                     eval_set    = [(X_val_np, y_val_b)],
                     eval_metric = "binary_logloss",
                     callbacks   = [
-                        lightgbm.early_stopping(stopping_rounds=150, verbose=False),
+                        lightgbm.early_stopping(stopping_rounds=250, verbose=False),
                         lightgbm.log_evaluation(period=500),
                     ],
                 )
@@ -608,7 +620,8 @@ def main():
             gc.collect()
 
             # ----------------------------------------------------------------
-            # Apply local hurdle gate for OOF diagnostics
+            # Apply local temporary hurdle gate (0.5) for per-fold OOF diagnostics
+            # NOTE: final thresholds are determined globally after all folds via sweep
             # ----------------------------------------------------------------
             oof_l1_w   = fold_val_preds_l1[:, week_idx]
             oof_prob_w = fold_val_probs[:,   week_idx]
@@ -619,7 +632,7 @@ def main():
             zero_gate_frac = float((oof_final_w == 0.0).mean())
             log(f"    [OOF Gate] HurdleMAE={mae_final:.4f}  "
                 f"zero-gated={zero_gate_frac:.2%}  "
-                f"(prob<0.5 threshold applied)")
+                f"(temp 0.5 threshold; final per-week sweep post-CV)")
 
         fold_elapsed = time.time() - fold_t0
 
@@ -661,13 +674,20 @@ def main():
             "region_ids": test_region_ids,
         })
 
+        # Store fold OOF data for global threshold sweep
+        oof_fold_data.append((
+            fold_val_preds_l1.copy(),   # (N_val, 5)
+            fold_val_probs.copy(),      # (N_val, 5)
+            y_val_np.copy(),            # (N_val, 5)
+        ))
+
         del X_train_np, y_train_np, X_val_np, y_val_np
         del fold_val_preds_l1, fold_val_probs, fold_val_final
         gc.collect()
 
     # -- 8. Cross-fold summary -------------------------------------------------
     log(f"\n{'='*90}")
-    log(f"5-Fold Cross-Validation Summary  [v28 Decoupled Dual-Tree Hurdle]")
+    log(f"5-Fold Cross-Validation Summary  [v29 Pure Conditional Hurdle]")
     log(f"{'='*90}")
     mean_cv_maes_final = []
     for fold_k, week_maes_l1, week_maes_final, mean_mae_final in fold_results:
@@ -677,26 +697,73 @@ def main():
 
     overall_mean = float(np.mean(mean_cv_maes_final))
     overall_std  = float(np.std(mean_cv_maes_final))
-    log(f"\n  Overall CV MAE (Hurdle-Gated) : {overall_mean:.4f}  +-  {overall_std:.4f}")
-    log(f"  Best Fold                      : Fold {int(np.argmin(mean_cv_maes_final))} "
+    log(f"\n  Overall CV MAE (Hurdle-Gated, temp 0.5 threshold) : {overall_mean:.4f}  +-  {overall_std:.4f}")
+    log(f"  Best Fold  : Fold {int(np.argmin(mean_cv_maes_final))} "
         f"(MAE={min(mean_cv_maes_final):.4f})")
-    log(f"  Worst Fold                     : Fold {int(np.argmax(mean_cv_maes_final))} "
+    log(f"  Worst Fold : Fold {int(np.argmax(mean_cv_maes_final))} "
         f"(MAE={max(mean_cv_maes_final):.4f})")
 
-    log(f"\n  Per-week CV MAE breakdown (Hurdle-Gated):")
+    log(f"\n  Per-week CV MAE breakdown (Hurdle-Gated, temp 0.5 threshold):")
     for week_idx in range(HORIZON):
         wk_maes = [fold_results[k][2][week_idx] for k in range(N_FOLDS)]
         log(f"    Week {week_idx + 1}: mean={np.mean(wk_maes):.4f}  "
             f"std={np.std(wk_maes):.4f}")
 
-    # -- 9. Asymmetric Ensemble Blending (Phase 3) -----------------------------
+    # -- 9. PHASE 3: Post-CV OOF Dynamic Threshold Sweep ----------------------
     log(f"\n{'='*90}")
-    log(f"[v28] Asymmetric Ensemble Compression  ({N_FOLDS} folds)")
+    log(f"[v29 PHASE 3] Post-CV OOF Dynamic Threshold Sweep")
+    log(f"  Goal: Replace hardcoded 0.5 with week-specific MAE-minimizing cutpoints.")
+    log(f"  Method: np.linspace(0.1, 0.9, 100) grid  |  independent per-week optimization")
+    log(f"  OOF matrix assembled by concatenating all {N_FOLDS} fold validation arrays.")
+    log(f"{'='*90}")
+
+    # Assemble full OOF matrices by concatenating across folds
+    oof_l1    = np.concatenate([d[0] for d in oof_fold_data], axis=0)   # (N_total, 5)
+    oof_prob  = np.concatenate([d[1] for d in oof_fold_data], axis=0)   # (N_total, 5)
+    y_true    = np.concatenate([d[2] for d in oof_fold_data], axis=0)   # (N_total, 5)
+
+    log(f"  Assembled OOF matrices: oof_l1={oof_l1.shape}  "
+        f"oof_prob={oof_prob.shape}  y_true={y_true.shape}")
+
+    best_thresholds = []
+    for week_idx in range(HORIZON):
+        thresholds = np.linspace(0.1, 0.9, 100)
+        maes = [
+            np.mean(np.abs(
+                np.where(oof_prob[:, week_idx] < th, 0.0, oof_l1[:, week_idx])
+                - y_true[:, week_idx]
+            ))
+            for th in thresholds
+        ]
+        best_th = thresholds[np.argmin(maes)]
+        best_thresholds.append(best_th)
+        log(f"  → Week {week_idx + 1} Optimized OOF Threshold: {best_th:.4f}  "
+            f"(MAE={min(maes):.4f})")
+
+    log(f"\n  Final best_thresholds: {[f'{t:.4f}' for t in best_thresholds]}")
+
+    # Evaluate overall OOF MAE with optimized thresholds
+    oof_final_opt = np.zeros_like(oof_l1)
+    for week_idx in range(HORIZON):
+        th = best_thresholds[week_idx]
+        oof_final_opt[:, week_idx] = np.where(
+            oof_prob[:, week_idx] < th, 0.0, oof_l1[:, week_idx]
+        )
+    oof_mae_opt = float(np.mean(np.abs(oof_final_opt - y_true)))
+    log(f"\n  OOF MAE with Optimized Thresholds : {oof_mae_opt:.4f}")
+    log(f"  OOF MAE improvement vs temp 0.5   : {overall_mean - oof_mae_opt:.4f}")
+
+    del oof_fold_data, oof_l1, oof_prob, y_true, oof_final_opt
+    gc.collect()
+
+    # -- 10. PHASE 4: Asymmetric Ensemble Blending + Vectorized Thresholds -----
+    log(f"\n{'='*90}")
+    log(f"[v29 PHASE 4] Asymmetric Ensemble Compression  ({N_FOLDS} folds)")
     log(f"  Model A (L1 Regressor)  -> strict np.MEDIAN across {N_FOLDS} folds")
     log(f"       Rationale: median is robust to individual fold outlier fluctuations.")
     log(f"  Model B (Classifier)    -> np.MEAN  across {N_FOLDS} folds")
     log(f"       Rationale: probability averaging stabilizes calibrated thresholds.")
-    log(f"  Zero-Gate: final_preds = np.where(prob_mean < 0.5, 0.0, l1_median)")
+    log(f"  Zero-Gate: vectorized best_thresholds[week_idx] applied per column.")
     log(f"{'='*90}")
 
     all_region_ids = fold_test_preds_a[0]["region_ids"]
@@ -725,11 +792,17 @@ def main():
     log(f"  prob_mean  stats    : mean={prob_mean.mean():.4f}  "
         f"std={prob_mean.std():.4f}  "
         f"min={prob_mean.min():.4f}  max={prob_mean.max():.4f}")
-    log(f"  prob_mean < 0.5 fraction: {(prob_mean < 0.5).mean():.2%}  "
-        f"(will be zero-gated)")
 
-    # Evaluate thresholding strictly after the cross-fold blend has stabilized probabilities
-    final_preds = np.where(prob_mean < 0.5, 0.0, l1_median)
+    # PHASE 4: Vectorized per-week dynamic thresholds
+    final_preds = np.zeros_like(l1_median)
+    for week_idx in range(HORIZON):
+        th = best_thresholds[week_idx]
+        final_preds[:, week_idx] = np.where(
+            prob_mean[:, week_idx] < th, 0.0, l1_median[:, week_idx]
+        )
+        zero_frac_w = float((final_preds[:, week_idx] == 0.0).mean())
+        log(f"  Week {week_idx + 1}: threshold={th:.4f}  "
+            f"zero-gated={zero_frac_w:.2%}")
 
     log(f"\n  Post-gate pre-clip stats:")
     log(f"    mean={final_preds.mean():.4f}  std={final_preds.std():.4f}  "
@@ -739,7 +812,7 @@ def main():
     # Physical safety boundary restriction [0, 5]
     final_preds = np.clip(final_preds, 0.0, 5.0)
 
-    # -- 10. Submission prediction diagnostics ---------------------------------
+    # -- 11. Submission prediction diagnostics ---------------------------------
     log("\n[Submission Prediction Diagnostics]")
     all_sub_preds   = final_preds.ravel()
     zero_frac_final = float((all_sub_preds == 0.0).mean())
@@ -765,7 +838,7 @@ def main():
     else:
         log(f"  v Zero-fraction within 15% tolerance of training baseline.")
 
-    # -- 11. Format & save submission.csv -------------------------------------
+    # -- 12. Format & save submission.csv -------------------------------------
     log("\nFormatting submission.csv ...")
     rows = []
     for i, region_id in enumerate(all_region_ids):
@@ -783,7 +856,7 @@ def main():
     sub_path   = os.path.join(ROOT, "submission.csv")
     submission.to_csv(sub_path, index=False)
 
-    # -- 12. Sanity checks -----------------------------------------------------
+    # -- 13. Sanity checks -----------------------------------------------------
     assert len(submission) == 2248, f"Expected 2248 rows, got {len(submission)}"
     assert list(submission.columns) == [
         "region_id", "pred_week1", "pred_week2",
@@ -809,23 +882,25 @@ def main():
     log(f"  Columns: {list(submission.columns)}")
     log(f"\n  Preview:\n{submission.head(5).to_string(index=False)}")
 
-    # -- 13. Total elapsed time ------------------------------------------------
+    # -- 14. Total elapsed time ------------------------------------------------
     elapsed = time.time() - t0
     log(f"\nTotal elapsed: {elapsed:.1f}s  ({elapsed/60:.1f} min)")
 
-    log_path = os.path.join(ROOT, "_training_log_28th.txt")
+    log_path = os.path.join(ROOT, "_training_log_29th.txt")
     with open(log_path, "w") as fh:
         fh.write("\n".join(log_lines))
     print(f"\nTraining log saved -> {log_path}")
 
     return {
-        "fold_results":    fold_results,
-        "overall_cv_mae":  overall_mean,
-        "std_cv_mae":      overall_std,
-        "input_dim":       N_FLAT_FEATURES,
-        "submission":      submission,
-        "sub_p99":         p99,
-        "zero_frac_final": zero_frac_final,
+        "fold_results":       fold_results,
+        "overall_cv_mae":     overall_mean,
+        "std_cv_mae":         overall_std,
+        "oof_mae_optimized":  oof_mae_opt,
+        "best_thresholds":    best_thresholds,
+        "input_dim":          N_FLAT_FEATURES,
+        "submission":         submission,
+        "sub_p99":            p99,
+        "zero_frac_final":    zero_frac_final,
     }
 
 
