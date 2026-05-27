@@ -1,131 +1,176 @@
 """
-FlatDroughtMLP
-==============
-v25 Multi-Quantile Flat MLP for drought score multi-step forecasting.
+DroughtSequenceNet
+==================
+v31 Parallel Hybrid Backbone for drought score multi-step forecasting.
 
-Architecture (v25 – Adversarial Weighting + Multi-Quantile Pinball Loss)
--------------------------------------------------------------------------
+Architecture (v31 — Parallel Conv1d + BiLSTM + Pure L1 Loss)
+-------------------------------------------------------------
 
-  v25 Paradigm Shift: Hurdle Abolished, Pure Quantile Regression
-  ---------------------------------------------------------------
-  Problem (v24): Dual-Head Hurdle architecture (BCE + SmoothL1) with manual
-    post-processing thresholding creates calibration distortions. Adversarial
-    Validation revealed AUC ~ 0.94 covariate shift between Train and Test sets.
+  v31 Paradigm Shift: Deep Learning Revival via Parallel Hybrid Sequence Net
+  --------------------------------------------------------------------------
+  Problem (v25–v30): Wide flat MLP on tabular 378-dim vectors and tree-based
+    LightGBM ensembles cannot simultaneously capture:
+      (a) Short-term local anomalies (e.g. heatwave spikes) — high-frequency
+          patterns best detected by 1D Temporal Convolutions over weeks.
+      (b) Long-term cumulative processes (e.g. soil evaporation decline) —
+          sequential memory best modelled by Recurrent networks.
 
-  Solution (v25) – FlatDroughtMLP + Multi-Quantile Pinball:
-    1. Replace BiLSTM + TCN with a wide MLP on flattened 13-week feature vectors.
-    2. Abolish dual-head (BCE + Regression). Use a single Quantile Head outputting
-       (B, 5, 3) covering q in [0.1, 0.5, 0.9] for 5 forecast weeks.
-    3. Softplus on the quantile head ensures all outputs >= 0 (physical constraint).
-    4. Training uses Weighted Multi-Quantile Pinball Loss with adversarial sample
-       weights from a LGBMClassifier (P_test = probability a row belongs to Test).
-    5. Inference: extract strictly the q=0.5 (median) channel; no thresholding.
+  Solution (v31) — DroughtSequenceNet + Pure L1 Loss:
+    1. Input reconstructed as (Batch, 13, 27) 3D chronological tensor.
+    2. Branch A (Temporal Convolution): transposed to (B, 27, 13) for Conv1d.
+       Detects local climate anomalies via kernel-3 spatial receptive field.
+    3. Branch B (Bidirectional LSTM): processes (B, 13, 27) directly.
+       3-layer BiLSTM accumulates long-range temporal context.
+    4. Fusion: parallel outputs concatenated → MLP head → (B, 5) raw regression.
+    5. Loss: pure nn.L1Loss() (MAE) natively converges to conditional median,
+       allowing the network to cleanly collapse to 0.0 for zero-inflated regions.
 
-Architecture Detail (v25: input_dim = WINDOW_SIZE * len(FEATURE_COLS) = 507)
-------------------------------------------------------------------------------
-  Input x (B, input_dim)   -- flattened 13-week x 39-feature vector
+Architecture Detail (v31)
+--------------------------
+  Input x (B, 13, 27)   -- 3D chronological time-series (13 weeks, 27 features)
 
-  == Shared Backbone ==
-    -> Linear(input_dim -> 512)
-    -> LayerNorm(512)
+  == Branch A: Temporal Convolution Channel (Short-Term Anomaly Detector) ==
+    -> x.transpose(1, 2)                  -- (B, 27, 13)
+    -> Conv1d(in=27, out=64, kernel=3, padding=1)
     -> GELU()
-    -> Dropout(0.3)
-    -> Linear(512 -> 256)
-    -> LayerNorm(256)
-    -> GELU()
-    -> Dropout(0.3)
-    -> backbone_out: (B, 256)
+    -> GroupNorm(num_groups=8, num_channels=64)
+    -> AdaptiveAvgPool1d(1)               -- (B, 64, 1)
+    -> flatten                            -- (B, 64)
+    branch_a_out : (B, 64)
 
-  == Multi-Quantile Head ==
-    -> Linear(256 -> 5 * 3)    -- 15 raw outputs: 5 weeks x 3 quantiles
-    -> Softplus()              -- guarantees all quantile boundaries >= 0.0
-    -> reshape(B, 5, 3)
-    -> quantile_outputs: (B, 5, 3)
-       dim[-1] index 0 -> q=0.1  (Lower / Pessimistic edge)
-       dim[-1] index 1 -> q=0.5  (Conditional Median -- used in inference)
-       dim[-1] index 2 -> q=0.9  (Upper / Severe drought edge)
+  == Branch B: Long-Term Accumulation Channel (BiLSTM Sequence Memory) ==
+    -> LSTM(input=27, hidden=64, layers=3, bidirectional=True, batch_first=True)
+    -> extract final time-step hidden (forward + backward concatenated)
+    branch_b_out : (B, 128)             -- 64 forward + 64 backward
+
+  == Fusion Head & Projection ==
+    -> torch.cat([branch_a_out, branch_b_out], dim=-1)
+    fused        : (B, 192)
+    -> Linear(192 -> 128) -> GELU() -> Dropout(0.2) -> Linear(128 -> 5)
+    output       : (B, 5)            -- no final activation; raw unbounded regression
 
   Forward Signature:
-    forward(self, x) -> quantile_outputs
-      quantile_outputs : (B, 5, 3)  strictly non-negative via Softplus
+    forward(self, x) -> output
+      output : (B, 5)  raw regression logits (unbounded, no Softplus/Sigmoid)
 
-Changes from v24
+Changes from v25
 ----------------
-  [v25] Hurdle Architecture ABOLISHED: no head_prob (BCE), no head_sev (SmoothL1).
-  [v25] BiLSTM + Dilated TCN ABOLISHED: replaced by wide flat MLP backbone.
-  [v25] Single Quantile Head: Linear(256->15) + Softplus + reshape(B,5,3).
-  [v25] input accepts (B, input_dim): flat 507-dim vector (13w x 39 feats).
-  [v25] forward(x) -- no target_time argument needed.
-  [v25] Softplus on quantile head natively enforces non-negativity.
-  [v25] Multi-Quantile output: q=[0.1, 0.5, 0.9] for uncertainty quantification.
-
-Retained from v24 (backbone philosophy)
------------------------------------------
-  [v24] Wide MLP configuration: 512 -> 256 with LayerNorm + GELU + Dropout(0.3).
-  [v24] Softplus enforces >= 0 physical constraint on predictions.
+  [v31] FlatDroughtMLP ABOLISHED: no wide backbone (512->256).
+  [v31] Input reshaped from (B, 507) flat to (B, 13, 27) 3D temporal tensor.
+  [v31] Conv1d Branch: detects short-term local climate anomaly patterns.
+  [v31] BiLSTM Branch: 3-layer bidirectional; extracts cumulative long-range context.
+  [v31] L1 Loss (MAE): forces median regression; no Softplus non-negativity guard.
+  [v31] No final activation: raw unbounded output (B, 5); clip applied post-inference.
+  [v31] Multi-quantile head ABOLISHED: no (B, 5, 3) quantile output.
+  [v31] Softplus ABOLISHED: physical clip [0, 5] applied in train.py inference block.
 """
 
 import torch
 import torch.nn as nn
 
 
-class FlatDroughtMLP(nn.Module):
+class DroughtSequenceNet(nn.Module):
     """
-    v25 Wide Flat MLP for Multi-Quantile drought forecasting.
+    v31 Parallel Hybrid Backbone for multi-step drought score forecasting.
+
+    Two parallel branches process the input (B, 13, 27) 3D time-series tensor:
+      - Branch A (Conv1d):  short-term local climate anomaly detector.
+      - Branch B (BiLSTM):  long-term cumulative process memory.
+
+    The fused representation is projected through a 2-layer MLP to produce
+    raw regression outputs of shape (B, 5) — no activation at the final layer.
 
     Parameters
     ----------
-    input_dim : int
-        Flattened feature dimension (WINDOW_SIZE * len(FEATURE_COLS) = 507).
-    horizon   : int
-        Number of forecast weeks (default 5).
-    n_quantiles : int
-        Number of quantile levels to predict (default 3: q=0.1, 0.5, 0.9).
-    dropout   : float
-        Dropout probability in backbone (default 0.3).
+    seq_len      : int   — sequence length (number of weeks, default 13)
+    n_features   : int   — number of input features per time step (default 27)
+    conv_out     : int   — Conv1d output channels for Branch A (default 64)
+    lstm_hidden  : int   — LSTM hidden size per direction for Branch B (default 64)
+    lstm_layers  : int   — number of stacked LSTM layers (default 3)
+    mlp_hidden   : int   — hidden size in fusion MLP (default 128)
+    horizon      : int   — number of forecast weeks / output neurons (default 5)
+    dropout      : float — dropout probability in fusion MLP (default 0.2)
     """
-
-    # Quantile levels (index -> quantile mapping)
-    QUANTILE_LEVELS = [0.1, 0.5, 0.9]   # index 0, 1, 2
 
     def __init__(
         self,
-        input_dim: int,
-        horizon: int = 5,
-        n_quantiles: int = 3,
-        dropout: float = 0.3,
+        seq_len:     int   = 13,
+        n_features:  int   = 27,
+        conv_out:    int   = 64,
+        lstm_hidden: int   = 64,
+        lstm_layers: int   = 3,
+        mlp_hidden:  int   = 128,
+        horizon:     int   = 5,
+        dropout:     float = 0.2,
     ):
         super().__init__()
-        self.input_dim   = input_dim
+
+        self.seq_len     = seq_len
+        self.n_features  = n_features
+        self.conv_out    = conv_out
+        self.lstm_hidden = lstm_hidden
+        self.lstm_layers = lstm_layers
+        self.mlp_hidden  = mlp_hidden
         self.horizon     = horizon
-        self.n_quantiles = n_quantiles
         self.dropout_p   = dropout
 
         # ----------------------------------------------------------------
-        # Shared Backbone
-        # Linear(input_dim -> 512) -> LN(512) -> GELU -> Dropout(0.3)
-        # -> Linear(512 -> 256) -> LN(256) -> GELU -> Dropout(0.3)
+        # Branch A: Temporal Convolution Channel
+        # Input: (B, n_features, seq_len)  after transpose from (B, seq_len, n_features)
+        #
+        # Conv1d(in=27, out=64, kernel=3, padding=1)
+        #   -> GELU()
+        #   -> GroupNorm(8, 64)              [GroupNorm works on (B, C, L) format]
+        #   -> AdaptiveAvgPool1d(1)           [global avg pool over time dim]
+        #   -> Flatten -> (B, 64)
         # ----------------------------------------------------------------
-        self.backbone = nn.Sequential(
-            nn.Linear(input_dim, 512),
-            nn.LayerNorm(512),
+        self.branch_a = nn.Sequential(
+            nn.Conv1d(
+                in_channels  = n_features,
+                out_channels = conv_out,
+                kernel_size  = 3,
+                padding      = 1,
+            ),                                       # (B, 64, 13)
             nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(512, 256),
-            nn.LayerNorm(256),
-            nn.GELU(),
-            nn.Dropout(dropout),
+            nn.GroupNorm(num_groups=8, num_channels=conv_out),  # (B, 64, 13)
+            nn.AdaptiveAvgPool1d(1),                 # (B, 64, 1)
+            nn.Flatten(),                            # (B, 64)
         )
 
         # ----------------------------------------------------------------
-        # Multi-Quantile Head
-        # Linear(256 -> horizon * n_quantiles) + Softplus
-        # Output (B, 15) -> reshape (B, horizon, n_quantiles)
-        # Softplus: guarantees all quantile boundaries >= 0 (physical constraint)
+        # Branch B: Long-Term Accumulation Channel (BiLSTM)
+        # Input: (B, seq_len, n_features) — batch_first=True
+        #
+        # LSTM(input=27, hidden=64, layers=3, bidirectional=True)
+        # Extract final time-step hidden encoding:
+        #   output[:, -1, :]  -> (B, 128)   [64 forward + 64 backward]
         # ----------------------------------------------------------------
-        self.quantile_head = nn.Sequential(
-            nn.Linear(256, horizon * n_quantiles),
-            nn.Softplus(),
+        self.branch_b_lstm = nn.LSTM(
+            input_size    = n_features,
+            hidden_size   = lstm_hidden,
+            num_layers    = lstm_layers,
+            bidirectional = True,
+            batch_first   = True,
+            dropout       = dropout if lstm_layers > 1 else 0.0,
+        )
+        # BiLSTM output size: lstm_hidden * 2 (forward + backward)
+        lstm_out_size = lstm_hidden * 2    # 128
+
+        # ----------------------------------------------------------------
+        # Fusion Head & Projection MLP
+        # fused = cat([branch_a_out, branch_b_out], dim=-1) -> (B, 64+128=192)
+        #
+        # Linear(192 -> 128) -> GELU() -> Dropout(0.2) -> Linear(128 -> 5)
+        # NO final activation — raw unbounded regression output.
+        # ----------------------------------------------------------------
+        fused_size = conv_out + lstm_out_size    # 64 + 128 = 192
+
+        self.fusion_head = nn.Sequential(
+            nn.Linear(fused_size, mlp_hidden),   # 192 -> 128
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_hidden, horizon),      # 128 -> 5
+            # NO Softplus / Sigmoid / ReLU — raw unbounded output
         )
 
         # Shape debug flag (prints once on first forward pass)
@@ -136,80 +181,102 @@ class FlatDroughtMLP(nn.Module):
         """
         Parameters
         ----------
-        x : (B, input_dim)  -- flattened 13-week feature window
+        x : (B, seq_len, n_features)  -- 3D chronological time-series tensor
+            e.g. (B, 13, 27) for the v31 27-feature / 13-week window
 
         Returns
         -------
-        quantile_outputs : (B, horizon, n_quantiles)
-            Strictly non-negative multi-quantile predictions via Softplus.
-            dim[-1]:
-              index 0 -> q=0.1  (Lower bound / Pessimistic edge)
-              index 1 -> q=0.5  (Conditional Median -- used in inference)
-              index 2 -> q=0.9  (Upper bound / Severe drought edge)
+        output : (B, horizon)
+            Raw unbounded regression predictions — no Softplus or clipping.
+            Physical clip [0, 5] is applied in the inference block of train.py.
         """
-        B = x.size(0)
+        # ----------------------------------------------------------------
+        # Branch A: Temporal Convolution
+        # x (B, 13, 27) -> transpose -> (B, 27, 13) -> Conv1d -> ... -> (B, 64)
+        # ----------------------------------------------------------------
+        x_conv   = x.transpose(1, 2)          # (B, 27, 13)
+        branch_a = self.branch_a(x_conv)       # (B, 64)
 
-        # Shared backbone: (B, input_dim) -> (B, 256)
-        backbone_out = self.backbone(x)      # (B, 256)
+        # ----------------------------------------------------------------
+        # Branch B: BiLSTM — long-range temporal memory
+        # x (B, 13, 27) -> LSTM -> output (B, 13, 128)
+        # Extract final time-step: output[:, -1, :] -> (B, 128)
+        # ----------------------------------------------------------------
+        lstm_out, _ = self.branch_b_lstm(x)    # (B, 13, 128)
+        branch_b    = lstm_out[:, -1, :]       # (B, 128) — 13th week hidden state
 
-        # Multi-quantile head: (B, 256) -> (B, horizon * n_quantiles)
-        raw_out = self.quantile_head(backbone_out)   # (B, 15)
+        # ----------------------------------------------------------------
+        # Fusion: horizontal concatenation of both branch outputs
+        # (B, 64) + (B, 128) -> (B, 192)
+        # ----------------------------------------------------------------
+        fused  = torch.cat([branch_a, branch_b], dim=-1)   # (B, 192)
+        output = self.fusion_head(fused)                   # (B, 5)
 
-        # Reshape to (B, horizon, n_quantiles)
-        quantile_outputs = raw_out.view(B, self.horizon, self.n_quantiles)
-        # (B, 5, 3)
-
-        # Shape debug – print once on first forward call
+        # Shape debug — print once on first forward call
         if not self._printed_shape:
             print(
-                f"  [v25 Shape Debug] x: {tuple(x.shape)}  "
-                f"| backbone_out: {tuple(backbone_out.shape)}  "
-                f"| quantile_outputs: {tuple(quantile_outputs.shape)}  "
-                f"  (B, horizon={self.horizon}, quantiles={self.n_quantiles})"
+                f"  [v31 Shape Debug]"
+                f"  x: {tuple(x.shape)}"
+                f"  | branch_a: {tuple(branch_a.shape)}"
+                f"  | branch_b (BiLSTM final): {tuple(branch_b.shape)}"
+                f"  | fused: {tuple(fused.shape)}"
+                f"  | output: {tuple(output.shape)}"
             )
             self._printed_shape = True
 
-        return quantile_outputs   # (B, 5, 3)
+        return output    # (B, 5)
 
     # -----------------------------------------------------------------------
     def count_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
     def architecture_summary(self) -> str:
-        h  = self.horizon
-        q  = self.n_quantiles
+        lstm_out = self.lstm_hidden * 2
+        fused    = self.conv_out + lstm_out
         lines = [
-            "FlatDroughtMLP Architecture (v25 – Multi-Quantile Pinball + Adversarial Weights)",
+            "DroughtSequenceNet Architecture (v31 — Parallel Conv1d + BiLSTM, Pure L1 Loss)",
             "=" * 90,
-            f"  Input dim    : {self.input_dim}  "
-            f"(WINDOW_SIZE={13} x FEATURE_COLS={self.input_dim // 13} = {self.input_dim})",
+            f"  Input shape  : (B, {self.seq_len}, {self.n_features})"
+            f"   [B x 13 weeks x 27 features]",
             "",
-            "  == Shared Backbone ==",
-            f"  Linear({self.input_dim} -> 512) -> LayerNorm(512) -> GELU() -> Dropout({self.dropout_p})",
-            "  Linear(512 -> 256) -> LayerNorm(256) -> GELU() -> Dropout(0.3)",
-            "  backbone_out : (B, 256)",
+            "  == Branch A: Temporal Convolution Channel (Short-Term Anomaly Detector) ==",
+            f"  x.transpose(1,2)  -> (B, {self.n_features}, {self.seq_len})",
+            f"  Conv1d(in={self.n_features}, out={self.conv_out}, kernel=3, padding=1)"
+            f"  -> (B, {self.conv_out}, {self.seq_len})",
+            f"  GELU()  ->  GroupNorm(8, {self.conv_out})  ->  AdaptiveAvgPool1d(1)"
+            f"  ->  Flatten",
+            f"  branch_a_out : (B, {self.conv_out})",
             "",
-            "  == Multi-Quantile Head ==",
-            f"  Linear(256 -> {h * q}) -> Softplus()  -- guarantees all outputs >= 0",
-            f"  reshape: (B, {h * q}) -> (B, {h}, {q})",
-            f"  quantile_outputs: (B, {h}, {q})",
-            "     dim[-1] index 0 -> q=0.1  (Lower / Pessimistic)",
-            "     dim[-1] index 1 -> q=0.5  (Conditional Median -- INFERENCE TARGET)",
-            "     dim[-1] index 2 -> q=0.9  (Upper / Severe drought)",
+            "  == Branch B: Long-Term Accumulation Channel (BiLSTM Sequence Memory) ==",
+            f"  LSTM(input={self.n_features}, hidden={self.lstm_hidden},"
+            f" layers={self.lstm_layers}, bidirectional=True, batch_first=True)",
+            f"  output[:, -1, :]  -- extract 13th-week final hidden state",
+            f"  branch_b_out : (B, {lstm_out})"
+            f"   [forward {self.lstm_hidden} + backward {self.lstm_hidden}]",
             "",
-            "  == Forward Signature ==",
-            "  forward(x)  -- x: (B, input_dim)  [flat 507-dim vector]",
-            "  return quantile_outputs  (B, 5, 3)  strictly non-negative",
+            "  == Fusion Head & Projection MLP ==",
+            f"  cat([branch_a, branch_b], dim=-1)  ->  fused: (B, {fused})",
+            f"  Linear({fused} -> {self.mlp_hidden}) -> GELU() -> Dropout({self.dropout_p})"
+            f" -> Linear({self.mlp_hidden} -> {self.horizon})",
+            f"  output : (B, {self.horizon})   [raw unbounded regression; NO final activation]",
+            "",
+            "  == Training Objective ==",
+            "  Loss   : nn.L1Loss()  (pure MAE — natively targets conditional median)",
+            "  Optimizer : AdamW(lr=1e-3, weight_decay=1e-3)",
+            "  Scheduler : CosineAnnealingLR(T_max=50, eta_min=1e-6)",
+            "  Epochs : 50 (hard limit)",
+            "  Batch  : 1024",
             "",
             "  == Inference ==",
-            "  prediction = quantile_outputs[:, :, 1]  # q=0.5 median channel",
-            "  NO manual thresholding. NO Sigmoid gate. NO hurdle multiplication.",
+            "  Median blending: np.median(all_fold_predictions, axis=0)",
+            "  Physical clip  : np.clip(predictions, 0.0, 5.0)",
+            "  NO manual thresholds. NO Sigmoid gate. NO hurdle multiplication.",
             "-" * 90,
-            "  [v25] Hurdle ABOLISHED: no head_prob (BCE), no head_sev (SmoothL1).",
-            "  [v25] BiLSTM + TCN ABOLISHED: replaced by flat MLP backbone.",
-            "  [v25] Quantile Head: q=[0.1, 0.5, 0.9]; Softplus non-negativity.",
-            "  [v25] forward(x) -- no target_time argument.",
-            "  [v24] Backbone config retained: 512->256, LN+GELU+Dropout(0.3).",
+            "  [v31] FlatDroughtMLP ABOLISHED: no wide MLP backbone (512->256).",
+            "  [v31] Tabular 378-dim flat input ABOLISHED: 3D (B, 13, 27) tensor.",
+            "  [v31] Multi-quantile Pinball Loss ABOLISHED: pure MAE objective.",
+            "  [v31] Softplus non-negativity guard ABOLISHED: raw regression + clip.",
+            "  [v31] LightGBM Dual-Tree Hurdle ABOLISHED: single end-to-end DL model.",
             "-" * 90,
             f"  Total params : {self.count_parameters():,}",
         ]
@@ -217,6 +284,7 @@ class FlatDroughtMLP(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Legacy stub: DroughtLSTM renamed but alias kept for backward-compat imports
+# Legacy alias: FlatDroughtMLP kept for any stale imports
 # ---------------------------------------------------------------------------
-DroughtLSTM = FlatDroughtMLP   # v25: alias for any stale imports
+FlatDroughtMLP = DroughtSequenceNet    # v31: alias so old imports don't crash
+DroughtLSTM    = DroughtSequenceNet    # v25 backward compat

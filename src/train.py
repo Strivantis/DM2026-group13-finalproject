@@ -1,91 +1,86 @@
 """
-train.py -- Drought Score Forecasting Pipeline (v29 -- The Tweedie-Hurdle Paradigm Refinement)
-===============================================================================================
+train.py -- Drought Score Forecasting Pipeline (v31 -- Parallel Hybrid Sequence Net)
+======================================================================================
 Usage:
     python src/train.py
 
 Outputs:
     submission.csv                        -- Kaggle submission (2248 rows x 6 cols)
-    models/lgbm_a_fold{k}_week{w}.pkl     -- Model A (L1 Regressor) checkpoint (25 total)
-    models/lgbm_b_fold{k}_week{w}.pkl     -- Model B (Binary Classifier) checkpoint (25 total)
-    _training_log_29th.txt                -- Full console log
+    models/dsn_fold{k}.pt                 -- DroughtSequenceNet checkpoint per fold
+    _training_log_31st.txt                -- Full console log
 
-v29 Changes (The Tweedie-Hurdle Paradigm Refinement)
-------------------------------------------------------
-  PHASE 1 -- Pure Conditional Severity Training (Model A Masking):
-    Model A now trains ONLY on active drought records (y > 0) per fold x week.
-    Zero-mass samples are excluded from Model A's .fit() to prevent calibration
-    scale corruption.  train_mask = y_train_w > 0  |  val_mask = y_val_w > 0.
-    OOF predictions for threshold search are still generated on the FULL X_val
-    to maintain shape alignment with oof_prob.
-    Model B continues to train on ALL rows with binary target (y > 0).
+v31 Architecture (Deep Learning Revival — Parallel Hybrid Sequence Net)
+------------------------------------------------------------------------
+  INPUT PIPELINE:
+    Data reshaped from flat 378-dim tabular rows (v27–v29) into a 3D
+    chronological time-series tensor of shape (B, 13, 27):
+      - 13 = sequence length (weeks)
+      - 27 = clean v26 feature set (lags & rolling cross-week artifacts purged)
+    Target: (B, 5) multi-step scores for the next 5 weeks.
 
-  PHASE 2 -- Capacity Release & Hyperparameter Re-Calibration:
-    max_depth constraint ABOLISHED from both Model A and Model B.
-    num_leaves      : 31  --> 63   (doubled node capacity)
-    learning_rate   : 0.02 --> 0.015  (stabilized for high leaf density)
-    n_estimators_A  : 10000 --> 15000  (wider budget for masked L1 convergence)
-    n_estimators_B  : 5000  --> 10000  (wider budget for classifier boundary)
-    early_stop_rounds : 150 --> 250
+  MODEL: DroughtSequenceNet (src/model.py)
+    Branch A (Temporal Convolution):
+      Conv1d(27->64, kernel=3) + GELU + GroupNorm + AdaptiveAvgPool1d(1)
+      -> Local anomaly context vector (B, 64)
+    Branch B (BiLSTM):
+      LSTM(27->64, layers=3, bidirectional=True, batch_first=True)
+      -> Final hidden state (B, 128)  [forward 64 + backward 64]
+    Fusion MLP:
+      Linear(192->128) -> GELU -> Dropout(0.2) -> Linear(128->5)
+      -> (B, 5) raw unbounded regression  [NO final activation]
 
-  PHASE 3 -- Post-CV OOF Dynamic Threshold Sweep:
-    After full 5-fold CV loop, a per-week grid search over [0.1, 0.9] (100 pts)
-    independently minimizes OOF MAE for each of the 5 future target weeks.
-    Result: best_thresholds[5]  (replaces hardcoded 0.5 boundary throughout).
+  TRAINING:
+    Loss      : nn.L1Loss()  (pure MAE — natively targets conditional median)
+    Optimizer : AdamW(lr=1e-3, weight_decay=1e-3)
+    Scheduler : CosineAnnealingLR(T_max=50, eta_min=1e-6)
+    Epochs    : 50 (hard limit)
+    Batch     : 1024 (fallback 512 if VRAM error)
+    Early Stop: monitor validation L1Loss; patience=10 epochs
 
-  PHASE 4 -- Updated Test Inference Pipeline:
-    Model A -> np.median across 5 folds (robust compression)
-    Model B -> np.mean  across 5 folds  (probability calibration)
-    Final gate: vectorized per-week application of best_thresholds[week_idx]
-    Safety clip: np.clip(0.0, 5.0)
+  INFERENCE:
+    All 5 fold models predict on test set independently.
+    Zero-interference median blending: np.median(fold_preds, axis=0)
+    Physical clip: np.clip(final, 0.0, 5.0)
+    NO manual thresholding. NO hard cutoffs. Trust the L1 objective.
 
-  RETAIN: 378-dimensional flat tabular layout from v27/v28 exactly.
-          (27 features x 13 weeks = 351 + 27 explicit trend deltas = 378)
-          5-Fold StratifiedGroupKFold, group=region_id.
-          Binned Error Matrix diagnostic layer from v28.
+  CV:
+    5-Fold StratifiedGroupKFold, grouped by region_id,
+    stratified on 10-quantile bins of per-region mean score.
 
-Architecture
--------------
-    Model A: LGBMRegressor  x 5 per fold (one per future week)
-    Model B: LGBMClassifier x 5 per fold (one per future week)
-    objective_A        : regression_l1
-    objective_B        : binary
-    device             : gpu
-    max_depth          : <REMOVED -- no constraint>
-    num_leaves         : 63
-    colsample_bytree   : 0.5
-    min_child_samples  : 100
-    learning_rate      : 0.015
-    n_estimators_A     : 15000
-    n_estimators_B     : 10000
-    early_stop_rounds  : 250
-    CV                 : 5-Fold StratifiedGroupKFold, group=region_id
+v31 Changes over v29/v30
+------------------------
+  [ABOLISH] LightGBM Dual-Tree Hurdle (Model A L1 Regressor + Model B Binary Classifier)
+  [ABOLISH] BCE & Pinball multi-task losses
+  [ABOLISH] Dynamic per-week threshold sweep [0.1, 0.9]
+  [ABOLISH] np.where(prob < th, 0.0, l1_pred) zero-gating
+  [ABOLISH] 378-dim tabular flat layout (27 x 13 + 27 deltas)
+  [ABOLISH] np.where(preds < 0.15, 0.0, ...) hard cutoff calibration
 
-Feature Space
---------------
-    v29 retains v27/v28: 27 features x 13 weeks (351) + 27 explicit deltas = 378 dimensions
+  [INTRODUCE] DroughtSequenceNet (Conv1d + BiLSTM parallel backbone)
+  [INTRODUCE] 3D (B, 13, 27) tensor input via DroughtSequenceDataset
+  [INTRODUCE] Pure nn.L1Loss() training objective
+  [INTRODUCE] AdamW(lr=1e-3, wd=1e-3) + CosineAnnealingLR(T_max=50)
+  [INTRODUCE] np.median(fold_preds, axis=0) zero-interference blending
+  [INTRODUCE] np.clip(0.0, 5.0) as SOLE post-processing constraint
 
-Post-Processing
----------------
-    Model A ensemble : np.median across 5 folds
-    Model B ensemble : np.mean  across 5 folds
-    Per-week dynamic threshold from OOF grid-search (best_thresholds[5])
-    Zero-gate        : np.where(prob_mean[:, w] < best_thresholds[w], 0.0, l1_median[:, w])
-    Clip             : np.clip(0.0, 5.0) physical safety guard
+  [RETAIN] refine_features() feature pipeline from v26
+  [RETAIN] 5-Fold StratifiedGroupKFold, group=region_id, 10-quantile strata
+  [RETAIN] Leakage-free per-fold Target Encoding injection
+  [RETAIN] 2248-row submission.csv with 6 columns
 """
 
 import os
 import sys
 import time
 import random
-import pickle
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 
-import lightgbm
 import numpy as np
 import pandas as pd
-from lightgbm import LGBMRegressor, LGBMClassifier
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
 import gc
 
 # -- project root on sys.path --------------------------------------------------
@@ -95,9 +90,9 @@ sys.path.insert(0, ROOT)
 from src.dataset import (
     refine_features,
     build_stratified_group_cv_folds,
-    build_tabular_dataset,
-    build_tabular_test,
-    make_flat_col_names,
+    build_sequence_dataset,
+    build_sequence_test,
+    DroughtSequenceDataset,
     FEATURE_COLS,
     WINDOW_SIZE,
     HORIZON,
@@ -106,6 +101,7 @@ from src.dataset import (
     N_TS_FOLDS,
     TS_SHIFT_WEEKS,
 )
+from src.model import DroughtSequenceNet
 
 # ---------------------------------------------------------------------------
 # Reproducibility
@@ -113,6 +109,10 @@ from src.dataset import (
 def set_seed(seed: int = 42) -> None:
     random.seed(seed)
     np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark     = False
 
 
 set_seed(42)
@@ -127,8 +127,25 @@ os.makedirs(MODELS_DIR, exist_ok=True)
 # Cross-validation
 N_FOLDS = 5
 
-# v29 retains v27/v28 378-dim feature space exactly
-N_FLAT_FEATURES = WINDOW_SIZE * len(FEATURE_COLS) + len(FEATURE_COLS)   # 378
+# Training hyperparameters (v31)
+EPOCHS         = 50
+BATCH_SIZE     = 1024
+LR             = 1e-3
+WEIGHT_DECAY   = 1e-3
+ETA_MIN        = 1e-6
+EARLY_STOP_PAT = 10   # patience in epochs for early stopping
+
+# Device
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Model hyperparameters (v31 DroughtSequenceNet defaults)
+SEQ_LEN     = WINDOW_SIZE   # 13
+N_FEATURES  = len(FEATURE_COLS)  # 27
+CONV_OUT    = 64
+LSTM_HIDDEN = 64
+LSTM_LAYERS = 3
+MLP_HIDDEN  = 128
+DROPOUT     = 0.2
 
 
 # ---------------------------------------------------------------------------
@@ -193,7 +210,6 @@ INTERVAL_LABELS = [
 ]
 
 def _interval_mask(y_true: np.ndarray, interval_idx: int) -> np.ndarray:
-    """Return boolean mask for samples belonging to drought interval idx."""
     if interval_idx == 0:
         return y_true == 0.0
     elif interval_idx == 1:
@@ -212,19 +228,9 @@ def _interval_mask(y_true: np.ndarray, interval_idx: int) -> np.ndarray:
 
 def print_binned_error_matrix(y_true: np.ndarray, y_pred: np.ndarray,
                                fold_k: int, log_fn) -> None:
-    """
-    Print a Binned Error Matrix auditing 6 physical drought intervals.
-
-    Parameters
-    ----------
-    y_true  : 1-D array of true ground-truth targets (all weeks flattened or per-week)
-    y_pred  : 1-D array of OOF final predictions after the hurdle gate
-    fold_k  : fold index for display labeling
-    log_fn  : callable (e.g. the local `log` function) for dual print+capture
-    """
     log_fn("")
     log_fn("  " + "=" * 80)
-    log_fn(f"  BINNED ERROR MATRIX  --  Fold {fold_k}  (OOF Hurdle-Gated Predictions)")
+    log_fn(f"  BINNED ERROR MATRIX  --  Fold {fold_k}  (OOF Predictions, L1-trained)")
     log_fn("  " + "=" * 80)
     header = (
         f"  {'Interval':<50}  {'Count':>7}  {'AvgTrue':>8}  "
@@ -254,6 +260,73 @@ def print_binned_error_matrix(y_true: np.ndarray, y_pred: np.ndarray,
 
 
 # ---------------------------------------------------------------------------
+# Training helpers
+# ---------------------------------------------------------------------------
+def _train_one_epoch(model, loader, optimizer, criterion, device):
+    """Run one full pass over the training DataLoader, return mean loss."""
+    model.train()
+    total_loss = 0.0
+    n_batches  = 0
+    for X_batch, y_batch in loader:
+        X_batch = X_batch.to(device, non_blocking=True)   # (B, 13, 27)
+        y_batch = y_batch.to(device, non_blocking=True)   # (B, 5)
+
+        optimizer.zero_grad()
+        preds = model(X_batch)          # (B, 5)
+        loss  = criterion(preds, y_batch)
+        loss.backward()
+        # Gradient clipping for LSTM stability
+        nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+
+        total_loss += loss.item()
+        n_batches  += 1
+
+    return total_loss / max(n_batches, 1)
+
+
+@torch.no_grad()
+def _eval_one_epoch(model, loader, criterion, device):
+    """Evaluate model on a DataLoader, return mean loss and all predictions."""
+    model.eval()
+    total_loss = 0.0
+    n_batches  = 0
+    all_preds  = []
+    all_targets = []
+
+    for X_batch, y_batch in loader:
+        X_batch = X_batch.to(device, non_blocking=True)
+        y_batch = y_batch.to(device, non_blocking=True)
+
+        preds = model(X_batch)
+        loss  = criterion(preds, y_batch)
+
+        total_loss  += loss.item()
+        n_batches   += 1
+        all_preds.append(preds.cpu().numpy())
+        all_targets.append(y_batch.cpu().numpy())
+
+    mean_loss = total_loss / max(n_batches, 1)
+    all_preds   = np.concatenate(all_preds,   axis=0)   # (N_val, 5)
+    all_targets = np.concatenate(all_targets, axis=0)   # (N_val, 5)
+    return mean_loss, all_preds, all_targets
+
+
+@torch.no_grad()
+def _predict(model, X_np, batch_size, device):
+    """Run inference on a 3D NumPy array, return predictions as NumPy."""
+    model.eval()
+    dataset = DroughtSequenceDataset(X_np)
+    loader  = DataLoader(dataset, batch_size=batch_size, shuffle=False,
+                         num_workers=0, pin_memory=(device.type == "cuda"))
+    preds_list = []
+    for X_batch in loader:
+        X_batch = X_batch.to(device, non_blocking=True)
+        preds_list.append(model(X_batch).cpu().numpy())
+    return np.concatenate(preds_list, axis=0)   # (N, 5)
+
+
+# ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
 def main():
@@ -266,54 +339,29 @@ def main():
 
     # -- 0. Pipeline description -----------------------------------------------
     log("=" * 90)
-    log("Drought Forecasting Pipeline  v29  (The Tweedie-Hurdle Paradigm Refinement)")
-    log("Decoupled Dual-Tree Hurdle  |  Model A: regression_l1 (masked y>0)  |  Model B: binary")
-    log("Feature Space: 27 features x 13 weeks (351) + 27 explicit deltas = 378 dims")
-    log("OOF Gate : per-week dynamic threshold from OOF grid-search [0.1, 0.9]")
-    log("Test Blend: Model A -> np.median (5 folds)  |  Model B -> np.mean (5 folds)")
-    log("Final Gate: vectorized best_thresholds[week_idx]  |  clip [0, 5]")
-    log("5-Fold StratifiedGroupKFold  |  5 model pairs per fold (one pair per week)")
+    log("Drought Forecasting Pipeline  v31  (Parallel Hybrid Sequence Net)")
+    log("DroughtSequenceNet  |  Conv1d Branch (local anomaly)  +  BiLSTM Branch (cumulative)")
+    log("Input  : (B, 13, 27) 3D chronological time-series tensor")
+    log("Target : (B, 5) multi-step scores (next 5 weeks)")
+    log("Loss   : nn.L1Loss()  (pure MAE — natively targets conditional median)")
+    log("Blend  : np.median(fold_preds, axis=0)  (zero-interference)")
+    log("Clip   : np.clip(0.0, 5.0)  (sole post-processing constraint)")
+    log("CV     : 5-Fold StratifiedGroupKFold  |  group=region_id  |  10-quantile strata")
     log("=" * 90)
     log("")
-    log("v29 Architectural Changes over v28:")
-    log("  [PHASE 1] Pure Conditional Severity Training (Model A Masking):")
-    log("            Model A trains ONLY on active drought rows (y_train_w > 0).")
-    log("            Zero-mass samples excluded from .fit() to prevent scale corruption.")
-    log("            OOF predictions generated on FULL X_val (shape alignment preserved).")
-    log("            Model B unchanged: trains on ALL rows with binary target (y > 0).")
-    log("  [PHASE 2] Capacity Release & Hyperparameter Re-Calibration:")
-    log("            max_depth ABOLISHED (no constraint) for both Model A and Model B.")
-    log("            num_leaves      : 31  --> 63")
-    log("            learning_rate   : 0.02 --> 0.015")
-    log("            min_child_samples: <new> = 100")
-    log("            n_estimators_A  : 10000 --> 15000")
-    log("            n_estimators_B  : 5000  --> 10000")
-    log("            early_stop_rounds: 150 --> 250")
-    log("  [PHASE 3] Post-CV OOF Dynamic Threshold Sweep:")
-    log("            Independent per-week grid-search over np.linspace(0.1, 0.9, 100).")
-    log("            Minimizes OOF MAE for each of the 5 future weeks independently.")
-    log("            best_thresholds[5] replaces hardcoded 0.5 everywhere.")
-    log("  [PHASE 4] Test Inference Pipeline: vectorized best_thresholds application.")
-    log("  [RETAIN]  378-dim flat tabular layout from v27/v28.")
-    log("            Binned Error Matrix diagnostic layer from v28.")
-    log("")
-    log(f"Training Config:")
-    log(f"  Model A (Regressor)  objective       = regression_l1  [trains on y>0 only]")
-    log(f"  Model B (Classifier) objective       = binary          [trains on all rows]")
-    log(f"  LGBM device                          = gpu")
-    log(f"  max_depth                            = <ABOLISHED -- no constraint>")
-    log(f"  num_leaves                           = 63")
-    log(f"  colsample_bytree                     = 0.5")
-    log(f"  min_child_samples                    = 100")
-    log(f"  learning_rate                        = 0.015")
-    log(f"  n_estimators (Model A)               = 15000")
-    log(f"  n_estimators (Model B)               = 10000")
-    log(f"  early_stopping_rounds                = 250")
-    log(f"  eval_metric (Model A)                = mae")
-    log(f"  eval_metric (Model B)                = binary_logloss")
-    log(f"  N_FOLDS                              = {N_FOLDS}")
-    log(f"  N_FLAT_FEATURES                      = {N_FLAT_FEATURES}  "
-        f"(WINDOW_SIZE={WINDOW_SIZE} x FEAT={len(FEATURE_COLS)} + {len(FEATURE_COLS)} deltas)")
+    log("v31 Configuration:")
+    log(f"  Device         : {DEVICE}")
+    log(f"  Epochs (max)   : {EPOCHS}")
+    log(f"  Batch size     : {BATCH_SIZE}")
+    log(f"  LR             : {LR}")
+    log(f"  Weight decay   : {WEIGHT_DECAY}")
+    log(f"  CosineAnnealing: T_max={EPOCHS}, eta_min={ETA_MIN}")
+    log(f"  Early stopping : patience={EARLY_STOP_PAT} epochs (val L1Loss)")
+    log(f"  GRADIENT CLIP  : max_norm=1.0  (LSTM stability)")
+    log(f"  Input shape    : (B, {SEQ_LEN}, {N_FEATURES})  [13 weeks x 27 features]")
+    log(f"  Conv1d out     : {CONV_OUT}  |  LSTM hidden: {LSTM_HIDDEN}  |  layers: {LSTM_LAYERS}")
+    log(f"  Fused dim      : {CONV_OUT + LSTM_HIDDEN * 2}  |  MLP hidden: {MLP_HIDDEN}")
+    log(f"  Output shape   : (B, {HORIZON})  [5 forecast weeks]")
 
     # -- 1. Load data ----------------------------------------------------------
     log("\nLoading processed data ...")
@@ -334,7 +382,7 @@ def main():
     assert n_test_regions  == 2248, f"Expected 2248 test regions,  got {n_test_regions}"
 
     # -- 1b. Feature Validation ------------------------------------------------
-    log("\n[v29 Feature Validation]")
+    log("\n[v31 Feature Validation]")
     assert "week_sin" in train_raw.columns, "week_sin missing -- run preprocess.py first"
     assert "week_cos" in train_raw.columns, "week_cos missing -- run preprocess.py first"
     log("  v week_sin, week_cos present.")
@@ -347,11 +395,9 @@ def main():
 
     lag_cols_check = [c for c in train_raw.columns if "lag" in c]
     if lag_cols_check:
-        log(f"  [INFO] Lag columns present in raw CSV (excluded from FEATURE_COLS): "
+        log(f"  [INFO] Lag columns in raw CSV (excluded by FEATURE_COLS): "
             f"{lag_cols_check[:6]}{'...' if len(lag_cols_check) > 6 else ''}")
-    log(f"  v29 FEATURE_COLS: {len(FEATURE_COLS)} base features (lag/rolling purged).")
-    log(f"  v29 flat input dim: {N_FLAT_FEATURES}  "
-        f"(27 x 13 = 351 + 27 explicit deltas = 378)")
+    log(f"  v31 FEATURE_COLS: {len(FEATURE_COLS)} features. 3D input: (B, {SEQ_LEN}, {N_FEATURES})")
 
     # -- 2. Feature refinement -------------------------------------------------
     log("\nRefining features (drought proxy index + log1p prec + v22/v26 pruning) ...")
@@ -373,20 +419,23 @@ def main():
     log(f"  mean={all_scores.mean():.4f}  std={all_scores.std():.4f}  "
         f"min={all_scores.min():.2f}  max={all_scores.max():.2f}")
     log(f"  Zero-inflation: {zero_frac:.2%} of training scores == 0.0")
-    log(f"  --> Hurdle classifier target: {(all_scores > 0.0).sum():,} positives "
-        f"({(all_scores > 0.0).mean():.2%}) vs "
-        f"{(all_scores == 0.0).sum():,} zeroes ({zero_frac:.2%})")
+    log(f"  Non-zero: {(all_scores > 0.0).sum():,}  ({(all_scores > 0.0).mean():.2%})  "
+        f"vs  Zeroes: {(all_scores == 0.0).sum():,}  ({zero_frac:.2%})")
+    log(f"  L1 Loss rationale: MAE converges to conditional MEDIAN; "
+        f"large zero-mass naturally collapses predictions toward 0.0")
 
-    # -- 5. Feature columns ----------------------------------------------------
-    log(f"\n[v29] Feature columns and flat input shape ...")
-    log(f"  FEATURE_COLS ({len(FEATURE_COLS)}): {FEATURE_COLS}")
-    log(f"  flat input_size = {N_FLAT_FEATURES}  "
-        f"(WINDOW_SIZE={WINDOW_SIZE} x FEATURE_COLS={len(FEATURE_COLS)} + "
-        f"{len(FEATURE_COLS)} deltas = {N_FLAT_FEATURES})")
+    # -- 5. Model architecture print -------------------------------------------
+    _tmp_model = DroughtSequenceNet(
+        seq_len=SEQ_LEN, n_features=N_FEATURES, conv_out=CONV_OUT,
+        lstm_hidden=LSTM_HIDDEN, lstm_layers=LSTM_LAYERS,
+        mlp_hidden=MLP_HIDDEN, horizon=HORIZON, dropout=DROPOUT,
+    )
+    log(f"\n{_tmp_model.architecture_summary()}")
+    del _tmp_model
 
     # -- 6. Build 5-Fold StratifiedGroupKFold CV splits -----------------------
     log(f"\n{'='*90}")
-    log(f"5-Fold StratifiedGroupKFold CV  [v29 -- Pure Conditional Hurdle]")
+    log(f"5-Fold StratifiedGroupKFold CV  [v31 -- DroughtSequenceNet + L1 Loss]")
     log(f"  Group  : region_id  |  Strata : 10-quantile bins of per-region mean score")
     log(f"{'='*90}")
 
@@ -395,29 +444,25 @@ def main():
     for fi, (tg, vg) in enumerate(folds):
         log(f"  Fold {fi}: train_groups={len(tg):,}  val_groups={len(vg):,}")
 
-    # -- 7. 5-Fold Dual-Tree Hurdle Training Loop ------------------------------
+    # -- 7. 5-Fold Deep Learning Training Loop ---------------------------------
     log(f"\n{'='*90}")
-    log("5-Fold Dual-Tree Hurdle Training  [v29]")
-    log("  Per fold x week: Model A (L1 Regressor, masked y>0) + Model B (Binary Classifier)")
-    log("  Model A: max_depth abolished, num_leaves=63, lr=0.015, n_estimators=15000")
-    log("  Model B: max_depth abolished, num_leaves=63, lr=0.015, n_estimators=10000")
-    log("  OOF output: per-week dynamic threshold applied post-sweep (not hardcoded 0.5)")
+    log("5-Fold DroughtSequenceNet Training  [v31]")
+    log(f"  Optimizer : AdamW(lr={LR}, weight_decay={WEIGHT_DECAY})")
+    log(f"  Scheduler : CosineAnnealingLR(T_max={EPOCHS}, eta_min={ETA_MIN})")
+    log(f"  Loss      : nn.L1Loss()  (pure MAE)")
+    log(f"  Batch     : {BATCH_SIZE}  |  Max Epochs: {EPOCHS}")
+    log(f"  Early Stop: patience={EARLY_STOP_PAT} (val L1Loss)")
     log(f"{'='*90}")
 
-    fold_results      = []   # (fold_k, week_maes_l1, week_maes_final, mean_mae_final)
-    fold_test_preds_a = []   # list of {"preds": (n_regions, 5), "region_ids": [...]}
-    fold_test_preds_b = []   # list of {"probs": (n_regions, 5), "region_ids": [...]}
+    fold_results      = []       # (fold_k, best_val_mae, epoch_stopped)
+    fold_test_preds   = []       # list of np.ndarray (2248, 5) per fold
 
-    # OOF accumulation arrays for dynamic threshold sweep (assembled across folds)
-    # We need to store per-fold val arrays keyed by fold index to reconstruct full OOF matrix.
-    # Strategy: store (val_indices, oof_l1_fold, oof_prob_fold, y_val_fold) per fold,
-    # then assemble after the loop using the ordering from folds.
-    oof_fold_data = []   # list of (oof_l1_fold, oof_prob_fold, y_val_fold) in fold order
+    criterion = nn.L1Loss()
 
     for fold_k, (raw_train_groups, raw_val_groups) in enumerate(folds):
 
         log(f"\n{'='*90}")
-        log(f"FOLD {fold_k + 1} / {N_FOLDS}  [v29 Pure Conditional Hurdle]")
+        log(f"FOLD {fold_k + 1} / {N_FOLDS}  [v31 DroughtSequenceNet + L1 Loss]")
         log(f"  train_groups: {len(raw_train_groups):,}  |  "
             f"val_groups: {len(raw_val_groups):,}")
         log(f"{'='*90}")
@@ -449,373 +494,263 @@ def main():
         # -- 7c. Determine feature columns available --------------------------
         _sample_group = aug_train_groups[0][0]
         feat_cols = [c for c in FEATURE_COLS if c in _sample_group.columns]
-        log(f"  feat_cols available: {len(feat_cols)} / {len(FEATURE_COLS)}")
+        n_feat    = len(feat_cols)
+        log(f"  feat_cols available: {n_feat} / {len(FEATURE_COLS)}")
 
-        # -- 7d. Build tabular matrices (13-week full flattening + 27 deltas) -
-        X_train_np, y_train_np, _ = build_tabular_dataset(aug_train_groups, feat_cols)
-        X_val_np,   y_val_np,   _ = build_tabular_dataset(aug_val_groups,   feat_cols)
-        X_train_np = np.asfortranarray(X_train_np)
-        X_val_np   = np.asfortranarray(X_val_np)
+        # -- 7d. Build 3D sequence arrays (N, 13, F) --------------------------
+        log(f"  Building 3D sequence arrays ...")
+        X_train_np, y_train_np, _ = build_sequence_dataset(aug_train_groups, feat_cols)
+        X_val_np,   y_val_np,   _ = build_sequence_dataset(aug_val_groups,   feat_cols)
 
         log(f"  X_train: {X_train_np.shape}  |  y_train: {y_train_np.shape}")
         log(f"  X_val  : {X_val_np.shape}    |  y_val  : {y_val_np.shape}")
 
-        # Verify 378-dim feature space (retained from v27/v28)
-        expected_dim = WINDOW_SIZE * len(feat_cols) + len(feat_cols)
-        assert X_train_np.shape[1] == expected_dim, (
-            f"Feature dim mismatch: got {X_train_np.shape[1]}, "
-            f"expected {expected_dim} (351 flat + 27 deltas)"
+        # Sanity: verify 3D shape
+        assert X_train_np.ndim == 3 and X_train_np.shape[1:] == (WINDOW_SIZE, n_feat), (
+            f"X_train shape mismatch: got {X_train_np.shape}, "
+            f"expected (N, {WINDOW_SIZE}, {n_feat})"
         )
-        log(f"  v Feature dim = {X_train_np.shape[1]}  "
-            f"(351 flat + 27 explicit deltas = 378)")
+        log(f"  v Input tensor shape confirmed: (N, {WINDOW_SIZE}, {n_feat}) = (B, 13, 27)")
 
-        # -- 7e. Build test tabular matrix for this fold ----------------------
-        test_df_fold = _merge_te_to_df(test_df, te_map_fold, gm_fold, gzp_fold)
-        X_test_np, test_region_ids = build_tabular_test(test_df_fold, feat_cols)
-        X_test_np = np.asfortranarray(X_test_np)
+        # -- 7e. Build test 3D array for this fold ----------------------------
+        test_df_fold  = _merge_te_to_df(test_df, te_map_fold, gm_fold, gzp_fold)
+        X_test_np, test_region_ids = build_sequence_test(test_df_fold, feat_cols)
         log(f"  X_test: {X_test_np.shape}")
 
-        # -- 7f. Train MODEL A + MODEL B per target week ----------------------
-        fold_val_preds_l1   = np.zeros_like(y_val_np)    # raw L1 regression outputs (full val)
-        fold_val_probs      = np.zeros_like(y_val_np)    # raw classifier probabilities (full val)
-        fold_val_final      = np.zeros_like(y_val_np)    # hurdle-gated OOF predictions (temp, 0.5)
-        fold_test_pred_l1   = np.zeros((X_test_np.shape[0], HORIZON), dtype=np.float32)
-        fold_test_prob      = np.zeros((X_test_np.shape[0], HORIZON), dtype=np.float32)
+        # -- 7f. Build DataLoaders --------------------------------------------
+        train_ds = DroughtSequenceDataset(X_train_np, y_train_np)
+        val_ds   = DroughtSequenceDataset(X_val_np,   y_val_np)
 
-        for week_idx in range(HORIZON):
-            y_train_w   = y_train_np[:, week_idx]              # (N_train,) continuous
-            y_val_w     = y_val_np[:,   week_idx]              # (N_val,)   continuous
-            y_train_b   = (y_train_w > 0.0).astype(int)        # (N_train,) binary
-            y_val_b     = (y_val_w   > 0.0).astype(int)        # (N_val,)   binary
-
-            # -- PHASE 1: Conditional mask for Model A ------------------------
-            # Train Model A ONLY on active drought rows (y > 0)
-            train_mask = y_train_w > 0
-            val_mask   = y_val_w   > 0
-            X_train_masked = X_train_np[train_mask]
-            y_train_masked = y_train_w[train_mask]
-            X_val_masked   = X_val_np[val_mask]
-            y_val_masked   = y_val_w[val_mask]
-            log(f"\n  --- Week {week_idx + 1} ---")
-            log(f"    [Mask-A] Active drought rows: train={train_mask.sum():,}/{len(train_mask):,}"
-                f"  val={val_mask.sum():,}/{len(val_mask):,}")
-
-            ckpt_a = os.path.join(MODELS_DIR, f"lgbm_a_fold{fold_k}_week{week_idx}.pkl")
-            ckpt_b = os.path.join(MODELS_DIR, f"lgbm_b_fold{fold_k}_week{week_idx}.pkl")
-
-            # ----------------------------------------------------------------
-            # MODEL A  (L1 Regressor -- Conditional Median, masked y>0)
-            # ----------------------------------------------------------------
-            if os.path.exists(ckpt_a):
-                log(f"    [RESUME-A] Checkpoint found: {ckpt_a}  -- loading.")
-                try:
-                    with open(ckpt_a, "rb") as fh:
-                        model_a = pickle.load(fh)
-                    # Predict on FULL X_val to keep shape aligned with oof_prob
-                    val_l1_w  = model_a.predict(X_val_np)
-                    test_l1_w = model_a.predict(X_test_np)
-                    best_a = model_a.best_iteration_
-                    mae_a  = float(np.mean(np.abs(val_l1_w - y_val_w)))
-                    log(f"    [Model A] best_iter={best_a}  val_MAE(full)={mae_a:.4f}  [LOADED]")
-                except Exception as e:
-                    log(f"    [WARN-A] Checkpoint corrupted ({e}), deleting and retraining.")
-                    os.remove(ckpt_a)
-                    model_a = None
-            else:
-                model_a = None
-
-            if model_a is None:
-                model_a = LGBMRegressor(
-                    objective         = "regression_l1",  # Natively optimizes Conditional Median (L1)
-                    # max_depth ABOLISHED -- no constraint for v29
-                    num_leaves        = 63,               # Doubled capacity (31 -> 63)
-                    colsample_bytree  = 0.5,              # High feature regularization
-                    min_child_samples = 100,              # Minimum leaf data constraint
-                    learning_rate     = 0.015,            # Stabilized for high leaf density
-                    n_estimators      = 15000,            # Wide budget for masked L1 convergence
-                    device            = "gpu",
-                    random_state      = 42,
-                    n_jobs            = -1,
-                    verbose           = -1,
-                )
-                # PHASE 1: fit ONLY on active drought rows (y > 0)
-                model_a.fit(
-                    X_train_masked, y_train_masked,
-                    eval_set    = [(X_val_masked, y_val_masked)],
-                    eval_metric = "mae",
-                    callbacks   = [
-                        lightgbm.early_stopping(stopping_rounds=250, verbose=False),
-                        lightgbm.log_evaluation(period=500),
-                    ],
-                )
-                # OOF Note: predict on FULL X_val so shape aligns with oof_prob
-                val_l1_w  = model_a.predict(X_val_np)
-                test_l1_w = model_a.predict(X_test_np)
-                best_a    = model_a.best_iteration_
-                mae_a     = float(np.mean(np.abs(val_l1_w - y_val_w)))
-                log(f"    [Model A] best_iter={best_a}  val_MAE(full)={mae_a:.4f}")
-                with open(ckpt_a, "wb") as fh:
-                    pickle.dump(model_a, fh)
-                log(f"    [SAVED-A] {ckpt_a}")
-
-            fold_val_preds_l1[:, week_idx]  = val_l1_w
-            fold_test_pred_l1[:, week_idx]  = test_l1_w.astype(np.float32)
-            del model_a
-            gc.collect()
-
-            # ----------------------------------------------------------------
-            # MODEL B  (Binary Classifier -- Drought Probability, ALL rows)
-            # ----------------------------------------------------------------
-            if os.path.exists(ckpt_b):
-                log(f"    [RESUME-B] Checkpoint found: {ckpt_b}  -- loading.")
-                try:
-                    with open(ckpt_b, "rb") as fh:
-                        model_b = pickle.load(fh)
-                    val_prob_w  = model_b.predict_proba(X_val_np)[:, 1]
-                    test_prob_w = model_b.predict_proba(X_test_np)[:, 1]
-                    best_b = model_b.best_iteration_
-                    log(f"    [Model B] best_iter={best_b}  [LOADED]")
-                except Exception as e:
-                    log(f"    [WARN-B] Checkpoint corrupted ({e}), deleting and retraining.")
-                    os.remove(ckpt_b)
-                    model_b = None
-            else:
-                model_b = None
-
-            if model_b is None:
-                model_b = LGBMClassifier(
-                    objective         = "binary",         # Pure binary cross-entropy probability tracking
-                    # max_depth ABOLISHED -- no constraint for v29
-                    num_leaves        = 63,               # Doubled capacity (31 -> 63)
-                    colsample_bytree  = 0.5,              # Feature sub-sampling identical at 50%
-                    min_child_samples = 100,              # Minimum leaf data constraint
-                    learning_rate     = 0.015,            # Stabilized for high leaf density
-                    n_estimators      = 10000,            # Wider budget for classification boundaries
-                    device            = "gpu",
-                    random_state      = 42,
-                    n_jobs            = -1,
-                    verbose           = -1,
-                )
-                # Model B trains on ALL rows with binary target
-                model_b.fit(
-                    X_train_np, y_train_b,
-                    eval_set    = [(X_val_np, y_val_b)],
-                    eval_metric = "binary_logloss",
-                    callbacks   = [
-                        lightgbm.early_stopping(stopping_rounds=250, verbose=False),
-                        lightgbm.log_evaluation(period=500),
-                    ],
-                )
-                val_prob_w  = model_b.predict_proba(X_val_np)[:, 1]
-                test_prob_w = model_b.predict_proba(X_test_np)[:, 1]
-                best_b      = model_b.best_iteration_
-                log(f"    [Model B] best_iter={best_b}")
-                with open(ckpt_b, "wb") as fh:
-                    pickle.dump(model_b, fh)
-                log(f"    [SAVED-B] {ckpt_b}")
-
-            fold_val_probs[:, week_idx]     = val_prob_w
-            fold_test_prob[:, week_idx]     = test_prob_w.astype(np.float32)
-            del model_b
-            gc.collect()
-
-            # ----------------------------------------------------------------
-            # Apply local temporary hurdle gate (0.5) for per-fold OOF diagnostics
-            # NOTE: final thresholds are determined globally after all folds via sweep
-            # ----------------------------------------------------------------
-            oof_l1_w   = fold_val_preds_l1[:, week_idx]
-            oof_prob_w = fold_val_probs[:,   week_idx]
-            oof_final_w = np.where(oof_prob_w < 0.5, 0.0, oof_l1_w)
-            fold_val_final[:, week_idx] = oof_final_w
-
-            mae_final = float(np.mean(np.abs(oof_final_w - y_val_w)))
-            zero_gate_frac = float((oof_final_w == 0.0).mean())
-            log(f"    [OOF Gate] HurdleMAE={mae_final:.4f}  "
-                f"zero-gated={zero_gate_frac:.2%}  "
-                f"(temp 0.5 threshold; final per-week sweep post-CV)")
-
-        fold_elapsed = time.time() - fold_t0
-
-        # -- 7g. Per-fold OOF Val MAE breakdown (L1 raw + Hurdle-gated) ------
-        week_maes_l1    = [
-            float(np.mean(np.abs(fold_val_preds_l1[:, w] - y_val_np[:, w])))
-            for w in range(HORIZON)
-        ]
-        week_maes_final = [
-            float(np.mean(np.abs(fold_val_final[:, w] - y_val_np[:, w])))
-            for w in range(HORIZON)
-        ]
-        mean_fold_mae_l1    = float(np.mean(week_maes_l1))
-        mean_fold_mae_final = float(np.mean(week_maes_final))
-
-        log(f"\n  [Fold {fold_k}] Week MAEs (Model A raw L1) : "
-            + "  ".join(f"W{i+1}={m:.4f}" for i, m in enumerate(week_maes_l1)))
-        log(f"  [Fold {fold_k}] Week MAEs (Hurdle-Gated)   : "
-            + "  ".join(f"W{i+1}={m:.4f}" for i, m in enumerate(week_maes_final)))
-        log(f"  [Fold {fold_k}] Mean Val MAE (raw L1)      : {mean_fold_mae_l1:.4f}")
-        log(f"  [Fold {fold_k}] Mean Val MAE (hurdle gate) : {mean_fold_mae_final:.4f}")
-        log(f"  [Fold {fold_k}] Elapsed                    : {fold_elapsed:.1f}s")
-
-        # -- 7h. Binned Error Matrix (flatten all weeks for fold-level audit) -
-        y_true_all = y_val_np.ravel()
-        y_pred_all = fold_val_final.ravel()
-        print_binned_error_matrix(y_true_all, y_pred_all, fold_k, log)
-
-        fold_results.append(
-            (fold_k, week_maes_l1, week_maes_final, mean_fold_mae_final)
+        # Try BATCH_SIZE first; fall back to 512 if VRAM is insufficient
+        effective_batch = BATCH_SIZE
+        train_loader = DataLoader(
+            train_ds, batch_size=effective_batch, shuffle=True,
+            num_workers=0, pin_memory=(DEVICE.type == "cuda"), drop_last=False,
+        )
+        val_loader = DataLoader(
+            val_ds, batch_size=effective_batch * 2, shuffle=False,
+            num_workers=0, pin_memory=(DEVICE.type == "cuda"),
         )
 
-        fold_test_preds_a.append({
-            "preds":      fold_test_pred_l1,
-            "region_ids": test_region_ids,
-        })
-        fold_test_preds_b.append({
-            "probs":      fold_test_prob,
-            "region_ids": test_region_ids,
-        })
+        # -- 7g. Instantiate model, optimizer, scheduler ----------------------
+        ckpt_path = os.path.join(MODELS_DIR, f"dsn_fold{fold_k}.pt")
 
-        # Store fold OOF data for global threshold sweep
-        oof_fold_data.append((
-            fold_val_preds_l1.copy(),   # (N_val, 5)
-            fold_val_probs.copy(),      # (N_val, 5)
-            y_val_np.copy(),            # (N_val, 5)
-        ))
+        model = DroughtSequenceNet(
+            seq_len    = WINDOW_SIZE,
+            n_features = n_feat,
+            conv_out   = CONV_OUT,
+            lstm_hidden = LSTM_HIDDEN,
+            lstm_layers = LSTM_LAYERS,
+            mlp_hidden  = MLP_HIDDEN,
+            horizon     = HORIZON,
+            dropout     = DROPOUT,
+        ).to(DEVICE)
 
+        optimizer = torch.optim.AdamW(
+            model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY
+        )
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=EPOCHS, eta_min=ETA_MIN
+        )
+
+        log(f"\n  Model params: {model.count_parameters():,}")
+
+        # -- 7h. Resume from checkpoint if available --------------------------
+        start_epoch   = 0
+        best_val_mae  = float("inf")
+        patience_ctr  = 0
+        best_state    = None
+
+        if os.path.exists(ckpt_path):
+            log(f"  [RESUME] Checkpoint found: {ckpt_path}  -- loading.")
+            try:
+                ckpt = torch.load(ckpt_path, map_location=DEVICE)
+                model.load_state_dict(ckpt["model_state"])
+                optimizer.load_state_dict(ckpt["optimizer_state"])
+                scheduler.load_state_dict(ckpt["scheduler_state"])
+                start_epoch  = ckpt.get("epoch", 0) + 1
+                best_val_mae = ckpt.get("best_val_mae", float("inf"))
+                patience_ctr = ckpt.get("patience_ctr", 0)
+                log(f"  [RESUME] Resuming from epoch {start_epoch}  "
+                    f"best_val_mae={best_val_mae:.4f}")
+            except Exception as exc:
+                log(f"  [WARN] Checkpoint load failed ({exc}). Starting from scratch.")
+                start_epoch  = 0
+                best_val_mae = float("inf")
+                patience_ctr = 0
+
+        # -- 7i. Epoch training loop ------------------------------------------
+        epoch_stopped = start_epoch
+        for epoch in range(start_epoch, EPOCHS):
+            ep_t0 = time.time()
+
+            try:
+                train_loss = _train_one_epoch(model, train_loader, optimizer, criterion, DEVICE)
+            except RuntimeError as oom_err:
+                if "out of memory" in str(oom_err).lower() and effective_batch > 512:
+                    log(f"  [OOM] Batch {effective_batch} caused OOM. "
+                        f"Rebuilding loaders with batch=512.")
+                    effective_batch = 512
+                    torch.cuda.empty_cache()
+                    train_loader = DataLoader(
+                        train_ds, batch_size=effective_batch, shuffle=True,
+                        num_workers=0, pin_memory=(DEVICE.type == "cuda"), drop_last=False,
+                    )
+                    val_loader = DataLoader(
+                        val_ds, batch_size=effective_batch * 2, shuffle=False,
+                        num_workers=0, pin_memory=(DEVICE.type == "cuda"),
+                    )
+                    train_loss = _train_one_epoch(model, train_loader, optimizer, criterion, DEVICE)
+                else:
+                    raise
+
+            val_loss, val_preds, val_targets = _eval_one_epoch(model, val_loader, criterion, DEVICE)
+            scheduler.step()
+
+            ep_elapsed = time.time() - ep_t0
+            current_lr = scheduler.get_last_lr()[0]
+
+            log(f"  Epoch [{epoch+1:3d}/{EPOCHS}]  "
+                f"train_L1={train_loss:.4f}  val_L1={val_loss:.4f}  "
+                f"lr={current_lr:.2e}  t={ep_elapsed:.1f}s")
+
+            epoch_stopped = epoch + 1
+
+            # Early stopping & checkpoint saving
+            if val_loss < best_val_mae:
+                best_val_mae = val_loss
+                best_state   = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                patience_ctr = 0
+                torch.save(
+                    {
+                        "model_state":     {k: v.cpu() for k, v in model.state_dict().items()},
+                        "optimizer_state": optimizer.state_dict(),
+                        "scheduler_state": scheduler.state_dict(),
+                        "epoch":           epoch,
+                        "best_val_mae":    best_val_mae,
+                        "patience_ctr":    patience_ctr,
+                        "fold_k":          fold_k,
+                    },
+                    ckpt_path,
+                )
+                log(f"    [SAVED] New best val_L1={best_val_mae:.4f}  -> {ckpt_path}")
+            else:
+                patience_ctr += 1
+                if patience_ctr >= EARLY_STOP_PAT:
+                    log(f"  [Early Stop] No improvement for {EARLY_STOP_PAT} epochs. "
+                        f"Stopping at epoch {epoch+1}.")
+                    break
+
+        # -- 7j. Load best model state for inference --------------------------
+        if best_state is not None:
+            model.load_state_dict(best_state)
+            log(f"  [BEST] Loaded best model state (val_L1={best_val_mae:.4f})")
+
+        # -- 7k. OOF validation predictions -----------------------------------
+        val_loss_final, oof_preds, oof_targets = _eval_one_epoch(
+            model, val_loader, criterion, DEVICE
+        )
+        oof_mae = float(np.mean(np.abs(oof_preds - oof_targets)))
+
+        # Per-week OOF MAE
+        week_maes = [
+            float(np.mean(np.abs(oof_preds[:, w] - oof_targets[:, w])))
+            for w in range(HORIZON)
+        ]
+
+        fold_elapsed = time.time() - fold_t0
+        log(f"\n  [Fold {fold_k}] Week MAEs (OOF L1): "
+            + "  ".join(f"W{i+1}={m:.4f}" for i, m in enumerate(week_maes)))
+        log(f"  [Fold {fold_k}] Overall OOF MAE   : {oof_mae:.4f}")
+        log(f"  [Fold {fold_k}] Best Val L1 (ckpt): {best_val_mae:.4f}")
+        log(f"  [Fold {fold_k}] Epochs run         : {epoch_stopped}/{EPOCHS}")
+        log(f"  [Fold {fold_k}] Elapsed            : {fold_elapsed:.1f}s")
+
+        # -- 7l. Binned Error Matrix -------------------------------------------
+        print_binned_error_matrix(oof_targets.ravel(), oof_preds.ravel(), fold_k, log)
+
+        fold_results.append((fold_k, week_maes, oof_mae, epoch_stopped))
+
+        # -- 7m. Test-set inference for this fold -----------------------------
+        test_preds_fold = _predict(model, X_test_np, effective_batch * 2, DEVICE)
+        fold_test_preds.append(test_preds_fold)   # (2248, 5)
+
+        log(f"  [Test inference] shape={test_preds_fold.shape}  "
+            f"mean={test_preds_fold.mean():.4f}  "
+            f"std={test_preds_fold.std():.4f}  "
+            f"min={test_preds_fold.min():.4f}  "
+            f"max={test_preds_fold.max():.4f}")
+
+        # Cleanup
         del X_train_np, y_train_np, X_val_np, y_val_np
-        del fold_val_preds_l1, fold_val_probs, fold_val_final
+        del train_ds, val_ds, train_loader, val_loader
+        del model, optimizer, scheduler
+        if DEVICE.type == "cuda":
+            torch.cuda.empty_cache()
         gc.collect()
 
     # -- 8. Cross-fold summary -------------------------------------------------
     log(f"\n{'='*90}")
-    log(f"5-Fold Cross-Validation Summary  [v29 Pure Conditional Hurdle]")
+    log(f"5-Fold Cross-Validation Summary  [v31 DroughtSequenceNet + L1 Loss]")
     log(f"{'='*90}")
-    mean_cv_maes_final = []
-    for fold_k, week_maes_l1, week_maes_final, mean_mae_final in fold_results:
-        final_str = "  ".join(f"W{i+1}={m:.4f}" for i, m in enumerate(week_maes_final))
-        log(f"  Fold {fold_k} [Hurdle-Gated]: {final_str}  ->  Mean={mean_mae_final:.4f}")
-        mean_cv_maes_final.append(mean_mae_final)
+    fold_oof_maes = []
+    for fold_k, week_maes, oof_mae, epoch_stopped in fold_results:
+        wk_str = "  ".join(f"W{i+1}={m:.4f}" for i, m in enumerate(week_maes))
+        log(f"  Fold {fold_k} [OOF L1]: {wk_str}  ->  Mean={oof_mae:.4f}"
+            f"  (stopped epoch {epoch_stopped})")
+        fold_oof_maes.append(oof_mae)
 
-    overall_mean = float(np.mean(mean_cv_maes_final))
-    overall_std  = float(np.std(mean_cv_maes_final))
-    log(f"\n  Overall CV MAE (Hurdle-Gated, temp 0.5 threshold) : {overall_mean:.4f}  +-  {overall_std:.4f}")
-    log(f"  Best Fold  : Fold {int(np.argmin(mean_cv_maes_final))} "
-        f"(MAE={min(mean_cv_maes_final):.4f})")
-    log(f"  Worst Fold : Fold {int(np.argmax(mean_cv_maes_final))} "
-        f"(MAE={max(mean_cv_maes_final):.4f})")
+    overall_mean = float(np.mean(fold_oof_maes))
+    overall_std  = float(np.std(fold_oof_maes))
+    log(f"\n  Overall CV L1 MAE : {overall_mean:.4f}  +-  {overall_std:.4f}")
+    log(f"  Best Fold  : Fold {int(np.argmin(fold_oof_maes))} "
+        f"(MAE={min(fold_oof_maes):.4f})")
+    log(f"  Worst Fold : Fold {int(np.argmax(fold_oof_maes))} "
+        f"(MAE={max(fold_oof_maes):.4f})")
 
-    log(f"\n  Per-week CV MAE breakdown (Hurdle-Gated, temp 0.5 threshold):")
+    log(f"\n  Per-week CV MAE breakdown:")
     for week_idx in range(HORIZON):
-        wk_maes = [fold_results[k][2][week_idx] for k in range(N_FOLDS)]
+        wk_maes = [fold_results[k][1][week_idx] for k in range(N_FOLDS)]
         log(f"    Week {week_idx + 1}: mean={np.mean(wk_maes):.4f}  "
             f"std={np.std(wk_maes):.4f}")
 
-    # -- 9. PHASE 3: Post-CV OOF Dynamic Threshold Sweep ----------------------
+    # -- 9. Zero-Interference Median Blending ----------------------------------
     log(f"\n{'='*90}")
-    log(f"[v29 PHASE 3] Post-CV OOF Dynamic Threshold Sweep")
-    log(f"  Goal: Replace hardcoded 0.5 with week-specific MAE-minimizing cutpoints.")
-    log(f"  Method: np.linspace(0.1, 0.9, 100) grid  |  independent per-week optimization")
-    log(f"  OOF matrix assembled by concatenating all {N_FOLDS} fold validation arrays.")
+    log(f"[v31] Zero-Interference Post-Ensemble Median Blending  ({N_FOLDS} folds)")
+    log(f"  Strategy : np.median(all_fold_predictions, axis=0)")
+    log(f"  Rationale: Median blending perfectly aligns with MAE optimization landscape.")
+    log(f"  NO hard thresholds. NO np.where cutoffs. Trust the L1 objective natively.")
     log(f"{'='*90}")
 
-    # Assemble full OOF matrices by concatenating across folds
-    oof_l1    = np.concatenate([d[0] for d in oof_fold_data], axis=0)   # (N_total, 5)
-    oof_prob  = np.concatenate([d[1] for d in oof_fold_data], axis=0)   # (N_total, 5)
-    y_true    = np.concatenate([d[2] for d in oof_fold_data], axis=0)   # (N_total, 5)
+    # Stack folds: (N_FOLDS, 2248, 5)
+    preds_stack = np.stack(fold_test_preds, axis=0)
+    log(f"  preds_stack shape : {preds_stack.shape}")
 
-    log(f"  Assembled OOF matrices: oof_l1={oof_l1.shape}  "
-        f"oof_prob={oof_prob.shape}  y_true={y_true.shape}")
+    # Per-fold stats
+    for k in range(N_FOLDS):
+        p = preds_stack[k]
+        log(f"  Fold {k} preds: mean={p.mean():.4f}  std={p.std():.4f}  "
+            f"min={p.min():.4f}  max={p.max():.4f}")
 
-    best_thresholds = []
-    for week_idx in range(HORIZON):
-        thresholds = np.linspace(0.1, 0.9, 100)
-        maes = [
-            np.mean(np.abs(
-                np.where(oof_prob[:, week_idx] < th, 0.0, oof_l1[:, week_idx])
-                - y_true[:, week_idx]
-            ))
-            for th in thresholds
-        ]
-        best_th = thresholds[np.argmin(maes)]
-        best_thresholds.append(best_th)
-        log(f"  → Week {week_idx + 1} Optimized OOF Threshold: {best_th:.4f}  "
-            f"(MAE={min(maes):.4f})")
+    # Median compression: (N_FOLDS, 2248, 5) -> (2248, 5)
+    final_submission = np.median(preds_stack, axis=0)
 
-    log(f"\n  Final best_thresholds: {[f'{t:.4f}' for t in best_thresholds]}")
+    log(f"\n  Pre-clip median blend stats:")
+    log(f"    mean={final_submission.mean():.4f}  std={final_submission.std():.4f}  "
+        f"min={final_submission.min():.4f}  max={final_submission.max():.4f}")
 
-    # Evaluate overall OOF MAE with optimized thresholds
-    oof_final_opt = np.zeros_like(oof_l1)
-    for week_idx in range(HORIZON):
-        th = best_thresholds[week_idx]
-        oof_final_opt[:, week_idx] = np.where(
-            oof_prob[:, week_idx] < th, 0.0, oof_l1[:, week_idx]
-        )
-    oof_mae_opt = float(np.mean(np.abs(oof_final_opt - y_true)))
-    log(f"\n  OOF MAE with Optimized Thresholds : {oof_mae_opt:.4f}")
-    log(f"  OOF MAE improvement vs temp 0.5   : {overall_mean - oof_mae_opt:.4f}")
+    # Physical constraint mask — SOLE post-processing step
+    final_submission = np.clip(final_submission, 0.0, 5.0)
 
-    del oof_fold_data, oof_l1, oof_prob, y_true, oof_final_opt
-    gc.collect()
+    log(f"  Post-clip stats:")
+    log(f"    mean={final_submission.mean():.4f}  std={final_submission.std():.4f}  "
+        f"min={final_submission.min():.4f}  max={final_submission.max():.4f}")
 
-    # -- 10. PHASE 4: Asymmetric Ensemble Blending + Vectorized Thresholds -----
-    log(f"\n{'='*90}")
-    log(f"[v29 PHASE 4] Asymmetric Ensemble Compression  ({N_FOLDS} folds)")
-    log(f"  Model A (L1 Regressor)  -> strict np.MEDIAN across {N_FOLDS} folds")
-    log(f"       Rationale: median is robust to individual fold outlier fluctuations.")
-    log(f"  Model B (Classifier)    -> np.MEAN  across {N_FOLDS} folds")
-    log(f"       Rationale: probability averaging stabilizes calibrated thresholds.")
-    log(f"  Zero-Gate: vectorized best_thresholds[week_idx] applied per column.")
-    log(f"{'='*90}")
-
-    all_region_ids = fold_test_preds_a[0]["region_ids"]
-    n_regions      = len(all_region_ids)
-    assert n_regions == 2248, f"Expected 2248 test regions, got {n_regions}"
-
-    # Stack Model A predictions: (N_FOLDS, n_regions, HORIZON)
-    preds_a_stack = np.stack(
-        [fp["preds"] for fp in fold_test_preds_a], axis=0
-    )  # (5, 2248, 5)
-
-    # Stack Model B probabilities: (N_FOLDS, n_regions, HORIZON)
-    probs_b_stack = np.stack(
-        [fp["probs"] for fp in fold_test_preds_b], axis=0
-    )  # (5, 2248, 5)
-
-    # Asymmetric compression
-    l1_median = np.median(preds_a_stack, axis=0)   # (2248, 5)  -- robust median
-    prob_mean  = np.mean(probs_b_stack,  axis=0)   # (2248, 5)  -- calibrated mean prob
-
-    log(f"  preds_a_stack shape : {preds_a_stack.shape}")
-    log(f"  probs_b_stack shape : {probs_b_stack.shape}")
-    log(f"  l1_median  stats    : mean={l1_median.mean():.4f}  "
-        f"std={l1_median.std():.4f}  "
-        f"min={l1_median.min():.4f}  max={l1_median.max():.4f}")
-    log(f"  prob_mean  stats    : mean={prob_mean.mean():.4f}  "
-        f"std={prob_mean.std():.4f}  "
-        f"min={prob_mean.min():.4f}  max={prob_mean.max():.4f}")
-
-    # PHASE 4: Vectorized per-week dynamic thresholds
-    final_preds = np.zeros_like(l1_median)
-    for week_idx in range(HORIZON):
-        th = best_thresholds[week_idx]
-        final_preds[:, week_idx] = np.where(
-            prob_mean[:, week_idx] < th, 0.0, l1_median[:, week_idx]
-        )
-        zero_frac_w = float((final_preds[:, week_idx] == 0.0).mean())
-        log(f"  Week {week_idx + 1}: threshold={th:.4f}  "
-            f"zero-gated={zero_frac_w:.2%}")
-
-    log(f"\n  Post-gate pre-clip stats:")
-    log(f"    mean={final_preds.mean():.4f}  std={final_preds.std():.4f}  "
-        f"min={final_preds.min():.4f}  max={final_preds.max():.4f}")
-    log(f"    exact-zero fraction: {(final_preds == 0.0).mean():.2%}")
-
-    # Physical safety boundary restriction [0, 5]
-    final_preds = np.clip(final_preds, 0.0, 5.0)
-
-    # -- 11. Submission prediction diagnostics ---------------------------------
-    log("\n[Submission Prediction Diagnostics]")
-    all_sub_preds   = final_preds.ravel()
+    # -- 10. Submission prediction diagnostics ---------------------------------
+    log("\n[v31 Submission Prediction Diagnostics]")
+    all_sub_preds   = final_submission.ravel()
     zero_frac_final = float((all_sub_preds == 0.0).mean())
+    near_zero_frac  = float((all_sub_preds < 0.05).mean())
     p50  = float(np.percentile(all_sub_preds, 50))
     p75  = float(np.percentile(all_sub_preds, 75))
     p90  = float(np.percentile(all_sub_preds, 90))
@@ -826,23 +761,21 @@ def main():
         f"mean={all_sub_preds.mean():.4f}  std={all_sub_preds.std():.4f}")
     log(f"  p50={p50:.4f}  p75={p75:.4f}  p90={p90:.4f}  "
         f"p95={p95:.4f}  p99={p99:.4f}  max={pmax:.4f}")
-    log(f"  zero-fraction (exact 0.0): {zero_frac_final:.4f}  "
-        f"(training zero-baseline was {zero_frac:.2%})")
+    log(f"  Exact zero fraction  (==0.0): {zero_frac_final:.4f}")
+    log(f"  Near-zero fraction  (<0.05) : {near_zero_frac:.4f}")
+    log(f"  (Training zero baseline was {zero_frac:.2%})")
+
     if p99 < 2.0:
         log("  *** WARNING: p99 < 2.0 -- predictions may be under-dispersed! ***")
     else:
         log("  v p99 >= 2.0 -- prediction diversity is healthy.")
-    if abs(zero_frac_final - zero_frac) > 0.15:
-        log(f"  *** WARNING: zero-fraction deviation > 15%  "
-            f"(pred={zero_frac_final:.2%} vs train={zero_frac:.2%})")
-    else:
-        log(f"  v Zero-fraction within 15% tolerance of training baseline.")
 
-    # -- 12. Format & save submission.csv -------------------------------------
+    # -- 11. Format & save submission.csv -------------------------------------
+    all_region_ids = test_region_ids
     log("\nFormatting submission.csv ...")
     rows = []
     for i, region_id in enumerate(all_region_ids):
-        preds = final_preds[i]
+        preds = final_submission[i]
         rows.append({
             "region_id":  region_id,
             "pred_week1": float(preds[0]),
@@ -856,7 +789,7 @@ def main():
     sub_path   = os.path.join(ROOT, "submission.csv")
     submission.to_csv(sub_path, index=False)
 
-    # -- 13. Sanity checks -----------------------------------------------------
+    # -- 12. Sanity checks -----------------------------------------------------
     assert len(submission) == 2248, f"Expected 2248 rows, got {len(submission)}"
     assert list(submission.columns) == [
         "region_id", "pred_week1", "pred_week2",
@@ -882,25 +815,23 @@ def main():
     log(f"  Columns: {list(submission.columns)}")
     log(f"\n  Preview:\n{submission.head(5).to_string(index=False)}")
 
-    # -- 14. Total elapsed time ------------------------------------------------
+    # -- 13. Total elapsed time ------------------------------------------------
     elapsed = time.time() - t0
     log(f"\nTotal elapsed: {elapsed:.1f}s  ({elapsed/60:.1f} min)")
 
-    log_path = os.path.join(ROOT, "_training_log_29th.txt")
+    log_path = os.path.join(ROOT, "_training_log_31st.txt")
     with open(log_path, "w") as fh:
         fh.write("\n".join(log_lines))
     print(f"\nTraining log saved -> {log_path}")
 
     return {
-        "fold_results":       fold_results,
-        "overall_cv_mae":     overall_mean,
-        "std_cv_mae":         overall_std,
-        "oof_mae_optimized":  oof_mae_opt,
-        "best_thresholds":    best_thresholds,
-        "input_dim":          N_FLAT_FEATURES,
-        "submission":         submission,
-        "sub_p99":            p99,
-        "zero_frac_final":    zero_frac_final,
+        "fold_results":   fold_results,
+        "overall_cv_mae": overall_mean,
+        "std_cv_mae":     overall_std,
+        "input_shape":    (SEQ_LEN, N_FEATURES),
+        "submission":     submission,
+        "sub_p99":        p99,
+        "zero_frac_final": zero_frac_final,
     }
 
 

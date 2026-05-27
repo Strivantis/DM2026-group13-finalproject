@@ -1,92 +1,59 @@
 """
 DroughtDataset
 ==============
-Custom tabular data builder for drought score multi-step forecasting.
+Custom data builder for drought score multi-step forecasting.
 
 Design
 ------
-- V23 PARADIGM SHIFT: 13-Week Full Tabular Flattening.
-  The complete 13-week context window (all 27 features x 13 weeks) is
-  flattened into a wide 2D spreadsheet of shape (N_samples, 351).
-  Column names follow the pattern `<feature>_w1` through `<feature>_w13`
-  so LightGBM can construct split paths over the full temporal dimension.
+- V31 PARADIGM SHIFT: 3D Temporal Sequence Tensors for Deep Learning.
+  The complete 13-week context window is reshaped into a chronological
+  3D time-series tensor (B, 13, 27) where:
+    - Dimension 0 (B)  : batch axis
+    - Dimension 1 (13) : sequence length (13 weekly time steps)
+    - Dimension 2 (27) : clean feature vector (v26 27-feature set)
+
+  Tabular flattening (v23–v29) and explicit trend deltas (v27) are ABOLISHED.
+  Deep learning handles feature interactions inside Conv1d and BiLSTM layers.
 
 - Multi-step target: the next H=5 weekly `score` values (Y), stored as a
-  (N_samples, 5) matrix - one column per target week.
+  (N_samples, 5) matrix — one column per target week.
 
-- Region boundaries are strictly respected - windows NEVER cross regions.
+- Region boundaries are strictly respected — windows NEVER cross regions.
 - Feature pruning, log1p precipitation transform, and Drought Index
   (PET-based deficit) are applied in refine_features().
 
-v27 Changes (The Tweedie-Hurdle Paradigm)
-------------------------------------------
-EXPAND: Append 27 explicit trend differential features (w13 - w1) onto the
-  351-dimensional flat matrix, upgrading the input dimension to 378.
+v31 Changes (Deep Learning Revival — Parallel Hybrid Sequence Net)
+------------------------------------------------------------------
+  REVIVE: build_sequence_dataset() and build_sequence_test() return
+    3D NumPy arrays of shape (N, 13, 27) for direct PyTorch consumption.
+  ABOLISH: build_tabular_dataset() flat-row construction with v27 deltas.
+           make_flat_col_names() 378-dim wide matrix.
+  RETAIN:  refine_features(), build_stratified_group_cv_folds(),
+           FEATURE_COLS, WINDOW_SIZE, HORIZON, all CV helpers.
 
-  For each sequence row, the direct physical derivative is computed as:
-    feature_delta = feature_w13 - feature_w1
-  for all 27 pure meteorological and intra-week statistics.
-
-  Column naming: <feat>_delta  (27 columns appended after the 351 flat cols).
-
-- build_tabular_dataset() now returns X of shape (N_samples, 378) in v27.
-- build_tabular_test() now returns X of shape (2248, 378) in v27.
+v27 Changes (The Tweedie-Hurdle Paradigm) [SUPERSEDED by v31]
+--------------------------------------------------------------
+  378-dim flat layout (351 flat + 27 explicit w13-w1 deltas).
 
 v26 Changes (The Clean Slate -- Feature Purge)
 ----------------------------------------------
-PURGE: All lag features (tmp_lag1w/2w, humidity_lag1w/2w, prec_lag1w/2w,
-  wind_lag1w/2w -- 8 tokens) and all cross-week rolling aggregates
-  (prec_roll_sum_4w, tmp_roll_mean_4w, humidity_roll_mean_4w,
-  deficit_roll_cum_4w -- 4 tokens) removed.
+  FEATURE_COLS: 39 -> 27 (12 tokens purged).
+  Retained: raw weekly baseline + intra-week stats + cyclic calendar
+            + drought proxy + target encoding.
 
-  Rationale: With 13-Week Full Tabular Flattening, week 12 features ARE
-  the 1-week lag of week 13; lag columns are perfectly redundant and create
-  artificial Train/Test distribution boundaries (adversarial AUC=1.0).
-  Cross-week rolling sums overflow boundaries during weeks 1-3 of each
-  sequence, causing additional domain shift.
+v23 Changes (13-Week Full Tabular Flattening) [SUPERSEDED by v31]
+------------------------------------------------------------------
+  Flattened ALL 13 rows into a wide 2D matrix (N, 351).
 
-RETAIN: raw weekly baseline meteorological variables + intra-week
-  aggregation summaries (_week_max, _week_min, _week_std).
-  These statistics never bleed across week indices.
-
-- FEATURE_COLS: 39 -> 27  (12 tokens purged)
-- Flat feature dimension: 507 -> 351  (27 x 13)
-
-v23 Changes (13-Week Full Tabular Flattening)
-----------------------------------------------
-EXPAND: Flatten ALL 13 rows of each sliding window into a single wide
-  feature vector.  Column naming: <feat>_w1 through <feat>_w13.
-
-- build_tabular_dataset() now returns X of shape (N, 351) in v26.
-- build_tabular_test() now returns X of shape (2248, 351) in v26.
-
-v22 Changes (Tabular Flattening + LightGBM)
---------------------------------------------
-PARADIGM SHIFT: Abolish 3D sliding-window PyTorch Datasets.  Replace with
-  build_tabular_dataset() that extracted ONLY the 13th row (index 12) from
-  each (i, i+13) window.  No DataLoader, no tensor wrappers.
-
-- NEW DROP_COLS pruning additions (v22 adversarial guard):
-    wind_max   : collinearity > 0.95 with baseline `wind`.
-    dow_sin    : lowest permutation importance, seasonal encoding artefact.
-  (dp_tmp, wb_tmp were already pruned in v19/v21 via DROP_COLS.)
-
-v21 Changes (Pure Continuous-Time Prediction + StratifiedGroupKFold CV)
-------------------------------------------------------------------------
-ABOLISHED: all Gap mechanisms.  V21 gap = 0.
-NEW: build_stratified_group_cv_folds() (5-Fold StratifiedGroupKFold).
-
-v19 Changes (Tweedie Paradigm Shift - Enriched Features + Time-Decay)
-----------------------------------------------------------------------
-FEATURE_COLS expanded: 29 to 40 enriched weekly statistics.
-
-v16 Changes (Preprocessing Overhaul - Sequence Grouping & 13-Week Bounds)
---------------------------------------------------------------------------
-WINDOW_SIZE reduced 26 to 13.  8w/13w rolling features removed.
+v22 Changes (Tabular Flattening + LightGBM) [SUPERSEDED by v31]
+-----------------------------------------------------------------
+  Paradigm shift from PyTorch 3D datasets to flat LightGBM tables.
 """
 
 import numpy as np
 import pandas as pd
+import torch
+from torch.utils.data import Dataset
 
 from src.preprocess import add_drought_index, DROUGHT_FEAT_COLS
 
@@ -100,7 +67,7 @@ HORIZON = 5        # forecast horizon (weeks)
 WF_FOLD_WEEKS  = 5   # weeks per fold
 WF_NUM_FOLDS   = 3   # number of folds
 
-# v11 legacy fallback gap (kept for import compat; UNUSED in V22 path)
+# v11 legacy fallback gap (kept for import compat; UNUSED in V31 path)
 GAP_WEEKS = 0
 
 # v20 legacy constants (kept for backward compat imports)
@@ -125,7 +92,7 @@ PREC_COLS = [
     "prec_week_max",
 ]
 
-# Feature columns fed to the model (order matters for scaler alignment)
+# Feature columns fed to the model (order matters for alignment)
 # v26 Clean Slate: 27 features
 #   base weather (10) + enriched weekly stats (11) + cyclic calendar (2)
 #   + drought proxy (2) + target encoding (2) = 27
@@ -151,32 +118,21 @@ FEATURE_COLS = [
     "pet", "deficit",
     # --- target encoding (2) [v9: leakage-free region stats, injected in train.py] ---
     "region_mean_score", "region_zero_prob",
-]   # total = 27 features  |  flat dim = 27 x 13 = 351
+]   # total = 27 features  |  3D tensor shape per sample = (13, 27)
 
 
 # ---------------------------------------------------------------------------
-# V23 Flat Column Names: <feat>_w1 ... <feat>_w13  (351 total in v26)
-# V27 Delta Column Names: <feat>_delta              (27 total in v27)
-# Combined: 351 + 27 = 378 total columns in v27
+# V23 Flat Column Names: retained for backward compat imports only.
 # ---------------------------------------------------------------------------
 def make_flat_col_names(feat_cols: list, window: int = WINDOW_SIZE) -> list:
     """
-    Generate the flat column names used by the v23+ wide matrix.
-    v26: 27 features x 13 weeks = 351 columns.
-    v27: additionally appends 27 delta columns -> 378 total.
-    Order: feat_w1, feat_w2, ..., feat_w13 for each feat in feat_cols.
-    i.e.  [f0_w1, f0_w2, ..., f0_w13, f1_w1, ..., f26_w13]
-    Week-major ordering matches numpy reshape(window * n_feats):
-      row.reshape(-1) after stacking window rows =
-        [f0_w1,..,f26_w1, f0_w2,..,f26_w2, ...]
-    For week_idx w (1-indexed), feat f -> f_w{w}.
-    v27 delta columns appended as: [f0_delta, f1_delta, ..., f26_delta]
+    [v23/v27 legacy — retained for backward compat; not used in v31 pipeline]
+    Generate flat column names: feat_w1 ... feat_w13 + feat_delta (378 total).
     """
     names = []
     for w in range(1, window + 1):
         for feat in feat_cols:
             names.append(f"{feat}_w{w}")
-    # v27: append explicit trend delta column names
     for feat in feat_cols:
         names.append(f"{feat}_delta")
     return names
@@ -189,7 +145,7 @@ def refine_features(df: pd.DataFrame, is_train: bool = True) -> pd.DataFrame:
     """
     1. Compute Drought Index (PET/deficit) BEFORE log1p (uses raw prec).
     2. Drop adversarial / collinear columns (wb_tmp, dp_tmp, surf_tmp,
-       wind_max, dow_sin - v22 expanded pruning).
+       wind_max, dow_sin — v22 expanded pruning).
     3. Apply log1p to precipitation columns (v26: prec and prec_week_max only).
     4. Handle NaN rows:
        - Train: drop rows where any FEATURE_COL is NaN.
@@ -235,28 +191,23 @@ def refine_features(df: pd.DataFrame, is_train: bool = True) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# V23 Primary: Tabular Dataset Builders (13-Week Full Flattening)
+# V31 Primary: 3D Sequence Dataset Builders (B, 13, 27)
 # ---------------------------------------------------------------------------
-def build_tabular_dataset(
+def build_sequence_dataset(
     region_groups: list,
     feat_cols: list,
     window: int = WINDOW_SIZE,
     horizon: int = HORIZON,
 ):
     """
-    V23 Tabular Flattening: flatten ALL `window` rows of each sliding window
-    into a single wide feature vector of length (window * len(feat_cols)).
-    v26: 27 features x 13 weeks = 351 columns.
+    V31 3D Sequence Builder: reshape each sliding window into a chronological
+    3D temporal tensor of shape (N_samples, window, F).
 
-    V27 EXPAND: Append 27 explicit trend differential features (w13 - w1)
-    directly after the 351-dim flat vector, yielding 378 dimensions total.
-    Delta computation:  feature_delta = feature_w13 - feature_w1
-    for each of the 27 features (feat_cols order is preserved).
+    For each window [i, i+window), the block of shape (window, F) is kept as-is
+    (no flattening, no delta appending). The deep layers (Conv1d, BiLSTM)
+    handle temporal interactions internally.
 
-    For each window [i, i+window), the full matrix of shape (window, F) is
-    flattened row-major (week-major) into a 1D vector of shape (window*F,),
-    then the F delta values are concatenated -> (window*F + F,) = (378,) in v27.
-    Column naming convention: feat_w1, feat_w2, ..., feat_w13, feat_delta.
+    v31: window=13, F=27 → each sample is a (13, 27) tensor.
 
     Parameters
     ----------
@@ -269,8 +220,8 @@ def build_tabular_dataset(
 
     Returns
     -------
-    X          : np.ndarray of shape (N_samples, window * len(feat_cols) + len(feat_cols)), float32
-                 i.e. (N_samples, 378) with v27 27-feature set + 27 deltas
+    X          : np.ndarray of shape (N_samples, window, F), float32
+                 i.e. (N_samples, 13, 27) for v31 27-feature set
     y          : np.ndarray of shape (N_samples, horizon), float32, or None
     region_ids : np.ndarray of shape (N_samples,)
     """
@@ -307,71 +258,55 @@ def build_tabular_dataset(
             if tgt_end > n:
                 break
 
-            # V23 KEY: flatten ALL window rows into a single wide row
-            # X_mat[i:end_feat] has shape (window, F) -> reshape to (window*F,)
-            window_block = X_mat[i:end_feat]          # (window, F)
-            flat_row     = window_block.reshape(-1)   # (window*F,) = (351,) in v26
-
-            # V27 KEY: compute explicit trend deltas (w13 - w1) for all F features
-            # window_block[-1] = week 13 values (shape F,)
-            # window_block[0]  = week 1  values (shape F,)
-            delta_row = window_block[-1] - window_block[0]   # (F,) = (27,) in v27
-
-            # Horizontal concatenation: 351 + 27 = 378 dimensions
-            full_row = np.concatenate([flat_row, delta_row])  # (378,)
-            X_rows.append(full_row)
+            # V31 KEY: keep the (window, F) block as 3D — no flattening
+            window_block = X_mat[i:end_feat]    # (13, 27)
+            X_rows.append(window_block)
 
             if y_arr is not None:
                 y_rows.append(y_arr[tgt_start:tgt_end])  # (H,)
 
             region_id_lst.append(rid)
 
-    n_flat_cols = len(feat_cols)
-    n_out = window * n_flat_cols + n_flat_cols  # 351 + 27 = 378
+    n_feat = len(feat_cols)
 
     if not X_rows:
         return (
-            np.empty((0, n_out), dtype=np.float32),
+            np.empty((0, window, n_feat), dtype=np.float32),
             None,
             np.empty(0),
         )
 
-    X = np.array(X_rows, dtype=np.float32)                           # (N, 378)
-    y = np.array(y_rows, dtype=np.float32) if y_rows else None       # (N, H)
+    X          = np.array(X_rows, dtype=np.float32)              # (N, 13, 27)
+    y          = np.array(y_rows, dtype=np.float32) if y_rows else None   # (N, H)
     region_ids = np.array(region_id_lst)
 
     return X, y, region_ids
 
 
-def build_tabular_test(
+def build_sequence_test(
     test_df: pd.DataFrame,
     feat_cols: list,
     window: int = WINDOW_SIZE,
 ):
     """
-    V23 Tabular Test Extractor.
+    V31 3D Sequence Test Extractor.
 
     For each region in test_df, take the LAST `window` rows (padding at front
-    if the region has fewer than `window` historical rows), then flatten ALL
-    `window` rows into a single wide feature vector of length (window * F).
-    v26: 27 features x 13 weeks = 351.
+    if the region has fewer than `window` historical rows), and return the
+    block as a 3D array of shape (n_regions, window, F).
 
-    V27 EXPAND: Append 27 explicit trend differential features (w13 - w1)
-    directly after the 351-dim flat vector, yielding 378 dimensions total.
-    Delta computation:  feature_delta = feature_w13 - feature_w1.
-
-    This gives exactly one row per region (2248 rows for the competition).
+    v31: window=13, F=27 → each row is a (13, 27) temporal block.
 
     Parameters
     ----------
     test_df   : pd.DataFrame with refined features + TE columns
-    feat_cols : list of str - must match the scaler's fitted column order
+    feat_cols : list of str — must match the training feature order
     window    : int, context window size (default 13)
 
     Returns
     -------
-    X          : np.ndarray of shape (n_regions, window * len(feat_cols) + len(feat_cols)), float32
-                 i.e. (2248, 378) with v27 27-feature set + 27 deltas
+    X          : np.ndarray of shape (n_regions, window, F), float32
+                 i.e. (2248, 13, 27) for the competition test set
     region_ids : np.ndarray of shape (n_regions,)
     """
     X_rows     = []
@@ -391,32 +326,51 @@ def build_tabular_test(
         win_df       = group.iloc[-window:]
         cols_present = [c for c in feat_cols if c in win_df.columns]
 
-        # V23 KEY: flatten all window rows into a single wide row
-        window_block = win_df[cols_present].values.astype(np.float32)  # (window, F)
-        flat_row     = window_block.reshape(-1)                         # (window*F,)
+        # V31 KEY: keep the (window, F) block as 3D — no flattening
+        window_block = win_df[cols_present].values.astype(np.float32)  # (13, 27)
 
-        # V27 KEY: compute explicit trend deltas (w13 - w1) for all F features
-        delta_row = window_block[-1] - window_block[0]                  # (F,)
-
-        # Horizontal concatenation: 351 + 27 = 378 dimensions
-        full_row = np.concatenate([flat_row, delta_row])                # (378,)
-
-        X_rows.append(full_row)
+        X_rows.append(window_block)
         region_ids.append(region_id)
 
-    X = np.array(X_rows, dtype=np.float32)
+    X = np.array(X_rows, dtype=np.float32)    # (2248, 13, 27)
     return X, np.array(region_ids)
 
 
 # ---------------------------------------------------------------------------
-# V21 Primary CV: 5-Fold StratifiedGroupKFold builder (RETAINED for V27)
+# V31 PyTorch Dataset wrapper
+# ---------------------------------------------------------------------------
+class DroughtSequenceDataset(Dataset):
+    """
+    V31 PyTorch Dataset wrapping pre-built 3D NumPy arrays.
+
+    Parameters
+    ----------
+    X : np.ndarray  (N, 13, 27)  — temporal sequence tensors
+    y : np.ndarray  (N, 5)       — multi-step targets, or None for inference
+    """
+
+    def __init__(self, X: np.ndarray, y: np.ndarray = None):
+        self.X = torch.from_numpy(X)                          # (N, 13, 27) float32
+        self.y = torch.from_numpy(y) if y is not None else None  # (N, 5) float32
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
+        if self.y is not None:
+            return self.X[idx], self.y[idx]
+        return self.X[idx]
+
+
+# ---------------------------------------------------------------------------
+# V21 Primary CV: 5-Fold StratifiedGroupKFold builder (RETAINED for V31)
 # ---------------------------------------------------------------------------
 def build_stratified_group_cv_folds(
     df: pd.DataFrame,
     n_splits: int = 5,
 ):
     """
-    V21/V22/V23/V26/V27 Primary CV: 5-Fold StratifiedGroupKFold.
+    V21/V22/V23/V26/V27/V31 Primary CV: 5-Fold StratifiedGroupKFold.
 
     Strategy:
     ---------
@@ -427,18 +381,6 @@ def build_stratified_group_cv_folds(
 
     This forces the model to generalise climate physics rather than memorise
     region-specific baselines.
-
-    Train sample construction (per region):
-    ----------------------------------------
-    ALL valid sliding windows with gap = 0:
-      X[i : i+WINDOW_SIZE]  ->  Y[i+WINDOW_SIZE : i+WINDOW_SIZE+HORIZON]
-    i ranges from 0 to n - WINDOW_SIZE - HORIZON (inclusive).
-
-    Val sample construction (per region):
-    ---------------------------------------
-    ALL valid sliding windows (same treatment as training regions).
-
-    Note: gap = 0 throughout (V21/V22/V23/V26/V27 paradigm).
 
     Parameters
     ----------
@@ -457,7 +399,7 @@ def build_stratified_group_cv_folds(
     n_regions  = len(region_ids)
 
     # ------------------------------------------------------------------
-    # Build stratification labels -- 10-quantile bins of per-region mean score
+    # Build stratification labels — 10-quantile bins of per-region mean score
     # ------------------------------------------------------------------
     region_mean_series = df.groupby("region_id")["score"].mean()
     region_means_arr   = np.array(
@@ -489,7 +431,7 @@ def build_stratified_group_cv_folds(
             n = len(group)
 
             if n < WINDOW_SIZE + HORIZON:
-                continue  # region too short for even one sample
+                continue
 
             train_i_max = n - WINDOW_SIZE - HORIZON
             train_groups.append((group, 0, train_i_max))
@@ -501,7 +443,7 @@ def build_stratified_group_cv_folds(
             n = len(group)
 
             if n < WINDOW_SIZE + HORIZON:
-                continue  # region too short for even one sample
+                continue
 
             val_i_max = n - WINDOW_SIZE - HORIZON
             val_groups.append((group, 0, val_i_max))
@@ -512,15 +454,15 @@ def build_stratified_group_cv_folds(
 
 
 # ---------------------------------------------------------------------------
-# Helper - build full-train group list (train on ALL data for final model)
+# Helper — build full-train group list (train on ALL data for final model)
 # ---------------------------------------------------------------------------
 def build_full_train_groups(df: pd.DataFrame, actual_gaps: dict = None):
     """
     Build region groups using ALL rows (no held-out validation period).
     Used for final model training after CV is complete.
 
-    V21/V22/V23/V26/V27: gap=0 throughout.  actual_gaps parameter retained for
-    backward compat but is ignored.
+    V21/V22/V23/V26/V27/V31: gap=0 throughout.  actual_gaps parameter retained
+    for backward compat but is ignored.
     """
     train_groups = []
     for _, group in df.groupby("region_id"):
@@ -537,24 +479,64 @@ def build_full_train_groups(df: pd.DataFrame, actual_gaps: dict = None):
 
 
 # ---------------------------------------------------------------------------
+# V31 backward-compat shims for tabular builders
+# (kept so that adversarial_witchhunt.py, eda.py import without crashing)
+# ---------------------------------------------------------------------------
+def build_tabular_dataset(
+    region_groups: list,
+    feat_cols: list,
+    window: int = WINDOW_SIZE,
+    horizon: int = HORIZON,
+):
+    """
+    [v31 backward-compat shim]
+    Delegates to build_sequence_dataset() and returns (X_flat, y, region_ids)
+    where X_flat has shape (N, window*F) — a 2D reshaping of the 3D block.
+    This ensures stale imports (adversarial_witchhunt.py) do not crash.
+    """
+    X_3d, y, region_ids = build_sequence_dataset(
+        region_groups, feat_cols, window, horizon
+    )
+    if X_3d.shape[0] == 0:
+        return X_3d.reshape(0, window * len(feat_cols)), y, region_ids
+    N, W, F = X_3d.shape
+    return X_3d.reshape(N, W * F), y, region_ids
+
+
+def build_tabular_test(
+    test_df: pd.DataFrame,
+    feat_cols: list,
+    window: int = WINDOW_SIZE,
+):
+    """
+    [v31 backward-compat shim]
+    Delegates to build_sequence_test() and returns (X_flat, region_ids)
+    where X_flat has shape (n_regions, window*F).
+    """
+    X_3d, region_ids = build_sequence_test(test_df, feat_cols, window)
+    N, W, F = X_3d.shape
+    return X_3d.reshape(N, W * F), region_ids
+
+
+# ---------------------------------------------------------------------------
 # Legacy PyTorch DroughtDataset stub  (V22+: raises NotImplementedError)
 # Retained so that any stale imports from older train.py versions do not crash
 # at module-load time.  Attempting to instantiate will raise clearly.
 # ---------------------------------------------------------------------------
 class DroughtDataset:
     """
-    V22+ STUB: PyTorch DroughtDataset is ABOLISHED.
+    V22+ STUB: Original PyTorch DroughtDataset is ABOLISHED.
 
-    The V22/V23/V26/V27 pipeline uses build_tabular_dataset() and build_tabular_test()
-    for pure NumPy/Pandas tabular matrices.  LightGBM does not use DataLoaders.
+    V31 introduces DroughtSequenceDataset (3D temporal tensor).
+    Use build_sequence_dataset() / build_sequence_test() for the v31 path.
 
     Retained for import compatibility only.  Instantiation raises NotImplementedError.
     """
 
     def __init__(self, *args, **kwargs):
         raise NotImplementedError(
-            "DroughtDataset (PyTorch 3D sliding window) is abolished in V22+. "
-            "Use build_tabular_dataset() / build_tabular_test() instead."
+            "DroughtDataset (v21 PyTorch 3D sliding window) is abolished. "
+            "V31: use DroughtSequenceDataset / build_sequence_dataset() instead."
         )
 
 
@@ -562,10 +544,7 @@ class DroughtDataset:
 # Legacy stubs retained for backward compat imports
 # ---------------------------------------------------------------------------
 def compute_actual_gaps(train_df: pd.DataFrame, test_df: pd.DataFrame) -> dict:
-    """
-    V21/V22/V23 STUB: Gap computation is abolished.  Returns a dict mapping every
-    region_id to 0.  Retained for import compatibility with older train.py.
-    """
+    """V21/V22/V23 STUB: Gap computation abolished. Returns all-zero dict."""
     all_ids = set(train_df["region_id"].unique()) | set(test_df["region_id"].unique())
     return {rid: 0 for rid in all_ids}
 
@@ -577,11 +556,7 @@ def build_temporal_shift_cv_folds(
     val_horizon: int = TS_VAL_HORIZON,
     shift_weeks: int = TS_SHIFT_WEEKS,
 ):
-    """
-    V21/V22/V23 STUB: Temporal Shift CV is abolished.
-    Delegates to build_stratified_group_cv_folds().
-    Retained for import compatibility.
-    """
+    """V21/V22/V23 STUB: Temporal Shift CV abolished. Delegates to StratifiedGroupKFold."""
     return build_stratified_group_cv_folds(df, n_splits=n_folds)
 
 
@@ -590,20 +565,12 @@ def build_region_group_cv_folds(
     actual_gaps: dict = None,
     n_splits: int = 5,
 ):
-    """
-    V18/V19 builder - now identical to V21/V22/V23 primary builder.
-    Retained for import compatibility.
-    """
+    """V18/V19 builder — now identical to V21+ primary builder."""
     return build_stratified_group_cv_folds(df, n_splits=n_splits)
 
 
 def build_single_fold(df: pd.DataFrame, actual_gaps: dict = None):
-    """
-    V15 legacy stub.  Returns (train_groups, val_groups) from first fold of
-    StratifiedGroupKFold.
-
-    V21/V22/V23/V26/V27: gap=0. actual_gaps ignored.
-    """
+    """V15 legacy stub. Returns (train_groups, val_groups) from first fold."""
     folds = build_stratified_group_cv_folds(df, n_splits=5)
     if folds:
         return folds[0]
@@ -611,15 +578,10 @@ def build_single_fold(df: pd.DataFrame, actual_gaps: dict = None):
 
 
 def build_gap_replay_folds(df: pd.DataFrame, actual_gaps: dict = None):
-    """
-    V14 legacy stub. Returns StratifiedGroupKFold folds.
-    V21/V22/V23/V26/V27: gap=0. actual_gaps ignored.
-    """
+    """V14 legacy stub. Returns StratifiedGroupKFold folds."""
     return build_stratified_group_cv_folds(df, n_splits=WF_NUM_FOLDS)
 
 
 def build_walk_forward_folds(df: pd.DataFrame):
-    """
-    Legacy stub. Delegates to build_stratified_group_cv_folds().
-    """
+    """Legacy stub. Delegates to build_stratified_group_cv_folds()."""
     return build_stratified_group_cv_folds(df, n_splits=WF_NUM_FOLDS)

@@ -1,0 +1,733 @@
+==========================================================================================
+Drought Forecasting Pipeline  v31  (Parallel Hybrid Sequence Net)
+DroughtSequenceNet  |  Conv1d Branch (local anomaly)  +  BiLSTM Branch (cumulative)
+Input  : (B, 13, 27) 3D chronological time-series tensor
+Target : (B, 5) multi-step scores (next 5 weeks)
+Loss   : nn.L1Loss()  (pure MAE — natively targets conditional median)
+Blend  : np.median(fold_preds, axis=0)  (zero-interference)
+Clip   : np.clip(0.0, 5.0)  (sole post-processing constraint)
+CV     : 5-Fold StratifiedGroupKFold  |  group=region_id  |  10-quantile strata
+==========================================================================================
+
+v31 Configuration:
+  Device         : cuda
+  Epochs (max)   : 50
+  Batch size     : 1024
+  LR             : 0.001
+  Weight decay   : 0.001
+  CosineAnnealing: T_max=50, eta_min=1e-06
+  Early stopping : patience=10 epochs (val L1Loss)
+  GRADIENT CLIP  : max_norm=1.0  (LSTM stability)
+  Input shape    : (B, 13, 27)  [13 weeks x 27 features]
+  Conv1d out     : 64  |  LSTM hidden: 64  |  layers: 3
+  Fused dim      : 192  |  MLP hidden: 128
+  Output shape   : (B, 5)  [5 forecast weeks]
+
+Loading processed data ...
+  train raw: (1757936, 43)  |  test raw: (29224, 40)
+  train regions: 2248  |  test regions: 2248
+
+[v31 Feature Validation]
+  v week_sin, week_cos present.
+  v No 8w/13w rolling features (domain-shift columns absent).
+  [INFO] Lag columns in raw CSV (excluded by FEATURE_COLS): ['tmp_lag1w', 'tmp_lag2w', 'humidity_lag1w', 'humidity_lag2w', 'prec_lag1w', 'prec_lag2w']...
+  v31 FEATURE_COLS: 27 features. 3D input: (B, 13, 27)
+
+Refining features (drought proxy index + log1p prec + v22/v26 pruning) ...
+  train after refinement: (1757936, 44)  |  test: (29224, 41)
+
+[Training Target Distribution]
+  mean=0.8357  std=1.2615  min=0.00  max=5.00
+  Zero-inflation: 59.63% of training scores == 0.0
+  Non-zero: 709,603  (40.37%)  vs  Zeroes: 1,048,333  (59.63%)
+  L1 Loss rationale: MAE converges to conditional MEDIAN; large zero-mass naturally collapses predictions toward 0.0
+
+DroughtSequenceNet Architecture (v31 — Parallel Conv1d + BiLSTM, Pure L1 Loss)
+==========================================================================================
+  Input shape  : (B, 13, 27)   [B x 13 weeks x 27 features]
+
+  == Branch A: Temporal Convolution Channel (Short-Term Anomaly Detector) ==
+  x.transpose(1,2)  -> (B, 27, 13)
+  Conv1d(in=27, out=64, kernel=3, padding=1)  -> (B, 64, 13)
+  GELU()  ->  GroupNorm(8, 64)  ->  AdaptiveAvgPool1d(1)  ->  Flatten
+  branch_a_out : (B, 64)
+
+  == Branch B: Long-Term Accumulation Channel (BiLSTM Sequence Memory) ==
+  LSTM(input=27, hidden=64, layers=3, bidirectional=True, batch_first=True)
+  output[:, -1, :]  -- extract 13th-week final hidden state
+  branch_b_out : (B, 128)   [forward 64 + backward 64]
+
+  == Fusion Head & Projection MLP ==
+  cat([branch_a, branch_b], dim=-1)  ->  fused: (B, 192)
+  Linear(192 -> 128) -> GELU() -> Dropout(0.2) -> Linear(128 -> 5)
+  output : (B, 5)   [raw unbounded regression; NO final activation]
+
+  == Training Objective ==
+  Loss   : nn.L1Loss()  (pure MAE — natively targets conditional median)
+  Optimizer : AdamW(lr=1e-3, weight_decay=1e-3)
+  Scheduler : CosineAnnealingLR(T_max=50, eta_min=1e-6)
+  Epochs : 50 (hard limit)
+  Batch  : 1024
+
+  == Inference ==
+  Median blending: np.median(all_fold_predictions, axis=0)
+  Physical clip  : np.clip(predictions, 0.0, 5.0)
+  NO manual thresholds. NO Sigmoid gate. NO hurdle multiplication.
+------------------------------------------------------------------------------------------
+  [v31] FlatDroughtMLP ABOLISHED: no wide MLP backbone (512->256).
+  [v31] Tabular 378-dim flat input ABOLISHED: 3D (B, 13, 27) tensor.
+  [v31] Multi-quantile Pinball Loss ABOLISHED: pure MAE objective.
+  [v31] Softplus non-negativity guard ABOLISHED: raw regression + clip.
+  [v31] LightGBM Dual-Tree Hurdle ABOLISHED: single end-to-end DL model.
+------------------------------------------------------------------------------------------
+  Total params : 276,997
+
+==========================================================================================
+5-Fold StratifiedGroupKFold CV  [v31 -- DroughtSequenceNet + L1 Loss]
+  Group  : region_id  |  Strata : 10-quantile bins of per-region mean score
+==========================================================================================
+
+  Folds built: 5
+  Fold 0: train_groups=1,798  val_groups=450
+  Fold 1: train_groups=1,798  val_groups=450
+  Fold 2: train_groups=1,798  val_groups=450
+  Fold 3: train_groups=1,798  val_groups=450
+  Fold 4: train_groups=1,800  val_groups=448
+
+==========================================================================================
+5-Fold DroughtSequenceNet Training  [v31]
+  Optimizer : AdamW(lr=0.001, weight_decay=0.001)
+  Scheduler : CosineAnnealingLR(T_max=50, eta_min=1e-06)
+  Loss      : nn.L1Loss()  (pure MAE)
+  Batch     : 1024  |  Max Epochs: 50
+  Early Stop: patience=10 (val L1Loss)
+==========================================================================================
+
+==========================================================================================
+FOLD 1 / 5  [v31 DroughtSequenceNet + L1 Loss]
+  train_groups: 1,798  |  val_groups: 450
+==========================================================================================
+  [OOF TE] Train regions: 1,798  | Val regions: 450
+  feat_cols available: 27 / 27
+  Building 3D sequence arrays ...
+  X_train: (1375470, 13, 27)  |  y_train: (1375470, 5)
+  X_val  : (344250, 13, 27)    |  y_val  : (344250, 5)
+  v Input tensor shape confirmed: (N, 13, 27) = (B, 13, 27)
+  X_test: (2248, 13, 27)
+
+  Model params: 276,997
+  Epoch [  1/50]  train_L1=0.6796  val_L1=0.6473  lr=9.99e-04  t=16.0s
+    [SAVED] New best val_L1=0.6473  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold0.pt
+  Epoch [  2/50]  train_L1=0.6540  val_L1=0.6426  lr=9.96e-04  t=15.5s
+    [SAVED] New best val_L1=0.6426  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold0.pt
+  Epoch [  3/50]  train_L1=0.6445  val_L1=0.6232  lr=9.91e-04  t=15.8s
+    [SAVED] New best val_L1=0.6232  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold0.pt
+  Epoch [  4/50]  train_L1=0.6302  val_L1=0.6128  lr=9.84e-04  t=14.8s
+    [SAVED] New best val_L1=0.6128  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold0.pt
+  Epoch [  5/50]  train_L1=0.6189  val_L1=0.6243  lr=9.76e-04  t=14.6s
+  Epoch [  6/50]  train_L1=0.6087  val_L1=0.5963  lr=9.65e-04  t=17.8s
+    [SAVED] New best val_L1=0.5963  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold0.pt
+  Epoch [  7/50]  train_L1=0.5971  val_L1=0.5849  lr=9.52e-04  t=17.4s
+    [SAVED] New best val_L1=0.5849  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold0.pt
+  Epoch [  8/50]  train_L1=0.5877  val_L1=0.5831  lr=9.38e-04  t=15.7s
+    [SAVED] New best val_L1=0.5831  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold0.pt
+  Epoch [  9/50]  train_L1=0.5777  val_L1=0.5699  lr=9.22e-04  t=16.5s
+    [SAVED] New best val_L1=0.5699  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold0.pt
+  Epoch [ 10/50]  train_L1=0.5668  val_L1=0.5616  lr=9.05e-04  t=17.1s
+    [SAVED] New best val_L1=0.5616  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold0.pt
+  Epoch [ 11/50]  train_L1=0.5605  val_L1=0.5555  lr=8.85e-04  t=16.5s
+    [SAVED] New best val_L1=0.5555  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold0.pt
+  Epoch [ 12/50]  train_L1=0.5489  val_L1=0.5854  lr=8.65e-04  t=16.6s
+  Epoch [ 13/50]  train_L1=0.5415  val_L1=0.5409  lr=8.42e-04  t=17.1s
+    [SAVED] New best val_L1=0.5409  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold0.pt
+  Epoch [ 14/50]  train_L1=0.5329  val_L1=0.5239  lr=8.19e-04  t=15.6s
+    [SAVED] New best val_L1=0.5239  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold0.pt
+  Epoch [ 15/50]  train_L1=0.5237  val_L1=0.5276  lr=7.94e-04  t=14.6s
+  Epoch [ 16/50]  train_L1=0.5161  val_L1=0.5274  lr=7.68e-04  t=14.7s
+  Epoch [ 17/50]  train_L1=0.5088  val_L1=0.5131  lr=7.41e-04  t=15.3s
+    [SAVED] New best val_L1=0.5131  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold0.pt
+  Epoch [ 18/50]  train_L1=0.5017  val_L1=0.5012  lr=7.13e-04  t=14.9s
+    [SAVED] New best val_L1=0.5012  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold0.pt
+  Epoch [ 19/50]  train_L1=0.4952  val_L1=0.4846  lr=6.84e-04  t=15.2s
+    [SAVED] New best val_L1=0.4846  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold0.pt
+  Epoch [ 20/50]  train_L1=0.4884  val_L1=0.4837  lr=6.55e-04  t=14.5s
+    [SAVED] New best val_L1=0.4837  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold0.pt
+  Epoch [ 21/50]  train_L1=0.4837  val_L1=0.4852  lr=6.25e-04  t=14.7s
+  Epoch [ 22/50]  train_L1=0.4785  val_L1=0.4917  lr=5.94e-04  t=14.8s
+  Epoch [ 23/50]  train_L1=0.4739  val_L1=0.4650  lr=5.63e-04  t=14.5s
+    [SAVED] New best val_L1=0.4650  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold0.pt
+  Epoch [ 24/50]  train_L1=0.4693  val_L1=0.4596  lr=5.32e-04  t=14.8s
+    [SAVED] New best val_L1=0.4596  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold0.pt
+  Epoch [ 25/50]  train_L1=0.4647  val_L1=0.4649  lr=5.00e-04  t=14.6s
+  Epoch [ 26/50]  train_L1=0.4600  val_L1=0.4539  lr=4.69e-04  t=16.0s
+    [SAVED] New best val_L1=0.4539  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold0.pt
+  Epoch [ 27/50]  train_L1=0.4569  val_L1=0.4573  lr=4.38e-04  t=15.9s
+  Epoch [ 28/50]  train_L1=0.4534  val_L1=0.4559  lr=4.07e-04  t=15.6s
+  Epoch [ 29/50]  train_L1=0.4498  val_L1=0.4582  lr=3.76e-04  t=15.8s
+  Epoch [ 30/50]  train_L1=0.4464  val_L1=0.4502  lr=3.46e-04  t=16.5s
+    [SAVED] New best val_L1=0.4502  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold0.pt
+  Epoch [ 31/50]  train_L1=0.4433  val_L1=0.4502  lr=3.17e-04  t=15.5s
+    [SAVED] New best val_L1=0.4502  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold0.pt
+  Epoch [ 32/50]  train_L1=0.4404  val_L1=0.4446  lr=2.88e-04  t=15.3s
+    [SAVED] New best val_L1=0.4446  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold0.pt
+  Epoch [ 33/50]  train_L1=0.4376  val_L1=0.4443  lr=2.60e-04  t=16.8s
+    [SAVED] New best val_L1=0.4443  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold0.pt
+  Epoch [ 34/50]  train_L1=0.4348  val_L1=0.4418  lr=2.33e-04  t=16.3s
+    [SAVED] New best val_L1=0.4418  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold0.pt
+  Epoch [ 35/50]  train_L1=0.4319  val_L1=0.4382  lr=2.07e-04  t=17.1s
+    [SAVED] New best val_L1=0.4382  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold0.pt
+  Epoch [ 36/50]  train_L1=0.4298  val_L1=0.4391  lr=1.82e-04  t=16.4s
+  Epoch [ 37/50]  train_L1=0.4279  val_L1=0.4318  lr=1.59e-04  t=16.1s
+    [SAVED] New best val_L1=0.4318  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold0.pt
+  Epoch [ 38/50]  train_L1=0.4258  val_L1=0.4418  lr=1.36e-04  t=15.7s
+  Epoch [ 39/50]  train_L1=0.4242  val_L1=0.4354  lr=1.16e-04  t=15.7s
+  Epoch [ 40/50]  train_L1=0.4223  val_L1=0.4282  lr=9.64e-05  t=16.2s
+    [SAVED] New best val_L1=0.4282  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold0.pt
+  Epoch [ 41/50]  train_L1=0.4208  val_L1=0.4272  lr=7.88e-05  t=15.9s
+    [SAVED] New best val_L1=0.4272  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold0.pt
+  Epoch [ 42/50]  train_L1=0.4189  val_L1=0.4268  lr=6.28e-05  t=15.5s
+    [SAVED] New best val_L1=0.4268  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold0.pt
+  Epoch [ 43/50]  train_L1=0.4176  val_L1=0.4299  lr=4.85e-05  t=16.1s
+  Epoch [ 44/50]  train_L1=0.4168  val_L1=0.4286  lr=3.61e-05  t=16.1s
+  Epoch [ 45/50]  train_L1=0.4163  val_L1=0.4256  lr=2.54e-05  t=16.5s
+    [SAVED] New best val_L1=0.4256  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold0.pt
+  Epoch [ 46/50]  train_L1=0.4158  val_L1=0.4246  lr=1.67e-05  t=15.1s
+    [SAVED] New best val_L1=0.4246  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold0.pt
+  Epoch [ 47/50]  train_L1=0.4150  val_L1=0.4238  lr=9.85e-06  t=15.2s
+    [SAVED] New best val_L1=0.4238  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold0.pt
+  Epoch [ 48/50]  train_L1=0.4147  val_L1=0.4249  lr=4.94e-06  t=14.7s
+  Epoch [ 49/50]  train_L1=0.4141  val_L1=0.4255  lr=1.99e-06  t=15.0s
+  Epoch [ 50/50]  train_L1=0.4142  val_L1=0.4243  lr=1.00e-06  t=14.8s
+  [BEST] Loaded best model state (val_L1=0.4238)
+
+  [Fold 0] Week MAEs (OOF L1): W1=0.4206  W2=0.4161  W3=0.4186  W4=0.4282  W5=0.4442
+  [Fold 0] Overall OOF MAE   : 0.4255
+  [Fold 0] Best Val L1 (ckpt): 0.4238
+  [Fold 0] Epochs run         : 50/50
+  [Fold 0] Elapsed            : 792.6s
+
+  ================================================================================
+  BINNED ERROR MATRIX  --  Fold 0  (OOF Predictions, L1-trained)
+  ================================================================================
+  Interval                                              Count   AvgTrue   AvgPred       MAE
+  ------------------------------------------------------------------------------
+  Interval 0  [Absolute Zero     y == 0.0       ]     1,025,076    0.0000    0.1355    0.1359
+  Interval 1  [Mild Drought      0.0 < y <= 1.0 ]     299,981    1.0000    0.6716    0.6144
+  Interval 2  [Moderate Drought  1.0 < y <= 2.0 ]     181,361    2.0000    1.3438    0.8847
+  Interval 3  [Severe Drought    2.0 < y <= 3.0 ]     118,791    3.0000    2.0707    1.1098
+  Interval 4  [Extreme Drought   3.0 < y <= 4.0 ]      66,541    4.0000    2.9268    1.1941
+  Interval 5  [Exceptional       4.0 < y <= 5.0 ]      29,500    5.0000    3.7506    1.2589
+  ================================================================================
+
+  [Test inference] shape=(2248, 5)  mean=1.0918  std=1.0700  min=-0.0665  max=5.2219
+
+==========================================================================================
+FOLD 2 / 5  [v31 DroughtSequenceNet + L1 Loss]
+  train_groups: 1,798  |  val_groups: 450
+==========================================================================================
+  [OOF TE] Train regions: 1,798  | Val regions: 450
+  feat_cols available: 27 / 27
+  Building 3D sequence arrays ...
+  X_train: (1375470, 13, 27)  |  y_train: (1375470, 5)
+  X_val  : (344250, 13, 27)    |  y_val  : (344250, 5)
+  v Input tensor shape confirmed: (N, 13, 27) = (B, 13, 27)
+  X_test: (2248, 13, 27)
+
+  Model params: 276,997
+  Epoch [  1/50]  train_L1=0.6826  val_L1=0.6349  lr=9.99e-04  t=15.5s
+    [SAVED] New best val_L1=0.6349  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold1.pt
+  Epoch [  2/50]  train_L1=0.6534  val_L1=0.6519  lr=9.96e-04  t=15.3s
+  Epoch [  3/50]  train_L1=0.6410  val_L1=0.6515  lr=9.91e-04  t=16.4s
+  Epoch [  4/50]  train_L1=0.6313  val_L1=0.6243  lr=9.84e-04  t=16.7s
+    [SAVED] New best val_L1=0.6243  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold1.pt
+  Epoch [  5/50]  train_L1=0.6233  val_L1=0.6132  lr=9.76e-04  t=15.5s
+    [SAVED] New best val_L1=0.6132  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold1.pt
+  Epoch [  6/50]  train_L1=0.6144  val_L1=0.6408  lr=9.65e-04  t=15.1s
+  Epoch [  7/50]  train_L1=0.6067  val_L1=0.6216  lr=9.52e-04  t=15.2s
+  Epoch [  8/50]  train_L1=0.6000  val_L1=0.6107  lr=9.38e-04  t=15.2s
+    [SAVED] New best val_L1=0.6107  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold1.pt
+  Epoch [  9/50]  train_L1=0.5927  val_L1=0.5989  lr=9.22e-04  t=15.0s
+    [SAVED] New best val_L1=0.5989  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold1.pt
+  Epoch [ 10/50]  train_L1=0.5891  val_L1=0.6096  lr=9.05e-04  t=14.9s
+  Epoch [ 11/50]  train_L1=0.5803  val_L1=0.5779  lr=8.85e-04  t=15.0s
+    [SAVED] New best val_L1=0.5779  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold1.pt
+  Epoch [ 12/50]  train_L1=0.5710  val_L1=0.6029  lr=8.65e-04  t=14.8s
+  Epoch [ 13/50]  train_L1=0.5618  val_L1=0.5781  lr=8.42e-04  t=15.2s
+  Epoch [ 14/50]  train_L1=0.5549  val_L1=0.5526  lr=8.19e-04  t=15.0s
+    [SAVED] New best val_L1=0.5526  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold1.pt
+  Epoch [ 15/50]  train_L1=0.5470  val_L1=0.5477  lr=7.94e-04  t=15.1s
+    [SAVED] New best val_L1=0.5477  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold1.pt
+  Epoch [ 16/50]  train_L1=0.5386  val_L1=0.5584  lr=7.68e-04  t=15.1s
+  Epoch [ 17/50]  train_L1=0.5321  val_L1=0.5250  lr=7.41e-04  t=15.1s
+    [SAVED] New best val_L1=0.5250  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold1.pt
+  Epoch [ 18/50]  train_L1=0.5258  val_L1=0.5281  lr=7.13e-04  t=15.6s
+  Epoch [ 19/50]  train_L1=0.5188  val_L1=0.5128  lr=6.84e-04  t=16.0s
+    [SAVED] New best val_L1=0.5128  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold1.pt
+  Epoch [ 20/50]  train_L1=0.5130  val_L1=0.5171  lr=6.55e-04  t=16.3s
+  Epoch [ 21/50]  train_L1=0.5073  val_L1=0.5227  lr=6.25e-04  t=16.1s
+  Epoch [ 22/50]  train_L1=0.5019  val_L1=0.5217  lr=5.94e-04  t=15.8s
+  Epoch [ 23/50]  train_L1=0.4963  val_L1=0.5056  lr=5.63e-04  t=16.0s
+    [SAVED] New best val_L1=0.5056  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold1.pt
+  Epoch [ 24/50]  train_L1=0.4926  val_L1=0.5063  lr=5.32e-04  t=15.8s
+  Epoch [ 25/50]  train_L1=0.4890  val_L1=0.5000  lr=5.00e-04  t=16.0s
+    [SAVED] New best val_L1=0.5000  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold1.pt
+  Epoch [ 26/50]  train_L1=0.4841  val_L1=0.5046  lr=4.69e-04  t=16.7s
+  Epoch [ 27/50]  train_L1=0.4799  val_L1=0.4941  lr=4.38e-04  t=15.8s
+    [SAVED] New best val_L1=0.4941  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold1.pt
+  Epoch [ 28/50]  train_L1=0.4770  val_L1=0.4875  lr=4.07e-04  t=16.3s
+    [SAVED] New best val_L1=0.4875  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold1.pt
+  Epoch [ 29/50]  train_L1=0.4736  val_L1=0.4818  lr=3.76e-04  t=15.9s
+    [SAVED] New best val_L1=0.4818  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold1.pt
+  Epoch [ 30/50]  train_L1=0.4700  val_L1=0.4844  lr=3.46e-04  t=15.8s
+  Epoch [ 31/50]  train_L1=0.4666  val_L1=0.4763  lr=3.17e-04  t=16.5s
+    [SAVED] New best val_L1=0.4763  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold1.pt
+  Epoch [ 32/50]  train_L1=0.4645  val_L1=0.4783  lr=2.88e-04  t=16.1s
+  Epoch [ 33/50]  train_L1=0.4614  val_L1=0.4997  lr=2.60e-04  t=16.0s
+  Epoch [ 34/50]  train_L1=0.4600  val_L1=0.4780  lr=2.33e-04  t=16.4s
+  Epoch [ 35/50]  train_L1=0.4572  val_L1=0.4775  lr=2.07e-04  t=16.3s
+  Epoch [ 36/50]  train_L1=0.4554  val_L1=0.4781  lr=1.82e-04  t=16.1s
+  Epoch [ 37/50]  train_L1=0.4528  val_L1=0.4739  lr=1.59e-04  t=15.7s
+    [SAVED] New best val_L1=0.4739  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold1.pt
+  Epoch [ 38/50]  train_L1=0.4514  val_L1=0.4757  lr=1.36e-04  t=16.1s
+  Epoch [ 39/50]  train_L1=0.4493  val_L1=0.4767  lr=1.16e-04  t=15.9s
+  Epoch [ 40/50]  train_L1=0.4477  val_L1=0.4662  lr=9.64e-05  t=16.1s
+    [SAVED] New best val_L1=0.4662  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold1.pt
+  Epoch [ 41/50]  train_L1=0.4461  val_L1=0.4738  lr=7.88e-05  t=15.8s
+  Epoch [ 42/50]  train_L1=0.4454  val_L1=0.4658  lr=6.28e-05  t=15.4s
+    [SAVED] New best val_L1=0.4658  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold1.pt
+  Epoch [ 43/50]  train_L1=0.4435  val_L1=0.4690  lr=4.85e-05  t=17.9s
+  Epoch [ 44/50]  train_L1=0.4430  val_L1=0.4696  lr=3.61e-05  t=17.6s
+  Epoch [ 45/50]  train_L1=0.4419  val_L1=0.4697  lr=2.54e-05  t=17.7s
+  Epoch [ 46/50]  train_L1=0.4412  val_L1=0.4710  lr=1.67e-05  t=16.5s
+  Epoch [ 47/50]  train_L1=0.4404  val_L1=0.4664  lr=9.85e-06  t=16.1s
+  Epoch [ 48/50]  train_L1=0.4400  val_L1=0.4668  lr=4.94e-06  t=16.1s
+  Epoch [ 49/50]  train_L1=0.4399  val_L1=0.4675  lr=1.99e-06  t=16.0s
+  Epoch [ 50/50]  train_L1=0.4397  val_L1=0.4680  lr=1.00e-06  t=16.5s
+  [BEST] Loaded best model state (val_L1=0.4658)
+
+  [Fold 1] Week MAEs (OOF L1): W1=0.4614  W2=0.4574  W3=0.4603  W4=0.4706  W5=0.4864
+  [Fold 1] Overall OOF MAE   : 0.4672
+  [Fold 1] Best Val L1 (ckpt): 0.4658
+  [Fold 1] Epochs run         : 50/50
+  [Fold 1] Elapsed            : 801.4s
+
+  ================================================================================
+  BINNED ERROR MATRIX  --  Fold 1  (OOF Predictions, L1-trained)
+  ================================================================================
+  Interval                                              Count   AvgTrue   AvgPred       MAE
+  ------------------------------------------------------------------------------
+  Interval 0  [Absolute Zero     y == 0.0       ]     1,019,404    0.0000    0.1487    0.1489
+  Interval 1  [Mild Drought      0.0 < y <= 1.0 ]     303,316    1.0000    0.6843    0.6535
+  Interval 2  [Moderate Drought  1.0 < y <= 2.0 ]     183,538    2.0000    1.3074    0.9707
+  Interval 3  [Severe Drought    2.0 < y <= 3.0 ]     118,371    3.0000    1.9971    1.2129
+  Interval 4  [Extreme Drought   3.0 < y <= 4.0 ]      65,856    4.0000    2.7513    1.3605
+  Interval 5  [Exceptional       4.0 < y <= 5.0 ]      30,765    5.0000    3.6276    1.3929
+  ================================================================================
+
+  [Test inference] shape=(2248, 5)  mean=1.1018  std=1.0941  min=-0.0219  max=5.1446
+
+==========================================================================================
+FOLD 3 / 5  [v31 DroughtSequenceNet + L1 Loss]
+  train_groups: 1,798  |  val_groups: 450
+==========================================================================================
+  [OOF TE] Train regions: 1,798  | Val regions: 450
+  feat_cols available: 27 / 27
+  Building 3D sequence arrays ...
+  X_train: (1375470, 13, 27)  |  y_train: (1375470, 5)
+  X_val  : (344250, 13, 27)    |  y_val  : (344250, 5)
+  v Input tensor shape confirmed: (N, 13, 27) = (B, 13, 27)
+  X_test: (2248, 13, 27)
+
+  Model params: 276,997
+  Epoch [  1/50]  train_L1=0.6778  val_L1=0.6627  lr=9.99e-04  t=16.6s
+    [SAVED] New best val_L1=0.6627  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold2.pt
+  Epoch [  2/50]  train_L1=0.6512  val_L1=0.6536  lr=9.96e-04  t=18.5s
+    [SAVED] New best val_L1=0.6536  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold2.pt
+  Epoch [  3/50]  train_L1=0.6369  val_L1=0.6167  lr=9.91e-04  t=16.0s
+    [SAVED] New best val_L1=0.6167  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold2.pt
+  Epoch [  4/50]  train_L1=0.6274  val_L1=0.6078  lr=9.84e-04  t=16.2s
+    [SAVED] New best val_L1=0.6078  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold2.pt
+  Epoch [  5/50]  train_L1=0.6186  val_L1=0.6266  lr=9.76e-04  t=16.7s
+  Epoch [  6/50]  train_L1=0.6073  val_L1=0.5912  lr=9.65e-04  t=16.5s
+    [SAVED] New best val_L1=0.5912  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold2.pt
+  Epoch [  7/50]  train_L1=0.5963  val_L1=0.6053  lr=9.52e-04  t=16.4s
+  Epoch [  8/50]  train_L1=0.5846  val_L1=0.5935  lr=9.38e-04  t=16.5s
+  Epoch [  9/50]  train_L1=0.5726  val_L1=0.5651  lr=9.22e-04  t=16.4s
+    [SAVED] New best val_L1=0.5651  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold2.pt
+  Epoch [ 10/50]  train_L1=0.5619  val_L1=0.5599  lr=9.05e-04  t=17.8s
+    [SAVED] New best val_L1=0.5599  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold2.pt
+  Epoch [ 11/50]  train_L1=0.5508  val_L1=0.5800  lr=8.85e-04  t=17.3s
+  Epoch [ 12/50]  train_L1=0.5416  val_L1=0.5406  lr=8.65e-04  t=15.8s
+    [SAVED] New best val_L1=0.5406  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold2.pt
+  Epoch [ 13/50]  train_L1=0.5318  val_L1=0.5314  lr=8.42e-04  t=15.5s
+    [SAVED] New best val_L1=0.5314  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold2.pt
+  Epoch [ 14/50]  train_L1=0.5237  val_L1=0.5258  lr=8.19e-04  t=16.2s
+    [SAVED] New best val_L1=0.5258  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold2.pt
+  Epoch [ 15/50]  train_L1=0.5155  val_L1=0.5091  lr=7.94e-04  t=15.6s
+    [SAVED] New best val_L1=0.5091  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold2.pt
+  Epoch [ 16/50]  train_L1=0.5088  val_L1=0.5026  lr=7.68e-04  t=19.6s
+    [SAVED] New best val_L1=0.5026  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold2.pt
+  Epoch [ 17/50]  train_L1=0.5017  val_L1=0.4905  lr=7.41e-04  t=16.6s
+    [SAVED] New best val_L1=0.4905  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold2.pt
+  Epoch [ 18/50]  train_L1=0.4951  val_L1=0.4813  lr=7.13e-04  t=16.9s
+    [SAVED] New best val_L1=0.4813  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold2.pt
+  Epoch [ 19/50]  train_L1=0.4892  val_L1=0.4821  lr=6.84e-04  t=18.0s
+  Epoch [ 20/50]  train_L1=0.4837  val_L1=0.4916  lr=6.55e-04  t=16.3s
+  Epoch [ 21/50]  train_L1=0.4780  val_L1=0.4674  lr=6.25e-04  t=17.6s
+    [SAVED] New best val_L1=0.4674  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold2.pt
+  Epoch [ 22/50]  train_L1=0.4735  val_L1=0.4561  lr=5.94e-04  t=16.1s
+    [SAVED] New best val_L1=0.4561  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold2.pt
+  Epoch [ 23/50]  train_L1=0.4688  val_L1=0.4673  lr=5.63e-04  t=17.2s
+  Epoch [ 24/50]  train_L1=0.4643  val_L1=0.4622  lr=5.32e-04  t=17.3s
+  Epoch [ 25/50]  train_L1=0.4605  val_L1=0.4476  lr=5.00e-04  t=17.5s
+    [SAVED] New best val_L1=0.4476  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold2.pt
+  Epoch [ 26/50]  train_L1=0.4570  val_L1=0.4439  lr=4.69e-04  t=15.9s
+    [SAVED] New best val_L1=0.4439  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold2.pt
+  Epoch [ 27/50]  train_L1=0.4533  val_L1=0.4461  lr=4.38e-04  t=15.8s
+  Epoch [ 28/50]  train_L1=0.4499  val_L1=0.4533  lr=4.07e-04  t=17.4s
+  Epoch [ 29/50]  train_L1=0.4477  val_L1=0.4349  lr=3.76e-04  t=18.7s
+    [SAVED] New best val_L1=0.4349  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold2.pt
+  Epoch [ 30/50]  train_L1=0.4436  val_L1=0.4364  lr=3.46e-04  t=16.5s
+  Epoch [ 31/50]  train_L1=0.4409  val_L1=0.4426  lr=3.17e-04  t=16.8s
+  Epoch [ 32/50]  train_L1=0.4383  val_L1=0.4283  lr=2.88e-04  t=16.5s
+    [SAVED] New best val_L1=0.4283  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold2.pt
+  Epoch [ 33/50]  train_L1=0.4359  val_L1=0.4267  lr=2.60e-04  t=17.1s
+    [SAVED] New best val_L1=0.4267  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold2.pt
+  Epoch [ 34/50]  train_L1=0.4343  val_L1=0.4349  lr=2.33e-04  t=16.2s
+  Epoch [ 35/50]  train_L1=0.4315  val_L1=0.4279  lr=2.07e-04  t=16.2s
+  Epoch [ 36/50]  train_L1=0.4297  val_L1=0.4254  lr=1.82e-04  t=16.7s
+    [SAVED] New best val_L1=0.4254  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold2.pt
+  Epoch [ 37/50]  train_L1=0.4277  val_L1=0.4270  lr=1.59e-04  t=16.6s
+  Epoch [ 38/50]  train_L1=0.4256  val_L1=0.4263  lr=1.36e-04  t=16.0s
+  Epoch [ 39/50]  train_L1=0.4237  val_L1=0.4215  lr=1.16e-04  t=16.9s
+    [SAVED] New best val_L1=0.4215  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold2.pt
+  Epoch [ 40/50]  train_L1=0.4222  val_L1=0.4193  lr=9.64e-05  t=17.0s
+    [SAVED] New best val_L1=0.4193  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold2.pt
+  Epoch [ 41/50]  train_L1=0.4205  val_L1=0.4178  lr=7.88e-05  t=16.8s
+    [SAVED] New best val_L1=0.4178  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold2.pt
+  Epoch [ 42/50]  train_L1=0.4195  val_L1=0.4167  lr=6.28e-05  t=16.5s
+    [SAVED] New best val_L1=0.4167  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold2.pt
+  Epoch [ 43/50]  train_L1=0.4180  val_L1=0.4161  lr=4.85e-05  t=16.3s
+    [SAVED] New best val_L1=0.4161  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold2.pt
+  Epoch [ 44/50]  train_L1=0.4171  val_L1=0.4171  lr=3.61e-05  t=15.1s
+  Epoch [ 45/50]  train_L1=0.4166  val_L1=0.4148  lr=2.54e-05  t=15.1s
+    [SAVED] New best val_L1=0.4148  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold2.pt
+  Epoch [ 46/50]  train_L1=0.4159  val_L1=0.4163  lr=1.67e-05  t=15.4s
+  Epoch [ 47/50]  train_L1=0.4154  val_L1=0.4145  lr=9.85e-06  t=15.3s
+    [SAVED] New best val_L1=0.4145  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold2.pt
+  Epoch [ 48/50]  train_L1=0.4152  val_L1=0.4141  lr=4.94e-06  t=14.9s
+    [SAVED] New best val_L1=0.4141  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold2.pt
+  Epoch [ 49/50]  train_L1=0.4148  val_L1=0.4136  lr=1.99e-06  t=15.4s
+    [SAVED] New best val_L1=0.4136  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold2.pt
+  Epoch [ 50/50]  train_L1=0.4148  val_L1=0.4137  lr=1.00e-06  t=16.9s
+  [BEST] Loaded best model state (val_L1=0.4136)
+
+  [Fold 2] Week MAEs (OOF L1): W1=0.4089  W2=0.4034  W3=0.4066  W4=0.4178  W5=0.4351
+  [Fold 2] Overall OOF MAE   : 0.4144
+  [Fold 2] Best Val L1 (ckpt): 0.4136
+  [Fold 2] Epochs run         : 50/50
+  [Fold 2] Elapsed            : 835.6s
+
+  ================================================================================
+  BINNED ERROR MATRIX  --  Fold 2  (OOF Predictions, L1-trained)
+  ================================================================================
+  Interval                                              Count   AvgTrue   AvgPred       MAE
+  ------------------------------------------------------------------------------
+  Interval 0  [Absolute Zero     y == 0.0       ]     1,024,790    0.0000    0.1355    0.1357
+  Interval 1  [Mild Drought      0.0 < y <= 1.0 ]     300,358    1.0000    0.7097    0.6134
+  Interval 2  [Moderate Drought  1.0 < y <= 2.0 ]     181,954    2.0000    1.4361    0.8555
+  Interval 3  [Severe Drought    2.0 < y <= 3.0 ]     113,193    3.0000    2.1595    1.0664
+  Interval 4  [Extreme Drought   3.0 < y <= 4.0 ]      67,836    4.0000    3.0794    1.0742
+  Interval 5  [Exceptional       4.0 < y <= 5.0 ]      33,119    5.0000    3.7784    1.2299
+  ================================================================================
+
+  [Test inference] shape=(2248, 5)  mean=1.1638  std=1.1603  min=-0.0420  max=5.1447
+
+==========================================================================================
+FOLD 4 / 5  [v31 DroughtSequenceNet + L1 Loss]
+  train_groups: 1,798  |  val_groups: 450
+==========================================================================================
+  [OOF TE] Train regions: 1,798  | Val regions: 450
+  feat_cols available: 27 / 27
+  Building 3D sequence arrays ...
+  X_train: (1375470, 13, 27)  |  y_train: (1375470, 5)
+  X_val  : (344250, 13, 27)    |  y_val  : (344250, 5)
+  v Input tensor shape confirmed: (N, 13, 27) = (B, 13, 27)
+  X_test: (2248, 13, 27)
+
+  Model params: 276,997
+  Epoch [  1/50]  train_L1=0.6736  val_L1=0.6428  lr=9.99e-04  t=17.8s
+    [SAVED] New best val_L1=0.6428  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold3.pt
+  Epoch [  2/50]  train_L1=0.6480  val_L1=0.6271  lr=9.96e-04  t=17.3s
+    [SAVED] New best val_L1=0.6271  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold3.pt
+  Epoch [  3/50]  train_L1=0.6352  val_L1=0.6139  lr=9.91e-04  t=15.7s
+    [SAVED] New best val_L1=0.6139  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold3.pt
+  Epoch [  4/50]  train_L1=0.6239  val_L1=0.6076  lr=9.84e-04  t=16.1s
+    [SAVED] New best val_L1=0.6076  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold3.pt
+  Epoch [  5/50]  train_L1=0.6132  val_L1=0.5960  lr=9.76e-04  t=16.7s
+    [SAVED] New best val_L1=0.5960  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold3.pt
+  Epoch [  6/50]  train_L1=0.6032  val_L1=0.6030  lr=9.65e-04  t=15.7s
+  Epoch [  7/50]  train_L1=0.5894  val_L1=0.5693  lr=9.52e-04  t=16.4s
+    [SAVED] New best val_L1=0.5693  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold3.pt
+  Epoch [  8/50]  train_L1=0.5748  val_L1=0.5701  lr=9.38e-04  t=15.5s
+  Epoch [  9/50]  train_L1=0.5638  val_L1=0.5606  lr=9.22e-04  t=18.5s
+    [SAVED] New best val_L1=0.5606  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold3.pt
+  Epoch [ 10/50]  train_L1=0.5488  val_L1=0.5430  lr=9.05e-04  t=17.2s
+    [SAVED] New best val_L1=0.5430  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold3.pt
+  Epoch [ 11/50]  train_L1=0.5388  val_L1=0.5394  lr=8.85e-04  t=17.0s
+    [SAVED] New best val_L1=0.5394  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold3.pt
+  Epoch [ 12/50]  train_L1=0.5288  val_L1=0.5201  lr=8.65e-04  t=17.2s
+    [SAVED] New best val_L1=0.5201  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold3.pt
+  Epoch [ 13/50]  train_L1=0.5191  val_L1=0.5336  lr=8.42e-04  t=15.7s
+  Epoch [ 14/50]  train_L1=0.5086  val_L1=0.5288  lr=8.19e-04  t=16.5s
+  Epoch [ 15/50]  train_L1=0.5016  val_L1=0.4943  lr=7.94e-04  t=15.6s
+    [SAVED] New best val_L1=0.4943  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold3.pt
+  Epoch [ 16/50]  train_L1=0.4943  val_L1=0.4819  lr=7.68e-04  t=17.5s
+    [SAVED] New best val_L1=0.4819  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold3.pt
+  Epoch [ 17/50]  train_L1=0.4863  val_L1=0.4804  lr=7.41e-04  t=17.5s
+    [SAVED] New best val_L1=0.4804  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold3.pt
+  Epoch [ 18/50]  train_L1=0.4799  val_L1=0.4743  lr=7.13e-04  t=16.2s
+    [SAVED] New best val_L1=0.4743  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold3.pt
+  Epoch [ 19/50]  train_L1=0.4744  val_L1=0.4762  lr=6.84e-04  t=16.1s
+  Epoch [ 20/50]  train_L1=0.4693  val_L1=0.4748  lr=6.55e-04  t=16.6s
+  Epoch [ 21/50]  train_L1=0.4634  val_L1=0.4601  lr=6.25e-04  t=15.5s
+    [SAVED] New best val_L1=0.4601  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold3.pt
+  Epoch [ 22/50]  train_L1=0.4595  val_L1=0.4555  lr=5.94e-04  t=16.4s
+    [SAVED] New best val_L1=0.4555  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold3.pt
+  Epoch [ 23/50]  train_L1=0.4549  val_L1=0.4501  lr=5.63e-04  t=16.2s
+    [SAVED] New best val_L1=0.4501  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold3.pt
+  Epoch [ 24/50]  train_L1=0.4497  val_L1=0.4511  lr=5.32e-04  t=16.9s
+  Epoch [ 25/50]  train_L1=0.4464  val_L1=0.4428  lr=5.00e-04  t=16.2s
+    [SAVED] New best val_L1=0.4428  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold3.pt
+  Epoch [ 26/50]  train_L1=0.4424  val_L1=0.4498  lr=4.69e-04  t=16.6s
+  Epoch [ 27/50]  train_L1=0.4384  val_L1=0.4512  lr=4.38e-04  t=16.1s
+  Epoch [ 28/50]  train_L1=0.4360  val_L1=0.4335  lr=4.07e-04  t=16.1s
+    [SAVED] New best val_L1=0.4335  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold3.pt
+  Epoch [ 29/50]  train_L1=0.4322  val_L1=0.4303  lr=3.76e-04  t=14.9s
+    [SAVED] New best val_L1=0.4303  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold3.pt
+  Epoch [ 30/50]  train_L1=0.4296  val_L1=0.4310  lr=3.46e-04  t=14.6s
+  Epoch [ 31/50]  train_L1=0.4267  val_L1=0.4269  lr=3.17e-04  t=15.0s
+    [SAVED] New best val_L1=0.4269  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold3.pt
+  Epoch [ 32/50]  train_L1=0.4243  val_L1=0.4306  lr=2.88e-04  t=15.7s
+  Epoch [ 33/50]  train_L1=0.4219  val_L1=0.4277  lr=2.60e-04  t=15.3s
+  Epoch [ 34/50]  train_L1=0.4192  val_L1=0.4305  lr=2.33e-04  t=15.2s
+  Epoch [ 35/50]  train_L1=0.4174  val_L1=0.4201  lr=2.07e-04  t=15.1s
+    [SAVED] New best val_L1=0.4201  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold3.pt
+  Epoch [ 36/50]  train_L1=0.4152  val_L1=0.4124  lr=1.82e-04  t=14.9s
+    [SAVED] New best val_L1=0.4124  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold3.pt
+  Epoch [ 37/50]  train_L1=0.4130  val_L1=0.4182  lr=1.59e-04  t=14.9s
+  Epoch [ 38/50]  train_L1=0.4104  val_L1=0.4174  lr=1.36e-04  t=15.1s
+  Epoch [ 39/50]  train_L1=0.4090  val_L1=0.4198  lr=1.16e-04  t=15.0s
+  Epoch [ 40/50]  train_L1=0.4070  val_L1=0.4123  lr=9.64e-05  t=15.0s
+    [SAVED] New best val_L1=0.4123  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold3.pt
+  Epoch [ 41/50]  train_L1=0.4060  val_L1=0.4092  lr=7.88e-05  t=15.1s
+    [SAVED] New best val_L1=0.4092  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold3.pt
+  Epoch [ 42/50]  train_L1=0.4046  val_L1=0.4108  lr=6.28e-05  t=15.0s
+  Epoch [ 43/50]  train_L1=0.4035  val_L1=0.4123  lr=4.85e-05  t=15.0s
+  Epoch [ 44/50]  train_L1=0.4024  val_L1=0.4097  lr=3.61e-05  t=15.1s
+  Epoch [ 45/50]  train_L1=0.4019  val_L1=0.4124  lr=2.54e-05  t=15.0s
+  Epoch [ 46/50]  train_L1=0.4011  val_L1=0.4086  lr=1.67e-05  t=15.0s
+    [SAVED] New best val_L1=0.4086  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold3.pt
+  Epoch [ 47/50]  train_L1=0.4002  val_L1=0.4088  lr=9.85e-06  t=14.9s
+  Epoch [ 48/50]  train_L1=0.4003  val_L1=0.4093  lr=4.94e-06  t=15.0s
+  Epoch [ 49/50]  train_L1=0.3997  val_L1=0.4084  lr=1.99e-06  t=14.9s
+    [SAVED] New best val_L1=0.4084  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold3.pt
+  Epoch [ 50/50]  train_L1=0.3999  val_L1=0.4086  lr=1.00e-06  t=15.0s
+  [BEST] Loaded best model state (val_L1=0.4084)
+
+  [Fold 3] Week MAEs (OOF L1): W1=0.4070  W2=0.4001  W3=0.4012  W4=0.4110  W5=0.4277
+  [Fold 3] Overall OOF MAE   : 0.4094
+  [Fold 3] Best Val L1 (ckpt): 0.4084
+  [Fold 3] Epochs run         : 50/50
+  [Fold 3] Elapsed            : 799.9s
+
+  ================================================================================
+  BINNED ERROR MATRIX  --  Fold 3  (OOF Predictions, L1-trained)
+  ================================================================================
+  Interval                                              Count   AvgTrue   AvgPred       MAE
+  ------------------------------------------------------------------------------
+  Interval 0  [Absolute Zero     y == 0.0       ]     1,025,500    0.0000    0.1229    0.1232
+  Interval 1  [Mild Drought      0.0 < y <= 1.0 ]     296,824    1.0000    0.7091    0.6232
+  Interval 2  [Moderate Drought  1.0 < y <= 2.0 ]     184,364    2.0000    1.4019    0.8709
+  Interval 3  [Severe Drought    2.0 < y <= 3.0 ]     114,192    3.0000    2.1741    1.0369
+  Interval 4  [Extreme Drought   3.0 < y <= 4.0 ]      68,452    4.0000    3.0158    1.1149
+  Interval 5  [Exceptional       4.0 < y <= 5.0 ]      31,918    5.0000    3.8190    1.1911
+  ================================================================================
+
+  [Test inference] shape=(2248, 5)  mean=1.0988  std=1.0594  min=-0.0480  max=4.8183
+
+==========================================================================================
+FOLD 5 / 5  [v31 DroughtSequenceNet + L1 Loss]
+  train_groups: 1,800  |  val_groups: 448
+==========================================================================================
+  [OOF TE] Train regions: 1,800  | Val regions: 448
+  feat_cols available: 27 / 27
+  Building 3D sequence arrays ...
+  X_train: (1377000, 13, 27)  |  y_train: (1377000, 5)
+  X_val  : (342720, 13, 27)    |  y_val  : (342720, 5)
+  v Input tensor shape confirmed: (N, 13, 27) = (B, 13, 27)
+  X_test: (2248, 13, 27)
+
+  Model params: 276,997
+  Epoch [  1/50]  train_L1=0.6795  val_L1=0.6309  lr=9.99e-04  t=15.2s
+    [SAVED] New best val_L1=0.6309  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold4.pt
+  Epoch [  2/50]  train_L1=0.6554  val_L1=0.6508  lr=9.96e-04  t=14.9s
+  Epoch [  3/50]  train_L1=0.6374  val_L1=0.6166  lr=9.91e-04  t=15.1s
+    [SAVED] New best val_L1=0.6166  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold4.pt
+  Epoch [  4/50]  train_L1=0.6239  val_L1=0.5892  lr=9.84e-04  t=15.2s
+    [SAVED] New best val_L1=0.5892  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold4.pt
+  Epoch [  5/50]  train_L1=0.6108  val_L1=0.5784  lr=9.76e-04  t=15.3s
+    [SAVED] New best val_L1=0.5784  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold4.pt
+  Epoch [  6/50]  train_L1=0.5979  val_L1=0.6560  lr=9.65e-04  t=15.4s
+  Epoch [  7/50]  train_L1=0.5876  val_L1=0.5695  lr=9.52e-04  t=15.3s
+    [SAVED] New best val_L1=0.5695  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold4.pt
+  Epoch [  8/50]  train_L1=0.5691  val_L1=0.5470  lr=9.38e-04  t=15.0s
+    [SAVED] New best val_L1=0.5470  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold4.pt
+  Epoch [  9/50]  train_L1=0.5554  val_L1=0.5473  lr=9.22e-04  t=15.3s
+  Epoch [ 10/50]  train_L1=0.5421  val_L1=0.5595  lr=9.05e-04  t=15.2s
+  Epoch [ 11/50]  train_L1=0.5279  val_L1=0.5116  lr=8.85e-04  t=15.0s
+    [SAVED] New best val_L1=0.5116  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold4.pt
+  Epoch [ 12/50]  train_L1=0.5166  val_L1=0.4918  lr=8.65e-04  t=15.2s
+    [SAVED] New best val_L1=0.4918  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold4.pt
+  Epoch [ 13/50]  train_L1=0.5052  val_L1=0.4859  lr=8.42e-04  t=15.1s
+    [SAVED] New best val_L1=0.4859  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold4.pt
+  Epoch [ 14/50]  train_L1=0.4961  val_L1=0.4752  lr=8.19e-04  t=15.1s
+    [SAVED] New best val_L1=0.4752  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold4.pt
+  Epoch [ 15/50]  train_L1=0.4890  val_L1=0.4744  lr=7.94e-04  t=15.0s
+    [SAVED] New best val_L1=0.4744  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold4.pt
+  Epoch [ 16/50]  train_L1=0.4810  val_L1=0.4715  lr=7.68e-04  t=15.1s
+    [SAVED] New best val_L1=0.4715  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold4.pt
+  Epoch [ 17/50]  train_L1=0.4750  val_L1=0.4457  lr=7.41e-04  t=15.5s
+    [SAVED] New best val_L1=0.4457  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold4.pt
+  Epoch [ 18/50]  train_L1=0.4675  val_L1=0.4498  lr=7.13e-04  t=14.9s
+  Epoch [ 19/50]  train_L1=0.4610  val_L1=0.4431  lr=6.84e-04  t=15.1s
+    [SAVED] New best val_L1=0.4431  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold4.pt
+  Epoch [ 20/50]  train_L1=0.4560  val_L1=0.4445  lr=6.55e-04  t=14.9s
+  Epoch [ 21/50]  train_L1=0.4516  val_L1=0.4386  lr=6.25e-04  t=15.0s
+    [SAVED] New best val_L1=0.4386  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold4.pt
+  Epoch [ 22/50]  train_L1=0.4464  val_L1=0.4401  lr=5.94e-04  t=15.4s
+  Epoch [ 23/50]  train_L1=0.4419  val_L1=0.4250  lr=5.63e-04  t=15.0s
+    [SAVED] New best val_L1=0.4250  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold4.pt
+  Epoch [ 24/50]  train_L1=0.4386  val_L1=0.4305  lr=5.32e-04  t=14.9s
+  Epoch [ 25/50]  train_L1=0.4347  val_L1=0.4262  lr=5.00e-04  t=15.3s
+  Epoch [ 26/50]  train_L1=0.4306  val_L1=0.4348  lr=4.69e-04  t=15.1s
+  Epoch [ 27/50]  train_L1=0.4267  val_L1=0.4162  lr=4.38e-04  t=15.3s
+    [SAVED] New best val_L1=0.4162  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold4.pt
+  Epoch [ 28/50]  train_L1=0.4241  val_L1=0.4146  lr=4.07e-04  t=14.8s
+    [SAVED] New best val_L1=0.4146  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold4.pt
+  Epoch [ 29/50]  train_L1=0.4210  val_L1=0.4128  lr=3.76e-04  t=15.1s
+    [SAVED] New best val_L1=0.4128  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold4.pt
+  Epoch [ 30/50]  train_L1=0.4183  val_L1=0.4054  lr=3.46e-04  t=15.0s
+    [SAVED] New best val_L1=0.4054  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold4.pt
+  Epoch [ 31/50]  train_L1=0.4151  val_L1=0.4088  lr=3.17e-04  t=15.2s
+  Epoch [ 32/50]  train_L1=0.4130  val_L1=0.3938  lr=2.88e-04  t=15.0s
+    [SAVED] New best val_L1=0.3938  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold4.pt
+  Epoch [ 33/50]  train_L1=0.4102  val_L1=0.4138  lr=2.60e-04  t=15.1s
+  Epoch [ 34/50]  train_L1=0.4075  val_L1=0.4002  lr=2.33e-04  t=15.1s
+  Epoch [ 35/50]  train_L1=0.4062  val_L1=0.4051  lr=2.07e-04  t=15.2s
+  Epoch [ 36/50]  train_L1=0.4040  val_L1=0.4117  lr=1.82e-04  t=15.2s
+  Epoch [ 37/50]  train_L1=0.4023  val_L1=0.4020  lr=1.59e-04  t=15.0s
+  Epoch [ 38/50]  train_L1=0.4004  val_L1=0.3927  lr=1.36e-04  t=15.3s
+    [SAVED] New best val_L1=0.3927  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold4.pt
+  Epoch [ 39/50]  train_L1=0.3987  val_L1=0.3972  lr=1.16e-04  t=15.1s
+  Epoch [ 40/50]  train_L1=0.3976  val_L1=0.3930  lr=9.64e-05  t=15.3s
+  Epoch [ 41/50]  train_L1=0.3961  val_L1=0.3914  lr=7.88e-05  t=15.1s
+    [SAVED] New best val_L1=0.3914  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold4.pt
+  Epoch [ 42/50]  train_L1=0.3944  val_L1=0.3899  lr=6.28e-05  t=15.0s
+    [SAVED] New best val_L1=0.3899  -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/dsn_fold4.pt
+  Epoch [ 43/50]  train_L1=0.3932  val_L1=0.3938  lr=4.85e-05  t=15.4s
+  Epoch [ 44/50]  train_L1=0.3923  val_L1=0.3989  lr=3.61e-05  t=14.8s
+  Epoch [ 45/50]  train_L1=0.3908  val_L1=0.3911  lr=2.54e-05  t=14.9s
+  Epoch [ 46/50]  train_L1=0.3909  val_L1=0.3904  lr=1.67e-05  t=15.1s
+  Epoch [ 47/50]  train_L1=0.3903  val_L1=0.3910  lr=9.85e-06  t=15.2s
+  Epoch [ 48/50]  train_L1=0.3902  val_L1=0.3911  lr=4.94e-06  t=15.1s
+  Epoch [ 49/50]  train_L1=0.3896  val_L1=0.3905  lr=1.99e-06  t=15.2s
+  Epoch [ 50/50]  train_L1=0.3893  val_L1=0.3902  lr=1.00e-06  t=15.1s
+  [BEST] Loaded best model state (val_L1=0.3899)
+
+  [Fold 4] Week MAEs (OOF L1): W1=0.3873  W2=0.3807  W3=0.3819  W4=0.3920  W5=0.4093
+  [Fold 4] Overall OOF MAE   : 0.3902
+  [Fold 4] Best Val L1 (ckpt): 0.3899
+  [Fold 4] Epochs run         : 50/50
+  [Fold 4] Elapsed            : 762.1s
+
+  ================================================================================
+  BINNED ERROR MATRIX  --  Fold 4  (OOF Predictions, L1-trained)
+  ================================================================================
+  Interval                                              Count   AvgTrue   AvgPred       MAE
+  ------------------------------------------------------------------------------
+  Interval 0  [Absolute Zero     y == 0.0       ]     1,025,353    0.0000    0.1249    0.1252
+  Interval 1  [Mild Drought      0.0 < y <= 1.0 ]     291,072    1.0000    0.7184    0.6155
+  Interval 2  [Moderate Drought  1.0 < y <= 2.0 ]     183,138    2.0000    1.4587    0.8305
+  Interval 3  [Severe Drought    2.0 < y <= 3.0 ]     113,435    3.0000    2.2455    0.9721
+  Interval 4  [Extreme Drought   3.0 < y <= 4.0 ]      67,659    4.0000    3.1795    0.9590
+  Interval 5  [Exceptional       4.0 < y <= 5.0 ]      32,943    5.0000    3.9748    1.0309
+  ================================================================================
+
+  [Test inference] shape=(2248, 5)  mean=1.1518  std=1.1213  min=-0.2884  max=5.1932
+
+==========================================================================================
+5-Fold Cross-Validation Summary  [v31 DroughtSequenceNet + L1 Loss]
+==========================================================================================
+  Fold 0 [OOF L1]: W1=0.4206  W2=0.4161  W3=0.4186  W4=0.4282  W5=0.4442  ->  Mean=0.4255  (stopped epoch 50)
+  Fold 1 [OOF L1]: W1=0.4614  W2=0.4574  W3=0.4603  W4=0.4706  W5=0.4864  ->  Mean=0.4672  (stopped epoch 50)
+  Fold 2 [OOF L1]: W1=0.4089  W2=0.4034  W3=0.4066  W4=0.4178  W5=0.4351  ->  Mean=0.4144  (stopped epoch 50)
+  Fold 3 [OOF L1]: W1=0.4070  W2=0.4001  W3=0.4012  W4=0.4110  W5=0.4277  ->  Mean=0.4094  (stopped epoch 50)
+  Fold 4 [OOF L1]: W1=0.3873  W2=0.3807  W3=0.3819  W4=0.3920  W5=0.4093  ->  Mean=0.3902  (stopped epoch 50)
+
+  Overall CV L1 MAE : 0.4213  +-  0.0256
+  Best Fold  : Fold 4 (MAE=0.3902)
+  Worst Fold : Fold 1 (MAE=0.4672)
+
+  Per-week CV MAE breakdown:
+    Week 1: mean=0.4170  std=0.0246
+    Week 2: mean=0.4115  std=0.0256
+    Week 3: mean=0.4137  std=0.0261
+    Week 4: mean=0.4239  std=0.0261
+    Week 5: mean=0.4405  std=0.0257
+
+==========================================================================================
+[v31] Zero-Interference Post-Ensemble Median Blending  (5 folds)
+  Strategy : np.median(all_fold_predictions, axis=0)
+  Rationale: Median blending perfectly aligns with MAE optimization landscape.
+  NO hard thresholds. NO np.where cutoffs. Trust the L1 objective natively.
+==========================================================================================
+  preds_stack shape : (5, 2248, 5)
+  Fold 0 preds: mean=1.0918  std=1.0700  min=-0.0665  max=5.2219
+  Fold 1 preds: mean=1.1018  std=1.0941  min=-0.0219  max=5.1446
+  Fold 2 preds: mean=1.1638  std=1.1603  min=-0.0420  max=5.1447
+  Fold 3 preds: mean=1.0988  std=1.0594  min=-0.0480  max=4.8183
+  Fold 4 preds: mean=1.1518  std=1.1213  min=-0.2884  max=5.1932
+
+  Pre-clip median blend stats:
+    mean=1.0891  std=1.0423  min=-0.0035  max=5.1035
+  Post-clip stats:
+    mean=1.0890  std=1.0422  min=0.0000  max=5.0000
+
+[v31 Submission Prediction Diagnostics]
+  n=11,240  mean=1.0890  std=1.0422
+  p50=0.9762  p75=1.7310  p90=2.5912  p95=3.0742  p99=4.1931  max=5.0000
+  Exact zero fraction  (==0.0): 0.0088
+  Near-zero fraction  (<0.05) : 0.2940
+  (Training zero baseline was 59.63%)
+  v p99 >= 2.0 -- prediction diversity is healthy.
+
+Formatting submission.csv ...
+  v Submission assertion passed: 2248 rows, 6 columns.
+  v No NaN values in submission.
+  v Train/test regions match (2248).
+  v All predictions in [0, 5]  (np.clip physical guard enforced).
+
+  submission.csv -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/submission.csv
+  Rows (excl. header): 2248
+  Columns: ['region_id', 'pred_week1', 'pred_week2', 'pred_week3', 'pred_week4', 'pred_week5']
+
+  Preview:
+region_id  pred_week1  pred_week2  pred_week3  pred_week4  pred_week5
+       R1    0.856826    0.819011    0.773848    0.718385    0.661832
+    R1001    0.961490    0.964032    0.963928    0.950325    0.936146
+    R1002    0.930902    0.944833    0.953843    0.919877    0.886382
+    R1005    1.011710    1.017275    1.016402    1.011498    0.985105
+    R1006    1.644161    1.669466    1.678856    1.678384    1.667054
+
+Total elapsed: 4005.2s  (66.8 min)
