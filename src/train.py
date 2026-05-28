@@ -1,5 +1,5 @@
 """
-train.py -- Drought Score Forecasting Pipeline (v31 -- Parallel Hybrid Sequence Net)
+train.py -- Drought Score Forecasting Pipeline (v32 -- Robust Sequence Network)
 ======================================================================================
 Usage:
     python src/train.py
@@ -7,22 +7,21 @@ Usage:
 Outputs:
     submission.csv                        -- Kaggle submission (2248 rows x 6 cols)
     models/dsn_fold{k}.pt                 -- DroughtSequenceNet checkpoint per fold
-    _training_log_31st.txt                -- Full console log
+    _training_log_32nd.txt                -- Full console log
 
-v31 Architecture (Deep Learning Revival — Parallel Hybrid Sequence Net)
+v32 Architecture (Robust Sequence Network -- Severity-Aware Training)
 ------------------------------------------------------------------------
   INPUT PIPELINE:
-    Data reshaped from flat 378-dim tabular rows (v27–v29) into a 3D
-    chronological time-series tensor of shape (B, 13, 27):
-      - 13 = sequence length (weeks)
-      - 27 = clean v26 feature set (lags & rolling cross-week artifacts purged)
-    Target: (B, 5) multi-step scores for the next 5 weeks.
+    Data reshaped into a 3D chronological time-series tensor of shape (B, 13, 27).
+    Training-time Gaussian noise (sigma=0.05) injected at input for scale-shift immunity.
 
-  MODEL: DroughtSequenceNet (src/model.py)
-    Branch A (Temporal Convolution):
-      Conv1d(27->64, kernel=3) + GELU + GroupNorm + AdaptiveAvgPool1d(1)
-      -> Local anomaly context vector (B, 64)
-    Branch B (BiLSTM):
+  MODEL: DroughtSequenceNet v32 (src/model.py)
+    Branch A (Dual-Layer Dilated TCN):
+      Conv1d(27->64, kernel=3, dilation=1) + GELU + InstanceNorm1d
+      Conv1d(64->64, kernel=3, dilation=2) + GELU + InstanceNorm1d
+      + AdaptiveAvgPool1d(1)  -> Multi-week anomaly vector (B, 64)
+    Branch B (Spatial Dropout + BiLSTM):
+      Dropout1d(p=0.1) zeroes entire time-step columns before LSTM
       LSTM(27->64, layers=3, bidirectional=True, batch_first=True)
       -> Final hidden state (B, 128)  [forward 64 + backward 64]
     Fusion MLP:
@@ -30,43 +29,45 @@ v31 Architecture (Deep Learning Revival — Parallel Hybrid Sequence Net)
       -> (B, 5) raw unbounded regression  [NO final activation]
 
   TRAINING:
-    Loss      : nn.L1Loss()  (pure MAE — natively targets conditional median)
+    Loss      : SeverityWeightedL1  mean(|pred-true| * (1.0 + true * 0.3))
+                y=0 weight: 1.0x baseline  |  y=5 weight: 2.5x amplified
     Optimizer : AdamW(lr=1e-3, weight_decay=1e-3)
-    Scheduler : CosineAnnealingLR(T_max=50, eta_min=1e-6)
-    Epochs    : 50 (hard limit)
+    Scheduler : CosineAnnealingLR(T_max=100, eta_min=1e-6)
+    Epochs    : 100 (hard limit)
     Batch     : 1024 (fallback 512 if VRAM error)
-    Early Stop: monitor validation L1Loss; patience=10 epochs
+    Early Stop: monitor validation SeverityWeightedL1; patience=10 epochs
 
   INFERENCE:
     All 5 fold models predict on test set independently.
-    Zero-interference median blending: np.median(fold_preds, axis=0)
+    Median blending: np.median(fold_preds, axis=0)
+    Micro-Zero Floor: np.where(preds < 0.05, 0.0, preds)  [noise wiper]
     Physical clip: np.clip(final, 0.0, 5.0)
-    NO manual thresholding. NO hard cutoffs. Trust the L1 objective.
 
   CV:
     5-Fold StratifiedGroupKFold, grouped by region_id,
     stratified on 10-quantile bins of per-region mean score.
 
-v31 Changes over v29/v30
+v32 Changes over v31
 ------------------------
-  [ABOLISH] LightGBM Dual-Tree Hurdle (Model A L1 Regressor + Model B Binary Classifier)
-  [ABOLISH] BCE & Pinball multi-task losses
-  [ABOLISH] Dynamic per-week threshold sweep [0.1, 0.9]
-  [ABOLISH] np.where(prob < th, 0.0, l1_pred) zero-gating
-  [ABOLISH] 378-dim tabular flat layout (27 x 13 + 27 deltas)
-  [ABOLISH] np.where(preds < 0.15, 0.0, ...) hard cutoff calibration
+  [ABOLISH] nn.L1Loss() pure MAE objective
+  [ABOLISH] Single-layer Conv1d Branch A (dilation=1 only)
+  [ABOLISH] GroupNorm in Branch A
+  [ABOLISH] No dropout before BiLSTM
 
-  [INTRODUCE] DroughtSequenceNet (Conv1d + BiLSTM parallel backbone)
-  [INTRODUCE] 3D (B, 13, 27) tensor input via DroughtSequenceDataset
-  [INTRODUCE] Pure nn.L1Loss() training objective
-  [INTRODUCE] AdamW(lr=1e-3, wd=1e-3) + CosineAnnealingLR(T_max=50)
-  [INTRODUCE] np.median(fold_preds, axis=0) zero-interference blending
-  [INTRODUCE] np.clip(0.0, 5.0) as SOLE post-processing constraint
+  [INTRODUCE] SeverityWeightedL1: mean(|pred-true| * (1.0 + true*0.3))
+  [INTRODUCE] Dual-layer Dilated TCN (dilation=1 then dilation=2) in Branch A
+  [INTRODUCE] InstanceNorm1d per conv layer in Branch A
+  [INTRODUCE] Dropout1d(p=0.1) spatial step dropout before BiLSTM in Branch B
+  [INTRODUCE] Training-time Gaussian noise injection (sigma=0.05)
+  [INTRODUCE] Epochs extended: 50 -> 100
+  [INTRODUCE] Scheduler T_max extended: 50 -> 100
+  [INTRODUCE] Micro-Zero Floor: np.where(preds < 0.05, 0.0, preds)
 
   [RETAIN] refine_features() feature pipeline from v26
   [RETAIN] 5-Fold StratifiedGroupKFold, group=region_id, 10-quantile strata
   [RETAIN] Leakage-free per-fold Target Encoding injection
   [RETAIN] 2248-row submission.csv with 6 columns
+  [RETAIN] np.median(fold_preds, axis=0) zero-interference blending
 """
 
 import os
@@ -127,8 +128,8 @@ os.makedirs(MODELS_DIR, exist_ok=True)
 # Cross-validation
 N_FOLDS = 5
 
-# Training hyperparameters (v31)
-EPOCHS         = 50
+# Training hyperparameters (v32)
+EPOCHS         = 100
 BATCH_SIZE     = 1024
 LR             = 1e-3
 WEIGHT_DECAY   = 1e-3
@@ -138,14 +139,50 @@ EARLY_STOP_PAT = 10   # patience in epochs for early stopping
 # Device
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Model hyperparameters (v31 DroughtSequenceNet defaults)
-SEQ_LEN     = WINDOW_SIZE   # 13
+# Model hyperparameters (v32 DroughtSequenceNet)
+SEQ_LEN     = WINDOW_SIZE        # 13
 N_FEATURES  = len(FEATURE_COLS)  # 27
 CONV_OUT    = 64
 LSTM_HIDDEN = 64
 LSTM_LAYERS = 3
 MLP_HIDDEN  = 128
 DROPOUT     = 0.2
+
+
+# ---------------------------------------------------------------------------
+# Severity-Weighted L1 Loss (v32)
+# ---------------------------------------------------------------------------
+def severity_weighted_l1_loss(preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    """
+    Severity-Weighted L1 Loss: punishes errors on high-drought targets proportionally.
+
+    Formula:
+        Loss = mean( |pred - true| * (1.0 + true * 0.3) )
+
+    Weights:
+        y_true = 0.0  ->  weight = 1.0x  (baseline, no amplification)
+        y_true = 1.0  ->  weight = 1.3x
+        y_true = 2.0  ->  weight = 1.6x
+        y_true = 3.0  ->  weight = 1.9x
+        y_true = 4.0  ->  weight = 2.2x
+        y_true = 5.0  ->  weight = 2.5x  (peak amplification)
+
+    Physical meaning: counteracts the 60% zero-inflation gravitational sink
+    by imposing 2.5x stronger gradient pressure on extreme drought predictions,
+    forcing the network to break through zero-collapsing suppression.
+
+    Parameters
+    ----------
+    preds   : (B, H) tensor -- raw model predictions
+    targets : (B, H) tensor -- ground-truth drought scores in [0, 5]
+
+    Returns
+    -------
+    scalar loss tensor
+    """
+    weights = 1.0 + targets * 0.3    # (B, H); range [1.0, 2.5] for targets in [0, 5]
+    loss    = torch.abs(preds - targets) * weights
+    return loss.mean()
 
 
 # ---------------------------------------------------------------------------
@@ -230,7 +267,7 @@ def print_binned_error_matrix(y_true: np.ndarray, y_pred: np.ndarray,
                                fold_k: int, log_fn) -> None:
     log_fn("")
     log_fn("  " + "=" * 80)
-    log_fn(f"  BINNED ERROR MATRIX  --  Fold {fold_k}  (OOF Predictions, L1-trained)")
+    log_fn(f"  BINNED ERROR MATRIX  --  Fold {fold_k}  (OOF Predictions, SeverityWeightedL1)")
     log_fn("  " + "=" * 80)
     header = (
         f"  {'Interval':<50}  {'Count':>7}  {'AvgTrue':>8}  "
@@ -289,9 +326,9 @@ def _train_one_epoch(model, loader, optimizer, criterion, device):
 def _eval_one_epoch(model, loader, criterion, device):
     """Evaluate model on a DataLoader, return mean loss and all predictions."""
     model.eval()
-    total_loss = 0.0
-    n_batches  = 0
-    all_preds  = []
+    total_loss  = 0.0
+    n_batches   = 0
+    all_preds   = []
     all_targets = []
 
     for X_batch, y_batch in loader:
@@ -306,7 +343,7 @@ def _eval_one_epoch(model, loader, criterion, device):
         all_preds.append(preds.cpu().numpy())
         all_targets.append(y_batch.cpu().numpy())
 
-    mean_loss = total_loss / max(n_batches, 1)
+    mean_loss   = total_loss / max(n_batches, 1)
     all_preds   = np.concatenate(all_preds,   axis=0)   # (N_val, 5)
     all_targets = np.concatenate(all_targets, axis=0)   # (N_val, 5)
     return mean_loss, all_preds, all_targets
@@ -339,24 +376,26 @@ def main():
 
     # -- 0. Pipeline description -----------------------------------------------
     log("=" * 90)
-    log("Drought Forecasting Pipeline  v31  (Parallel Hybrid Sequence Net)")
-    log("DroughtSequenceNet  |  Conv1d Branch (local anomaly)  +  BiLSTM Branch (cumulative)")
+    log("Drought Forecasting Pipeline  v32  (Robust Sequence Network)")
+    log("DroughtSequenceNet  |  Dual Dilated TCN Branch  +  Spatial Dropout + BiLSTM Branch")
     log("Input  : (B, 13, 27) 3D chronological time-series tensor")
     log("Target : (B, 5) multi-step scores (next 5 weeks)")
-    log("Loss   : nn.L1Loss()  (pure MAE — natively targets conditional median)")
+    log("Loss   : SeverityWeightedL1  mean(|pred-true| * (1.0 + true*0.3))")
+    log("         y=0 weight: 1.0x  |  y=5 weight: 2.5x  (drought severity amplification)")
     log("Blend  : np.median(fold_preds, axis=0)  (zero-interference)")
-    log("Clip   : np.clip(0.0, 5.0)  (sole post-processing constraint)")
+    log("Floor  : np.where(preds < 0.05, 0.0, preds)  (Micro-Zero noise wiper)")
+    log("Clip   : np.clip(0.0, 5.0)  (physical constraint)")
     log("CV     : 5-Fold StratifiedGroupKFold  |  group=region_id  |  10-quantile strata")
     log("=" * 90)
     log("")
-    log("v31 Configuration:")
+    log("v32 Configuration:")
     log(f"  Device         : {DEVICE}")
     log(f"  Epochs (max)   : {EPOCHS}")
     log(f"  Batch size     : {BATCH_SIZE}")
     log(f"  LR             : {LR}")
     log(f"  Weight decay   : {WEIGHT_DECAY}")
     log(f"  CosineAnnealing: T_max={EPOCHS}, eta_min={ETA_MIN}")
-    log(f"  Early stopping : patience={EARLY_STOP_PAT} epochs (val L1Loss)")
+    log(f"  Early stopping : patience={EARLY_STOP_PAT} epochs (val SeverityWeightedL1)")
     log(f"  GRADIENT CLIP  : max_norm=1.0  (LSTM stability)")
     log(f"  Input shape    : (B, {SEQ_LEN}, {N_FEATURES})  [13 weeks x 27 features]")
     log(f"  Conv1d out     : {CONV_OUT}  |  LSTM hidden: {LSTM_HIDDEN}  |  layers: {LSTM_LAYERS}")
@@ -382,7 +421,7 @@ def main():
     assert n_test_regions  == 2248, f"Expected 2248 test regions,  got {n_test_regions}"
 
     # -- 1b. Feature Validation ------------------------------------------------
-    log("\n[v31 Feature Validation]")
+    log("\n[v32 Feature Validation]")
     assert "week_sin" in train_raw.columns, "week_sin missing -- run preprocess.py first"
     assert "week_cos" in train_raw.columns, "week_cos missing -- run preprocess.py first"
     log("  v week_sin, week_cos present.")
@@ -397,7 +436,7 @@ def main():
     if lag_cols_check:
         log(f"  [INFO] Lag columns in raw CSV (excluded by FEATURE_COLS): "
             f"{lag_cols_check[:6]}{'...' if len(lag_cols_check) > 6 else ''}")
-    log(f"  v31 FEATURE_COLS: {len(FEATURE_COLS)} features. 3D input: (B, {SEQ_LEN}, {N_FEATURES})")
+    log(f"  v32 FEATURE_COLS: {len(FEATURE_COLS)} features. 3D input: (B, {SEQ_LEN}, {N_FEATURES})")
 
     # -- 2. Feature refinement -------------------------------------------------
     log("\nRefining features (drought proxy index + log1p prec + v22/v26 pruning) ...")
@@ -421,8 +460,7 @@ def main():
     log(f"  Zero-inflation: {zero_frac:.2%} of training scores == 0.0")
     log(f"  Non-zero: {(all_scores > 0.0).sum():,}  ({(all_scores > 0.0).mean():.2%})  "
         f"vs  Zeroes: {(all_scores == 0.0).sum():,}  ({zero_frac:.2%})")
-    log(f"  L1 Loss rationale: MAE converges to conditional MEDIAN; "
-        f"large zero-mass naturally collapses predictions toward 0.0")
+    log(f"  SeverityWeightedL1: zero targets get 1.0x weight; y=5 targets get 2.5x weight.")
 
     # -- 5. Model architecture print -------------------------------------------
     _tmp_model = DroughtSequenceNet(
@@ -435,7 +473,7 @@ def main():
 
     # -- 6. Build 5-Fold StratifiedGroupKFold CV splits -----------------------
     log(f"\n{'='*90}")
-    log(f"5-Fold StratifiedGroupKFold CV  [v31 -- DroughtSequenceNet + L1 Loss]")
+    log(f"5-Fold StratifiedGroupKFold CV  [v32 -- DroughtSequenceNet + SeverityWeightedL1]")
     log(f"  Group  : region_id  |  Strata : 10-quantile bins of per-region mean score")
     log(f"{'='*90}")
 
@@ -446,23 +484,23 @@ def main():
 
     # -- 7. 5-Fold Deep Learning Training Loop ---------------------------------
     log(f"\n{'='*90}")
-    log("5-Fold DroughtSequenceNet Training  [v31]")
+    log("5-Fold DroughtSequenceNet Training  [v32]")
     log(f"  Optimizer : AdamW(lr={LR}, weight_decay={WEIGHT_DECAY})")
     log(f"  Scheduler : CosineAnnealingLR(T_max={EPOCHS}, eta_min={ETA_MIN})")
-    log(f"  Loss      : nn.L1Loss()  (pure MAE)")
+    log(f"  Loss      : SeverityWeightedL1  mean(|pred-true| * (1.0 + true*0.3))")
     log(f"  Batch     : {BATCH_SIZE}  |  Max Epochs: {EPOCHS}")
-    log(f"  Early Stop: patience={EARLY_STOP_PAT} (val L1Loss)")
+    log(f"  Early Stop: patience={EARLY_STOP_PAT} (val SeverityWeightedL1)")
     log(f"{'='*90}")
 
-    fold_results      = []       # (fold_k, best_val_mae, epoch_stopped)
-    fold_test_preds   = []       # list of np.ndarray (2248, 5) per fold
+    fold_results    = []    # (fold_k, week_maes, oof_mae, epoch_stopped)
+    fold_test_preds = []    # list of np.ndarray (2248, 5) per fold
 
-    criterion = nn.L1Loss()
+    criterion = severity_weighted_l1_loss
 
     for fold_k, (raw_train_groups, raw_val_groups) in enumerate(folds):
 
         log(f"\n{'='*90}")
-        log(f"FOLD {fold_k + 1} / {N_FOLDS}  [v31 DroughtSequenceNet + L1 Loss]")
+        log(f"FOLD {fold_k + 1} / {N_FOLDS}  [v32 DroughtSequenceNet + SeverityWeightedL1]")
         log(f"  train_groups: {len(raw_train_groups):,}  |  "
             f"val_groups: {len(raw_val_groups):,}")
         log(f"{'='*90}")
@@ -521,7 +559,6 @@ def main():
         train_ds = DroughtSequenceDataset(X_train_np, y_train_np)
         val_ds   = DroughtSequenceDataset(X_val_np,   y_val_np)
 
-        # Try BATCH_SIZE first; fall back to 512 if VRAM is insufficient
         effective_batch = BATCH_SIZE
         train_loader = DataLoader(
             train_ds, batch_size=effective_batch, shuffle=True,
@@ -536,9 +573,9 @@ def main():
         ckpt_path = os.path.join(MODELS_DIR, f"dsn_fold{fold_k}.pt")
 
         model = DroughtSequenceNet(
-            seq_len    = WINDOW_SIZE,
-            n_features = n_feat,
-            conv_out   = CONV_OUT,
+            seq_len     = WINDOW_SIZE,
+            n_features  = n_feat,
+            conv_out    = CONV_OUT,
             lstm_hidden = LSTM_HIDDEN,
             lstm_layers = LSTM_LAYERS,
             mlp_hidden  = MLP_HIDDEN,
@@ -556,10 +593,10 @@ def main():
         log(f"\n  Model params: {model.count_parameters():,}")
 
         # -- 7h. Resume from checkpoint if available --------------------------
-        start_epoch   = 0
-        best_val_mae  = float("inf")
-        patience_ctr  = 0
-        best_state    = None
+        start_epoch  = 0
+        best_val_mae = float("inf")
+        patience_ctr = 0
+        best_state   = None
 
         if os.path.exists(ckpt_path):
             log(f"  [RESUME] Checkpoint found: {ckpt_path}  -- loading.")
@@ -585,7 +622,9 @@ def main():
             ep_t0 = time.time()
 
             try:
-                train_loss = _train_one_epoch(model, train_loader, optimizer, criterion, DEVICE)
+                train_loss = _train_one_epoch(
+                    model, train_loader, optimizer, criterion, DEVICE
+                )
             except RuntimeError as oom_err:
                 if "out of memory" in str(oom_err).lower() and effective_batch > 512:
                     log(f"  [OOM] Batch {effective_batch} caused OOM. "
@@ -594,24 +633,29 @@ def main():
                     torch.cuda.empty_cache()
                     train_loader = DataLoader(
                         train_ds, batch_size=effective_batch, shuffle=True,
-                        num_workers=0, pin_memory=(DEVICE.type == "cuda"), drop_last=False,
+                        num_workers=0, pin_memory=(DEVICE.type == "cuda"),
+                        drop_last=False,
                     )
                     val_loader = DataLoader(
                         val_ds, batch_size=effective_batch * 2, shuffle=False,
                         num_workers=0, pin_memory=(DEVICE.type == "cuda"),
                     )
-                    train_loss = _train_one_epoch(model, train_loader, optimizer, criterion, DEVICE)
+                    train_loss = _train_one_epoch(
+                        model, train_loader, optimizer, criterion, DEVICE
+                    )
                 else:
                     raise
 
-            val_loss, val_preds, val_targets = _eval_one_epoch(model, val_loader, criterion, DEVICE)
+            val_loss, val_preds, val_targets = _eval_one_epoch(
+                model, val_loader, criterion, DEVICE
+            )
             scheduler.step()
 
             ep_elapsed = time.time() - ep_t0
             current_lr = scheduler.get_last_lr()[0]
 
             log(f"  Epoch [{epoch+1:3d}/{EPOCHS}]  "
-                f"train_L1={train_loss:.4f}  val_L1={val_loss:.4f}  "
+                f"train_SWL1={train_loss:.4f}  val_SWL1={val_loss:.4f}  "
                 f"lr={current_lr:.2e}  t={ep_elapsed:.1f}s")
 
             epoch_stopped = epoch + 1
@@ -633,7 +677,7 @@ def main():
                     },
                     ckpt_path,
                 )
-                log(f"    [SAVED] New best val_L1={best_val_mae:.4f}  -> {ckpt_path}")
+                log(f"    [SAVED] New best val_SWL1={best_val_mae:.4f}  -> {ckpt_path}")
             else:
                 patience_ctr += 1
                 if patience_ctr >= EARLY_STOP_PAT:
@@ -644,7 +688,7 @@ def main():
         # -- 7j. Load best model state for inference --------------------------
         if best_state is not None:
             model.load_state_dict(best_state)
-            log(f"  [BEST] Loaded best model state (val_L1={best_val_mae:.4f})")
+            log(f"  [BEST] Loaded best model state (val_SWL1={best_val_mae:.4f})")
 
         # -- 7k. OOF validation predictions -----------------------------------
         val_loss_final, oof_preds, oof_targets = _eval_one_epoch(
@@ -662,9 +706,9 @@ def main():
         log(f"\n  [Fold {fold_k}] Week MAEs (OOF L1): "
             + "  ".join(f"W{i+1}={m:.4f}" for i, m in enumerate(week_maes)))
         log(f"  [Fold {fold_k}] Overall OOF MAE   : {oof_mae:.4f}")
-        log(f"  [Fold {fold_k}] Best Val L1 (ckpt): {best_val_mae:.4f}")
-        log(f"  [Fold {fold_k}] Epochs run         : {epoch_stopped}/{EPOCHS}")
-        log(f"  [Fold {fold_k}] Elapsed            : {fold_elapsed:.1f}s")
+        log(f"  [Fold {fold_k}] Best Val SWL1 (ckpt): {best_val_mae:.4f}")
+        log(f"  [Fold {fold_k}] Epochs run           : {epoch_stopped}/{EPOCHS}")
+        log(f"  [Fold {fold_k}] Elapsed              : {fold_elapsed:.1f}s")
 
         # -- 7l. Binned Error Matrix -------------------------------------------
         print_binned_error_matrix(oof_targets.ravel(), oof_preds.ravel(), fold_k, log)
@@ -691,7 +735,7 @@ def main():
 
     # -- 8. Cross-fold summary -------------------------------------------------
     log(f"\n{'='*90}")
-    log(f"5-Fold Cross-Validation Summary  [v31 DroughtSequenceNet + L1 Loss]")
+    log(f"5-Fold Cross-Validation Summary  [v32 DroughtSequenceNet + SeverityWeightedL1]")
     log(f"{'='*90}")
     fold_oof_maes = []
     for fold_k, week_maes, oof_mae, epoch_stopped in fold_results:
@@ -714,12 +758,12 @@ def main():
         log(f"    Week {week_idx + 1}: mean={np.mean(wk_maes):.4f}  "
             f"std={np.std(wk_maes):.4f}")
 
-    # -- 9. Zero-Interference Median Blending ----------------------------------
+    # -- 9. Median Blending + Micro-Zero Floor --------------------------------
     log(f"\n{'='*90}")
-    log(f"[v31] Zero-Interference Post-Ensemble Median Blending  ({N_FOLDS} folds)")
-    log(f"  Strategy : np.median(all_fold_predictions, axis=0)")
-    log(f"  Rationale: Median blending perfectly aligns with MAE optimization landscape.")
-    log(f"  NO hard thresholds. NO np.where cutoffs. Trust the L1 objective natively.")
+    log(f"[v32] Post-Ensemble Median Blending + Micro-Zero Floor  ({N_FOLDS} folds)")
+    log(f"  Strategy      : np.median(all_fold_predictions, axis=0)")
+    log(f"  Micro-Zero    : np.where(preds < 0.05, 0.0, preds)  [noise wiper]")
+    log(f"  Physical clip : np.clip(0.0, 5.0)")
     log(f"{'='*90}")
 
     # Stack folds: (N_FOLDS, 2248, 5)
@@ -733,21 +777,29 @@ def main():
             f"min={p.min():.4f}  max={p.max():.4f}")
 
     # Median compression: (N_FOLDS, 2248, 5) -> (2248, 5)
-    final_submission = np.median(preds_stack, axis=0)
+    final_preds = np.median(preds_stack, axis=0)
 
-    log(f"\n  Pre-clip median blend stats:")
-    log(f"    mean={final_submission.mean():.4f}  std={final_submission.std():.4f}  "
-        f"min={final_submission.min():.4f}  max={final_submission.max():.4f}")
+    log(f"\n  Pre-floor/clip median blend stats:")
+    log(f"    mean={final_preds.mean():.4f}  std={final_preds.std():.4f}  "
+        f"min={final_preds.min():.4f}  max={final_preds.max():.4f}")
 
-    # Physical constraint mask — SOLE post-processing step
-    final_submission = np.clip(final_submission, 0.0, 5.0)
+    # Micro-Zero Floor: cleanly wipe out trailing decimals under 0.05
+    # Removes floating-point noise without harming legitimate light drought signals.
+    final_preds = np.where(final_preds < 0.05, 0.0, final_preds)
 
-    log(f"  Post-clip stats:")
+    log(f"  Post-floor stats (< 0.05 zeroed):")
+    log(f"    mean={final_preds.mean():.4f}  std={final_preds.std():.4f}  "
+        f"min={final_preds.min():.4f}  max={final_preds.max():.4f}")
+
+    # Physical constraint — clip to valid drought score range [0, 5]
+    final_submission = np.clip(final_preds, 0.0, 5.0)
+
+    log(f"  Post-clip stats (physical guard [0, 5]):")
     log(f"    mean={final_submission.mean():.4f}  std={final_submission.std():.4f}  "
         f"min={final_submission.min():.4f}  max={final_submission.max():.4f}")
 
     # -- 10. Submission prediction diagnostics ---------------------------------
-    log("\n[v31 Submission Prediction Diagnostics]")
+    log("\n[v32 Submission Prediction Diagnostics]")
     all_sub_preds   = final_submission.ravel()
     zero_frac_final = float((all_sub_preds == 0.0).mean())
     near_zero_frac  = float((all_sub_preds < 0.05).mean())
@@ -775,14 +827,14 @@ def main():
     log("\nFormatting submission.csv ...")
     rows = []
     for i, region_id in enumerate(all_region_ids):
-        preds = final_submission[i]
+        preds_i = final_submission[i]
         rows.append({
             "region_id":  region_id,
-            "pred_week1": float(preds[0]),
-            "pred_week2": float(preds[1]),
-            "pred_week3": float(preds[2]),
-            "pred_week4": float(preds[3]),
-            "pred_week5": float(preds[4]),
+            "pred_week1": float(preds_i[0]),
+            "pred_week2": float(preds_i[1]),
+            "pred_week3": float(preds_i[2]),
+            "pred_week4": float(preds_i[3]),
+            "pred_week5": float(preds_i[4]),
         })
 
     submission = pd.DataFrame(rows)
@@ -819,18 +871,18 @@ def main():
     elapsed = time.time() - t0
     log(f"\nTotal elapsed: {elapsed:.1f}s  ({elapsed/60:.1f} min)")
 
-    log_path = os.path.join(ROOT, "_training_log_31st.txt")
+    log_path = os.path.join(ROOT, "_training_log_32nd.txt")
     with open(log_path, "w") as fh:
         fh.write("\n".join(log_lines))
     print(f"\nTraining log saved -> {log_path}")
 
     return {
-        "fold_results":   fold_results,
-        "overall_cv_mae": overall_mean,
-        "std_cv_mae":     overall_std,
-        "input_shape":    (SEQ_LEN, N_FEATURES),
-        "submission":     submission,
-        "sub_p99":        p99,
+        "fold_results":    fold_results,
+        "overall_cv_mae":  overall_mean,
+        "std_cv_mae":      overall_std,
+        "input_shape":     (SEQ_LEN, N_FEATURES),
+        "submission":      submission,
+        "sub_p99":         p99,
         "zero_frac_final": zero_frac_final,
     }
 
