@@ -1,0 +1,385 @@
+===============================================================================================
+Drought Forecasting Pipeline  v34  (Anomaly Space + Bounded Hurdle Trees)
+Model A : LGBMRegressor  objective=regression_l1  (Pure Severity Median — y>0 only)
+Model B : LGBMClassifier objective=binary          (Drought Occurrence Classifier)
+Input   : (N, 354) tabular matrix  [351 Z-score dims + 3 horizontal features]
+            • tmp_momentum_w13    = tmp_z_w13 - tmp_z_w9
+            • prec_deficit_last4w = prec_z_w10 + ... + prec_z_w13
+            • extreme_temp_count  = Σ I(tmp_z_w > 1.5)
+Target  : Model A: y[y>0] (conditional severity)
+          Model B: (y > 0).astype(int) (all rows)
+Gate    : pred = 0.0  if prob_mean < best_th[w]  else l1_median
+Clip    : np.clip(0.0, 5.0)  physical constraint
+CV      : 5-Fold StratifiedGroupKFold  |  group=region_id  |  10-quantile strata
+===============================================================================================
+
+v34 Configuration:
+  FLAT_DIMS : 354  (= 13 weeks × 27 features + 3 horizontal)
+  Model A   : LGBMRegressor   {'objective': 'regression_l1', 'n_estimators': 10000, 'num_leaves': 63, 'colsample_bytree': 0.5, 'learning_rate': 0.015, 'device': 'gpu', 'random_state': 42, 'n_jobs': -1, 'verbose': -1}
+  Model B   : LGBMClassifier  {'objective': 'binary', 'n_estimators': 8000, 'num_leaves': 63, 'colsample_bytree': 0.5, 'learning_rate': 0.015, 'device': 'gpu', 'random_state': 42, 'n_jobs': -1, 'verbose': -1}
+  Threshold : grid sweep [0.0, 1.0]  -> clamp [0.4, 0.55]
+
+Loading processed data ...
+  train raw: (1757936, 43)  |  test raw: (29224, 40)
+  train regions: 2248  |  test regions: 2248
+
+Refining features (log1p_prec derivation, NaN fill) ...
+  train after refinement: (1757936, 44)  |  test: (29224, 41)
+
+[Training Target Distribution]
+  mean=0.8357  std=1.2615  min=0.00  max=5.00
+  Zero-inflation : 59.63%  (1,048,333 rows)
+  Non-zero       : 40.37%  (709,603 rows)
+
+[v34 Per-Region Z-Score Statistics]  Train split only — ZERO LEAKAGE
+  Regions with statistics: 2,248
+  Global mean range       : [-0.0017, 11822390.0000]
+  Global std  range       : [0.6102,  5514354.0000]
+
+[v34 Anomaly Space Transformation]  Z = (F - μ_region) / (σ_region + 1e-6)
+  Train Z-score matrix  mean=0.0000  std=0.9997  min=-4.9851  max=27.9504
+
+[v34 Tabular Flattening]  (N, 354) = 351 Z-score dims + 3 horizontal features
+  X_train : (1719720, 354)  |  y_train : (1719720, 5)
+  X_test  : (2248, 354)
+  Groups  : 2,248 unique region_ids in training windows
+  v Flat dimension confirmed: 354  (351 base + 3 horizontal)
+
+===============================================================================================
+5-Fold StratifiedGroupKFold CV  [v34 -- Anomaly Space Hurdle Trees]
+  Group   : region_id  |  Strata : 10-quantile bins of per-region mean score
+===============================================================================================
+
+  Folds built: 5
+  Fold 0: train_samples=1,375,470  val_samples=344,250
+  Fold 1: train_samples=1,375,470  val_samples=344,250
+  Fold 2: train_samples=1,375,470  val_samples=344,250
+  Fold 3: train_samples=1,376,235  val_samples=343,485
+  Fold 4: train_samples=1,376,235  val_samples=343,485
+
+===============================================================================================
+5-Fold Dual-Head LightGBM Hurdle  [v34]
+  Model A: LGBMRegressor  (L1 severity median — trains on y > 0 ONLY)
+  Model B: LGBMClassifier (binary drought occurrence — ALL rows)
+  Early stopping: stopping_rounds=150
+===============================================================================================
+
+===============================================================================================
+FOLD 1 / 5  [v34 Dual-Head Hurdle]
+  train_samples: 1,375,470  |  val_samples: 344,250
+===============================================================================================
+  Fold 0 | Week 1 | Model A: train_pos=557,427  val_pos=139,543
+  Fold 0 | Week 1 | Model A (L1)   best_iter=10000  oof_mae_raw=0.8660
+  Fold 0 | Week 1 | Model B (BinCls) best_iter= 8000  val_zero_frac=0.595
+  Fold 0 | Week 2 | Model A: train_pos=556,945  val_pos=139,416
+  Fold 0 | Week 2 | Model A (L1)   best_iter=10000  oof_mae_raw=0.8693
+  Fold 0 | Week 2 | Model B (BinCls) best_iter= 8000  val_zero_frac=0.595
+  Fold 0 | Week 3 | Model A: train_pos=556,437  val_pos=139,280
+  Fold 0 | Week 3 | Model A (L1)   best_iter=10000  oof_mae_raw=0.8729
+  Fold 0 | Week 3 | Model B (BinCls) best_iter= 8000  val_zero_frac=0.595
+  Fold 0 | Week 4 | Model A: train_pos=555,889  val_pos=139,141
+  Fold 0 | Week 4 | Model A (L1)   best_iter=10000  oof_mae_raw=0.8817
+  Fold 0 | Week 4 | Model B (BinCls) best_iter= 8000  val_zero_frac=0.596
+  Fold 0 | Week 5 | Model A: train_pos=555,386  val_pos=139,013
+  Fold 0 | Week 5 | Model A (L1)   best_iter=10000  oof_mae_raw=0.8882
+  Fold 0 | Week 5 | Model B (BinCls) best_iter= 8000  val_zero_frac=0.596
+
+  [Fold 0] Week MAEs (Hurdle@0.5): W1=0.2775  W2=0.2795  W3=0.2816  W4=0.2857  W5=0.2877
+  [Fold 0] Fold OOF Hurdle MAE : 0.2824
+  [Fold 0] Elapsed             : 3057.6s
+
+  ================================================================================
+  BINNED ERROR MATRIX  --  Fold 0  (OOF Hurdle Predictions)
+  ================================================================================
+  Interval                                              Count   AvgTrue   AvgPred       MAE
+  ------------------------------------------------------------------------------
+  Interval 0  [Absolute Zero     y == 0.0       ]     1,024,857    0.0000    0.0981    0.0981
+  Interval 1  [Mild Drought      0.0 < y <= 1.0 ]     299,204    1.0000    1.0280    0.5586
+  Interval 2  [Moderate Drought  1.0 < y <= 2.0 ]     181,589    2.0000    1.8374    0.4278
+  Interval 3  [Severe Drought    2.0 < y <= 3.0 ]     114,154    3.0000    2.5888    0.5637
+  Interval 4  [Extreme Drought   3.0 < y <= 4.0 ]      70,601    4.0000    3.3613    0.7369
+  Interval 5  [Exceptional       4.0 < y <= 5.0 ]      30,845    5.0000    4.2338    0.7897
+  ================================================================================
+
+
+===============================================================================================
+FOLD 2 / 5  [v34 Dual-Head Hurdle]
+  train_samples: 1,375,470  |  val_samples: 344,250
+===============================================================================================
+  Fold 1 | Week 1 | Model A: train_pos=557,710  val_pos=139,260
+  Fold 1 | Week 1 | Model A (L1)   best_iter=10000  oof_mae_raw=0.8676
+  Fold 1 | Week 1 | Model B (BinCls) best_iter= 8000  val_zero_frac=0.595
+  Fold 1 | Week 2 | Model A: train_pos=557,203  val_pos=139,158
+  Fold 1 | Week 2 | Model A (L1)   best_iter=10000  oof_mae_raw=0.8728
+  Fold 1 | Week 2 | Model B (BinCls) best_iter= 8000  val_zero_frac=0.596
+  Fold 1 | Week 3 | Model A: train_pos=556,670  val_pos=139,047
+  Fold 1 | Week 3 | Model A (L1)   best_iter=10000  oof_mae_raw=0.8765
+  Fold 1 | Week 3 | Model B (BinCls) best_iter= 8000  val_zero_frac=0.596
+  Fold 1 | Week 4 | Model A: train_pos=556,096  val_pos=138,934
+  Fold 1 | Week 4 | Model A (L1)   best_iter=10000  oof_mae_raw=0.8873
+  Fold 1 | Week 4 | Model B (BinCls) best_iter= 8000  val_zero_frac=0.596
+  Fold 1 | Week 5 | Model A: train_pos=555,559  val_pos=138,840
+  Fold 1 | Week 5 | Model A (L1)   best_iter=10000  oof_mae_raw=0.8948
+  Fold 1 | Week 5 | Model B (BinCls) best_iter= 8000  val_zero_frac=0.597
+
+  [Fold 1] Week MAEs (Hurdle@0.5): W1=0.2851  W2=0.2890  W3=0.2905  W4=0.2949  W5=0.2960
+  [Fold 1] Fold OOF Hurdle MAE : 0.2911
+  [Fold 1] Elapsed             : 5961.9s
+
+  ================================================================================
+  BINNED ERROR MATRIX  --  Fold 1  (OOF Hurdle Predictions)
+  ================================================================================
+  Interval                                              Count   AvgTrue   AvgPred       MAE
+  ------------------------------------------------------------------------------
+  Interval 0  [Absolute Zero     y == 0.0       ]     1,026,011    0.0000    0.0979    0.0979
+  Interval 1  [Mild Drought      0.0 < y <= 1.0 ]     296,395    1.0000    1.0069    0.5658
+  Interval 2  [Moderate Drought  1.0 < y <= 2.0 ]     182,976    2.0000    1.8226    0.4349
+  Interval 3  [Severe Drought    2.0 < y <= 3.0 ]     114,191    3.0000    2.5409    0.5975
+  Interval 4  [Extreme Drought   3.0 < y <= 4.0 ]      68,054    4.0000    3.2818    0.8013
+  Interval 5  [Exceptional       4.0 < y <= 5.0 ]      33,623    5.0000    4.1103    0.9101
+  ================================================================================
+
+
+===============================================================================================
+FOLD 3 / 5  [v34 Dual-Head Hurdle]
+  train_samples: 1,375,470  |  val_samples: 344,250
+===============================================================================================
+  Fold 2 | Week 1 | Model A: train_pos=559,180  val_pos=137,790
+  Fold 2 | Week 1 | Model A (L1)   best_iter=10000  oof_mae_raw=0.8601
+  Fold 2 | Week 1 | Model B (BinCls) best_iter= 8000  val_zero_frac=0.600
+  Fold 2 | Week 2 | Model A: train_pos=558,683  val_pos=137,678
+  Fold 2 | Week 2 | Model A (L1)   best_iter=10000  oof_mae_raw=0.8609
+  Fold 2 | Week 2 | Model B (BinCls) best_iter= 8000  val_zero_frac=0.600
+  Fold 2 | Week 3 | Model A: train_pos=558,161  val_pos=137,556
+  Fold 2 | Week 3 | Model A (L1)   best_iter=10000  oof_mae_raw=0.8691
+  Fold 2 | Week 3 | Model B (BinCls) best_iter= 8000  val_zero_frac=0.600
+  Fold 2 | Week 4 | Model A: train_pos=557,607  val_pos=137,423
+  Fold 2 | Week 4 | Model A (L1)   best_iter=10000  oof_mae_raw=0.8784
+  Fold 2 | Week 4 | Model B (BinCls) best_iter= 8000  val_zero_frac=0.601
+  Fold 2 | Week 5 | Model A: train_pos=557,102  val_pos=137,297
+  Fold 2 | Week 5 | Model A (L1)   best_iter=10000  oof_mae_raw=0.8891
+  Fold 2 | Week 5 | Model B (BinCls) best_iter= 8000  val_zero_frac=0.601
+
+  [Fold 2] Week MAEs (Hurdle@0.5): W1=0.2735  W2=0.2748  W3=0.2786  W4=0.2813  W5=0.2843
+  [Fold 2] Fold OOF Hurdle MAE : 0.2785
+  [Fold 2] Elapsed             : 6533.0s
+
+  ================================================================================
+  BINNED ERROR MATRIX  --  Fold 2  (OOF Hurdle Predictions)
+  ================================================================================
+  Interval                                              Count   AvgTrue   AvgPred       MAE
+  ------------------------------------------------------------------------------
+  Interval 0  [Absolute Zero     y == 0.0       ]     1,033,506    0.0000    0.0891    0.0891
+  Interval 1  [Mild Drought      0.0 < y <= 1.0 ]     291,467    1.0000    1.0166    0.5538
+  Interval 2  [Moderate Drought  1.0 < y <= 2.0 ]     182,415    2.0000    1.8205    0.4313
+  Interval 3  [Severe Drought    2.0 < y <= 3.0 ]     115,341    3.0000    2.5510    0.5846
+  Interval 4  [Extreme Drought   3.0 < y <= 4.0 ]      66,961    4.0000    3.2820    0.7910
+  Interval 5  [Exceptional       4.0 < y <= 5.0 ]      31,560    5.0000    4.1688    0.8494
+  ================================================================================
+
+
+===============================================================================================
+FOLD 4 / 5  [v34 Dual-Head Hurdle]
+  train_samples: 1,376,235  |  val_samples: 343,485
+===============================================================================================
+  Fold 3 | Week 1 | Model A: train_pos=556,132  val_pos=140,838
+  Fold 3 | Week 1 | Model A (L1)   best_iter=10000  oof_mae_raw=0.8512
+  Fold 3 | Week 1 | Model B (BinCls) best_iter= 8000  val_zero_frac=0.590
+  Fold 3 | Week 2 | Model A: train_pos=555,666  val_pos=140,695
+  Fold 3 | Week 2 | Model A (L1)   best_iter=10000  oof_mae_raw=0.8578
+  Fold 3 | Week 2 | Model B (BinCls) best_iter= 8000  val_zero_frac=0.590
+  Fold 3 | Week 3 | Model A: train_pos=555,167  val_pos=140,550
+  Fold 3 | Week 3 | Model A (L1)   best_iter=10000  oof_mae_raw=0.8606
+  Fold 3 | Week 3 | Model B (BinCls) best_iter= 8000  val_zero_frac=0.591
+  Fold 3 | Week 4 | Model A: train_pos=554,636  val_pos=140,394
+  Fold 3 | Week 4 | Model A (L1)   best_iter=10000  oof_mae_raw=0.8701
+  Fold 3 | Week 4 | Model B (BinCls) best_iter= 8000  val_zero_frac=0.591
+  Fold 3 | Week 5 | Model A: train_pos=554,148  val_pos=140,251
+  Fold 3 | Week 5 | Model A (L1)   best_iter=10000  oof_mae_raw=0.8803
+  Fold 3 | Week 5 | Model B (BinCls) best_iter= 8000  val_zero_frac=0.592
+
+  [Fold 3] Week MAEs (Hurdle@0.5): W1=0.2818  W2=0.2856  W3=0.2872  W4=0.2918  W5=0.2932
+  [Fold 3] Fold OOF Hurdle MAE : 0.2879
+  [Fold 3] Elapsed             : 2783.7s
+
+  ================================================================================
+  BINNED ERROR MATRIX  --  Fold 3  (OOF Hurdle Predictions)
+  ================================================================================
+  Interval                                              Count   AvgTrue   AvgPred       MAE
+  ------------------------------------------------------------------------------
+  Interval 0  [Absolute Zero     y == 0.0       ]     1,014,697    0.0000    0.0984    0.0984
+  Interval 1  [Mild Drought      0.0 < y <= 1.0 ]     308,048    1.0000    1.0153    0.5550
+  Interval 2  [Moderate Drought  1.0 < y <= 2.0 ]     183,630    2.0000    1.8326    0.4206
+  Interval 3  [Severe Drought    2.0 < y <= 3.0 ]     115,470    3.0000    2.5314    0.6011
+  Interval 4  [Extreme Drought   3.0 < y <= 4.0 ]      65,256    4.0000    3.2894    0.7924
+  Interval 5  [Exceptional       4.0 < y <= 5.0 ]      30,324    5.0000    4.1804    0.8347
+  ================================================================================
+
+
+===============================================================================================
+FOLD 5 / 5  [v34 Dual-Head Hurdle]
+  train_samples: 1,376,235  |  val_samples: 343,485
+===============================================================================================
+  Fold 4 | Week 1 | Model A: train_pos=557,431  val_pos=139,539
+  Fold 4 | Week 1 | Model A (L1)   best_iter=10000  oof_mae_raw=0.8654
+  Fold 4 | Week 1 | Model B (BinCls) best_iter= 8000  val_zero_frac=0.594
+  Fold 4 | Week 2 | Model A: train_pos=556,947  val_pos=139,414
+  Fold 4 | Week 2 | Model A (L1)   best_iter=10000  oof_mae_raw=0.8680
+  Fold 4 | Week 2 | Model B (BinCls) best_iter= 8000  val_zero_frac=0.594
+  Fold 4 | Week 3 | Model A: train_pos=556,433  val_pos=139,284
+  Fold 4 | Week 3 | Model A (L1)   best_iter=10000  oof_mae_raw=0.8724
+  Fold 4 | Week 3 | Model B (BinCls) best_iter= 8000  val_zero_frac=0.594
+  Fold 4 | Week 4 | Model A: train_pos=555,892  val_pos=139,138
+  Fold 4 | Week 4 | Model A (L1)   best_iter=10000  oof_mae_raw=0.8818
+  Fold 4 | Week 4 | Model B (BinCls) best_iter= 8000  val_zero_frac=0.595
+  Fold 4 | Week 5 | Model A: train_pos=555,401  val_pos=138,998
+  Fold 4 | Week 5 | Model A (L1)   best_iter=10000  oof_mae_raw=0.8878
+  Fold 4 | Week 5 | Model B (BinCls) best_iter= 8000  val_zero_frac=0.595
+
+  [Fold 4] Week MAEs (Hurdle@0.5): W1=0.2841  W2=0.2864  W3=0.2880  W4=0.2925  W5=0.2938
+  [Fold 4] Fold OOF Hurdle MAE : 0.2889
+  [Fold 4] Elapsed             : 2787.8s
+
+  ================================================================================
+  BINNED ERROR MATRIX  --  Fold 4  (OOF Hurdle Predictions)
+  ================================================================================
+  Interval                                              Count   AvgTrue   AvgPred       MAE
+  ------------------------------------------------------------------------------
+  Interval 0  [Absolute Zero     y == 0.0       ]     1,021,052    0.0000    0.0972    0.0972
+  Interval 1  [Mild Drought      0.0 < y <= 1.0 ]     296,437    1.0000    1.0168    0.5649
+  Interval 2  [Moderate Drought  1.0 < y <= 2.0 ]     183,745    2.0000    1.8156    0.4301
+  Interval 3  [Severe Drought    2.0 < y <= 3.0 ]     118,826    3.0000    2.5339    0.6013
+  Interval 4  [Extreme Drought   3.0 < y <= 4.0 ]      65,472    4.0000    3.2952    0.7908
+  Interval 5  [Exceptional       4.0 < y <= 5.0 ]      31,893    5.0000    4.1594    0.8570
+  ================================================================================
+
+
+===============================================================================================
+5-Fold CV Summary  [v34 Anomaly Space Hurdle Trees  |  Hurdle MAE @ th=0.5]
+===============================================================================================
+  Fold 0: OOF Hurdle MAE = 0.2824
+  Fold 1: OOF Hurdle MAE = 0.2911
+  Fold 2: OOF Hurdle MAE = 0.2785
+  Fold 3: OOF Hurdle MAE = 0.2879
+  Fold 4: OOF Hurdle MAE = 0.2889
+
+  Overall CV Hurdle MAE : 0.2858  +-  0.0046
+  Best Fold  : Fold 2 (MAE=0.2785)
+  Worst Fold : Fold 1 (MAE=0.2911)
+
+  Per-week Full-OOF MAE (raw L1, no gate):
+    Week 1: raw_L1_MAE=0.8621
+    Week 2: raw_L1_MAE=0.8658
+    Week 3: raw_L1_MAE=0.8703
+    Week 4: raw_L1_MAE=0.8799
+    Week 5: raw_L1_MAE=0.8880
+
+===============================================================================================
+[v34] Bounded OOF Threshold Calibration  (per forecast week)
+  Hard clamp: best_th = np.clip(raw_best_th, 0.4, 0.55)
+===============================================================================================
+
+  [Bounded Threshold Search]  Per-week OOF MAE grid sweep
+  Search range  : [0.0, 1.0]  (201 steps)
+  Safety clamp  : [0.4, 0.55]
+
+  Week 1: raw_best_th=0.5550  clamped_th=0.5500  unclamped_MAE=0.2789  clamped_MAE=0.2790
+  Week 2: raw_best_th=0.5400  clamped_th=0.5400  unclamped_MAE=0.2815  clamped_MAE=0.2815
+  Week 3: raw_best_th=0.5500  clamped_th=0.5500  unclamped_MAE=0.2835  clamped_MAE=0.2835
+  Week 4: raw_best_th=0.5500  clamped_th=0.5500  unclamped_MAE=0.2872  clamped_MAE=0.2872
+  Week 5: raw_best_th=0.5400  clamped_th=0.5400  unclamped_MAE=0.2889  clamped_MAE=0.2889
+
+  Optimised clamped thresholds per week:
+    Week 1: best_th = 0.5500
+    Week 2: best_th = 0.5400
+    Week 3: best_th = 0.5500
+    Week 4: best_th = 0.5500
+    Week 5: best_th = 0.5400
+
+  Full-OOF MAE at calibrated thresholds:
+    Week 1: calibrated_th=0.5500  MAE=0.2790
+    Week 2: calibrated_th=0.5400  MAE=0.2815
+    Week 3: calibrated_th=0.5500  MAE=0.2835
+    Week 4: calibrated_th=0.5500  MAE=0.2872
+    Week 5: calibrated_th=0.5400  MAE=0.2889
+
+===============================================================================================
+[v34] Post-Ensemble Hurdle Blending  (5 folds)
+  Probability channel : mean(fold_probs, axis=0)       [5-fold arithmetic mean]
+  Severity channel    : median(fold_l1s, axis=0)       [5-fold strict median]
+  Hard Hurdle Gate    : np.where(prob_mean < final_th, 0.0, l1_median)
+  Physical clip       : np.clip(0.0, 5.0)
+===============================================================================================
+  prob_stack shape : (5, 2248, 5)
+  l1_stack   shape : (5, 2248, 5)
+
+  prob_mean stats  : mean=0.6528  std=0.2543  min=0.0145  max=0.9978
+  l1_median stats  : mean=1.7362  std=0.4044  min=0.7962  max=3.3729
+
+  Pre-clip Hurdle output stats:
+    mean=1.2831  std=0.9318  min=0.0000  max=3.3729
+    Zero fraction (gate): 0.3193
+  Applied thresholds (clamped to [0.4, 0.55]):
+    Week 1: final_th = 0.5500
+    Week 2: final_th = 0.5400
+    Week 3: final_th = 0.5500
+    Week 4: final_th = 0.5500
+    Week 5: final_th = 0.5400
+  Post-clip stats (physical guard [0, 5]):
+    mean=1.2831  std=0.9318  min=0.0000  max=3.3729
+
+===============================================================================================
+[v34] Test Set Binned Prediction Distribution Audit
+===============================================================================================
+
+  =====================================================================================
+  TEST SET BINNED PREDICTION MATRIX  [v34 Anomaly Space Hurdle Diagnostic]
+  Empirical distribution of final Hurdle-gated + clipped test predictions
+  =====================================================================================
+  Bin / Drought Category                                   Count    % Share    AvgPred    MinPred    MaxPred
+  -----------------------------------------------------------------------------------
+  Bin 0  [Absolute Zero       preds == 0.0        ]        3,589     31.93%     0.0000     0.0000     0.0000
+  Bin 1  [Mild Drought        0.0 < preds <= 1.0  ]            2      0.02%     0.9400     0.9196     0.9604
+  Bin 2  [Moderate Drought    1.0 < preds <= 2.0  ]        5,173     46.02%     1.6785     1.0029     2.0000
+  Bin 3  [Severe Drought      2.0 < preds <= 3.0  ]        2,424     21.57%     2.3002     2.0001     2.9973
+  Bin 4  [Extreme Drought     3.0 < preds <= 4.0  ]           52      0.46%     3.1060     3.0038     3.3729
+  Bin 5  [Exceptional Drought 4.0 < preds <= 5.0  ]            0      0.00%        N/A        N/A        N/A
+  -----------------------------------------------------------------------------------
+  Total predictions : 11,240
+  Exact zero fraction    : 0.3193  (3,589 of 11,240)
+  Non-zero fraction      : 0.6807  (7,651 of 11,240)
+  Mean (all)    : 1.2831
+  Std  (all)    : 0.9318
+  p50           : 1.6338
+  p90           : 2.2742
+  p99           : 2.8858
+  Max           : 3.3729
+  =====================================================================================
+
+
+[v34 Submission Prediction Diagnostics]
+  n=11,240  mean=1.2831  std=0.9318
+  p50=1.6338  p75=1.9567  p90=2.2742  p95=2.5032  p99=2.8858  max=3.3729
+  Exact zero fraction  (==0.0): 0.3193
+  (Training zero baseline was 59.63%)
+  v p99 >= 2.0 -- prediction diversity is healthy.
+
+Formatting submission.csv ...
+  v Submission assertion passed: 2248 rows, 6 columns.
+  v No NaN values in submission.
+  v Train/test regions match (2248).
+  v All predictions in [0, 5]  (np.clip physical guard enforced).
+
+  submission.csv -> /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/submission.csv
+  Rows (excl. header): 2248
+  Columns: ['region_id', 'pred_week1', 'pred_week2', 'pred_week3', 'pred_week4', 'pred_week5']
+
+  Preview:
+region_id  pred_week1  pred_week2  pred_week3  pred_week4  pred_week5
+       R1    1.696640    1.810526    1.591078    1.566013    1.569709
+    R1001    1.594311    0.000000    0.000000    0.000000    0.000000
+    R1002    1.552496    0.000000    0.000000    0.000000    0.000000
+    R1005    1.600441    1.684370    2.164100    2.065844    0.000000
+    R1006    1.859156    2.041562    2.510930    2.374202    2.332410
+
+Total elapsed: 21155.2s  (352.6 min)

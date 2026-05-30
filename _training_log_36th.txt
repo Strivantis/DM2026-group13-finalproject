@@ -1,0 +1,249 @@
+===============================================================================================
+Drought Forecasting Pipeline  v36  (Temporal Fusion Transformer)
+Model   : TemporalFusionTransformer  (pytorch_forecasting)  + QuantileLoss()
+Input   : Raw 13-week sequential meteorological windows per region
+          NO tabular flattening  |  NO manual Z-score normalisation
+Output  : 7 quantiles [0.02–0.98]  →  p50 (index 3) extracted for submission
+Ensemble: 5-Fold Rolling CV  →  np.median(p50 across folds, axis=0)
+ZeroFloor : preds < 0.10  →  0.0  (conservative micro-noise suppression)
+Clip    : np.clip(0.0, 5.0)  physical constraint
+===============================================================================================
+
+TFT Architecture:
+  hidden_size            = 64
+  attention_head_size    = 4
+  dropout                = 0.2
+  hidden_continuous_size = 32
+  output_size            = 7  (quantiles: 0.02, 0.10, 0.25, 0.50, 0.75, 0.90, 0.98)
+  loss                   = QuantileLoss()
+  learning_rate          = 0.001
+  max_epochs             = 50
+  batch_size             = 256
+
+5-Fold Rolling Time-Based CV Boundaries:
+  Fold 0: train time_idx [0, 756]  →  val time_idx [757, 761]
+  Fold 1: train time_idx [0, 761]  →  val time_idx [762, 766]
+  Fold 2: train time_idx [0, 766]  →  val time_idx [767, 771]
+  Fold 3: train time_idx [0, 771]  →  val time_idx [772, 776]
+  Fold 4: train time_idx [0, 776]  →  val time_idx [777, 781]
+
+Loading processed data ...
+  train_df : (1757936, 44)  |  test_df : (29224, 42)
+  train regions : 2,248
+  test  regions : 2,248
+
+[Training Target Distribution]
+  mean=0.8357  std=1.2615  min=0.0000  max=5.0000
+  Zero-fraction : 0.5963  (1,048,333 rows)
+  Non-zero      : 0.4037  (709,603 rows)
+
+===============================================================================================
+5-Fold Rolling Time-Based TFT Training
+  Each fold trains a separate TFT and predicts the test set.
+  p50 predictions are collected and median-ensembled post-training.
+===============================================================================================
+
+===============================================================================================
+FOLD 1 / 5  [TFT Rolling CV]
+  train time_idx : [0, 756]  (= 757 weeks × 2248 regions)
+  val   time_idx : [757, 761]  (= 5 weeks × 2248 regions)
+===============================================================================================
+
+  Building TimeSeriesDataSet (training fold 0) ...
+  Building TimeSeriesDataSet (validation fold 0) ...
+  training dataset size      : 1,663,520 samples
+  validation dataset size    : 2,248 samples
+
+  Building test inference TimeSeriesDataSet (fold 0 encoders) ...
+  test inference dataset size: 2,248 samples (= 2248 regions × 1 window)
+
+  Initialising TemporalFusionTransformer (fold 0) ...
+  Parameter count: 436,539
+
+  Fitting TFT (fold 0)  ...  [max_epochs=50, early_stop patience=5]
+
+  [Fold 0] Training complete.
+  Stopped at epoch : 7
+  Best val_loss    : 0.299070
+
+  Running test inference (fold 0) ...
+  p50_fold shape         : (2248, 5)
+  p50_fold stats  mean=1.3352  std=1.1225  min=-0.0127  max=5.0171
+  Fold 0 elapsed : 1386.7s  (23.1 min)
+
+===============================================================================================
+FOLD 2 / 5  [TFT Rolling CV]
+  train time_idx : [0, 761]  (= 762 weeks × 2248 regions)
+  val   time_idx : [762, 766]  (= 5 weeks × 2248 regions)
+===============================================================================================
+
+  Building TimeSeriesDataSet (training fold 1) ...
+  Building TimeSeriesDataSet (validation fold 1) ...
+  training dataset size      : 1,674,760 samples
+  validation dataset size    : 2,248 samples
+
+  Initialising TemporalFusionTransformer (fold 1) ...
+  Parameter count: 436,539
+
+  Fitting TFT (fold 1)  ...  [max_epochs=50, early_stop patience=5]
+
+  [Fold 1] Training complete.
+  Stopped at epoch : 6
+  Best val_loss    : 0.302135
+
+  Running test inference (fold 1) ...
+  p50_fold shape         : (2248, 5)
+  p50_fold stats  mean=1.4301  std=1.1534  min=-0.0113  max=5.0786
+  Fold 1 elapsed : 1178.3s  (19.6 min)
+
+===============================================================================================
+FOLD 3 / 5  [TFT Rolling CV]
+  train time_idx : [0, 766]  (= 767 weeks × 2248 regions)
+  val   time_idx : [767, 771]  (= 5 weeks × 2248 regions)
+===============================================================================================
+
+  Building TimeSeriesDataSet (training fold 2) ...
+  Building TimeSeriesDataSet (validation fold 2) ...
+  training dataset size      : 1,686,000 samples
+  validation dataset size    : 2,248 samples
+
+  Initialising TemporalFusionTransformer (fold 2) ...
+  Parameter count: 436,539
+
+  Fitting TFT (fold 2)  ...  [max_epochs=50, early_stop patience=5]
+
+  [Fold 2] Training complete.
+  Stopped at epoch : 6
+  Best val_loss    : 0.241086
+
+  Running test inference (fold 2) ...
+  p50_fold shape         : (2248, 5)
+  p50_fold stats  mean=1.2532  std=1.1549  min=-0.0081  max=5.0252
+  Fold 2 elapsed : 1184.8s  (19.7 min)
+
+===============================================================================================
+FOLD 4 / 5  [TFT Rolling CV]
+  train time_idx : [0, 771]  (= 772 weeks × 2248 regions)
+  val   time_idx : [772, 776]  (= 5 weeks × 2248 regions)
+===============================================================================================
+
+  Building TimeSeriesDataSet (training fold 3) ...
+  Building TimeSeriesDataSet (validation fold 3) ...
+  training dataset size      : 1,697,240 samples
+  validation dataset size    : 2,248 samples
+
+  Initialising TemporalFusionTransformer (fold 3) ...
+  Parameter count: 436,539
+
+  Fitting TFT (fold 3)  ...  [max_epochs=50, early_stop patience=5]
+
+  [Fold 3] Training complete.
+  Stopped at epoch : 9
+  Best val_loss    : 0.196146
+
+  Running test inference (fold 3) ...
+  p50_fold shape         : (2248, 5)
+  p50_fold stats  mean=1.4272  std=1.2455  min=-0.0008  max=5.0409
+  Fold 3 elapsed : 1787.9s  (29.8 min)
+
+===============================================================================================
+FOLD 5 / 5  [TFT Rolling CV]
+  train time_idx : [0, 776]  (= 777 weeks × 2248 regions)
+  val   time_idx : [777, 781]  (= 5 weeks × 2248 regions)
+===============================================================================================
+
+  Building TimeSeriesDataSet (training fold 4) ...
+  Building TimeSeriesDataSet (validation fold 4) ...
+  training dataset size      : 1,708,480 samples
+  validation dataset size    : 2,248 samples
+
+  Initialising TemporalFusionTransformer (fold 4) ...
+  Parameter count: 436,539
+
+  Fitting TFT (fold 4)  ...  [max_epochs=50, early_stop patience=5]
+
+  [Fold 4] Training complete.
+  Stopped at epoch : 6
+  Best val_loss    : 0.186397
+
+  Running test inference (fold 4) ...
+  p50_fold shape         : (2248, 5)
+  p50_fold stats  mean=1.3533  std=1.2206  min=-0.0158  max=5.0467
+  Fold 4 elapsed : 1200.6s  (20.0 min)
+
+===============================================================================================
+5-Fold Rolling CV Summary  [v36 TFT QuantileLoss]
+===============================================================================================
+  Fold 0: best val_loss = 0.299070
+  Fold 1: best val_loss = 0.302135
+  Fold 2: best val_loss = 0.241086
+  Fold 3: best val_loss = 0.196146
+  Fold 4: best val_loss = 0.186397
+
+  Mean val_loss : 0.244967  ±  0.049039
+  Best fold     : 4 (val_loss = 0.186397)
+
+===============================================================================================
+[v36] 5-Fold p50 Ensemble Compression
+  Strategy: np.median(all_fold_p50_matrices, axis=0)
+===============================================================================================
+  p50_stack shape        : (5, 2248, 5)
+  final_preds shape      : (2248, 5)
+  Pre-floor stats: mean=1.3281  std=1.0908  min=-0.0026  max=5.0254
+
+[v36] Conservative Zero-Floor  (threshold < 0.1)
+  Zero fraction before floor : 0.0000
+  Zero fraction after  floor : 0.2423
+  Micro-noise eliminated     : 0.2423
+
+  Post-clip stats [0, 5]:
+    mean=1.3264  std=1.0926  min=0.0000  max=5.0000
+
+===============================================================================================
+[v36] Test Set 6-Tier Binned Distribution Audit
+===============================================================================================
+
+  ========================================================================================
+  TEST SET BINNED PREDICTION MATRIX  [v36 TFT p50 Inference Diagnostic]
+  Empirical distribution of median-ensembled, zero-floored, clipped preds
+  ========================================================================================
+  Bin / Drought Category                                   Count    % Share    AvgPred    MinPred    MaxPred
+  --------------------------------------------------------------------------------------
+  Bin 0  [Absolute Zero       preds == 0.0        ]        2,724     24.23%     0.0000     0.0000     0.0000
+  Bin 1  [Mild Drought        0.0 < preds <= 1.0  ]        1,777     15.81%     0.9744     0.1013     1.0000
+  Bin 2  [Moderate Drought    1.0 < preds <= 2.0  ]        3,770     33.54%     1.3642     1.0000     2.0000
+  Bin 3  [Severe Drought      2.0 < preds <= 3.0  ]        2,021     17.98%     2.2853     2.0000     3.0000
+  Bin 4  [Extreme Drought     3.0 < preds <= 4.0  ]          682      6.07%     3.2796     3.0001     4.0000
+  Bin 5  [Exceptional Drought 4.0 < preds <= 5.0  ]          266      2.37%     4.4324     4.0000     5.0000
+  --------------------------------------------------------------------------------------
+  Total predictions : 11,240
+  Exact-zero fraction: 0.2423  (2,724 of 11,240)
+  Non-zero fraction  : 0.7577  (8,516 of 11,240)
+  Mean  : 1.3264  Std : 1.0926
+  p50   : 1.0081  p90  : 2.9883  p99  : 4.5959  Max : 5.0000
+  ========================================================================================
+
+[v36 Submission Prediction Diagnostics]
+  n=11,240  mean=1.3264  std=1.0926
+  p50=1.0081  p75=2.0024  p90=2.9883  p95=3.0314  p99=4.5959  max=5.0000
+  Exact zero fraction: 0.2423
+  ✓ p99 >= 1.5 -- prediction dynamic range is healthy.
+
+Formatting submission.csv ...
+  ✓ Submission assertion passed: 2248 rows, 6 columns.
+  ✓ No NaN values in submission.
+  ✓ All predictions in [0, 5]  (np.clip physical guard enforced).
+
+  submission.csv  →  /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/submission.csv
+  Rows (excl. header): 2248
+  Columns: ['region_id', 'pred_week1', 'pred_week2', 'pred_week3', 'pred_week4', 'pred_week5']
+
+  Preview:
+region_id  pred_week1  pred_week2  pred_week3  pred_week4  pred_week5
+       R1    0.999884    1.000533    0.995234    0.991021    0.994018
+    R1001    0.988610    0.000000    0.000000    0.000000    0.000000
+    R1002    1.009787    1.006346    1.002074    0.994518    0.000000
+    R1005    0.997548    1.000430    0.997128    0.000000    0.000000
+    R1006    1.013285    1.003030    0.994191    0.000000    0.000000
+
+Total elapsed: 6741.9s  (112.4 min)

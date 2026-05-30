@@ -52,5 +52,5 @@ def calculate_prediction_proportions(file_path):
 
 if __name__ == "__main__":
     # 指定 workplace 中的檔案路徑
-    target_file = 'submission_27th.csv'
+    target_file = 'submission.csv'
     calculate_prediction_proportions(target_file)
