@@ -1,75 +1,98 @@
+# ---------------------------------------------------------------------------
+# [v37.1] Hardware Acceleration — Tensor Core float32 matmul precision
+# Must be set BEFORE any other torch operations or module imports.
+# ---------------------------------------------------------------------------
+import torch
+torch.set_float32_matmul_precision('high')
+
 """
-train.py -- Drought Score Forecasting Pipeline (v36 -- Temporal Fusion Transformer)
-=====================================================================================
+train.py -- Drought Score Forecasting Pipeline (v37 -- CORAL-TFT Ordinal CDF)
+==============================================================================
 Usage:
     python src/train.py
 
 Outputs:
     submission.csv              -- Kaggle submission (2248 rows × 6 cols)
-    _training_log_36th.txt      -- Full console log
+    _training_log_37th.txt      -- Full console log
 
-v36 Architecture (TFT — pytorch_forecasting + PyTorch Lightning)
------------------------------------------------------------------
+v37 Architecture (CORAL-TFT — Ordinal CDF Paradigm)
+-----------------------------------------------------
   INPUT PIPELINE:
-    Raw, un-flattened 13-week sequential meteorological data per region.
-    NO manual Z-score normalisation, NO tabular flattening, NO horizontal deltas.
-    TimeSeriesDataSet handles windowing + per-encoder-window target normalisation.
-    time_idx : week_idx (train 0–781; test encoder 782–794; future decoder 795–799)
+    TimeSeriesDataSet with 33 meteorological / lag / hydrology reals
+    (expanded from 8 in v36).
+    target_normalizer = TorchNormalizer(method="identity"):
+      NO normalization → raw [0, 5] drought scores for CORAL threshold
+      comparisons.
+    time_idx : week_idx (train 0–781; test encoder 782–794; decoder 795–799)
 
-  MODEL:
+  BACKBONE:
     TemporalFusionTransformer.from_dataset()
-      hidden_size             = 64   (LSTM / Gating hidden state capacity)
-      attention_head_size     = 4    (multi-head self-attention heads)
+      hidden_size             = 64
+      attention_head_size     = 4
       dropout                 = 0.2
-      hidden_continuous_size  = 32   (continuous variable embedding size)
-      output_size             = 7    (quantiles: 0.02, 0.1, 0.25, 0.5, 0.75, 0.9, 0.98)
-      loss                    = QuantileLoss()
-      reduce_on_plateau_patience = 4
+      hidden_continuous_size  = 32
+      output_size             = 1  (scalar logit: g(H_{i,t}))
+      loss placeholder        = QuantileLoss(quantiles=[0.5])
+        → used ONLY to size the TFT output layer to 1 neuron;
+          never computed during training (CORALTFTWrapper owns all loss).
+
+  CORAL HEAD (CORALTFTWrapper):
+    coral_bias_raw (K=50,) unconstrained → monotonic biases via
+      b = -cumsum(softplus(raw))   [b_1 > b_2 > ... > b_50]
+    p̂_{ik} = σ( g(H_{i,t}) + b_k )   →  (B, 5, 50) CDF probabilities
+
+  LOSS (Masked Ordinal BCE):
+    z_{ik} = 1 if y_i ≥ t_k (Δt=0.1, K=50)  else 0
+    L = -1/K ∑_k [ z_k log(p̂_k) + (1-z_k) log(1-p̂_k) ]
+    Anti-anchor mechanism: zero-score samples produce near-zero gradient
+    on high-drought bins as p̂ → 0, freeing tail thresholds.
 
   TRAINING:
-    5-Fold Rolling Time-Based CV  (no group-overlap leakage between folds)
+    5-Fold Rolling Time-Based CV (no group-overlap leakage):
       Fold 0 : train [0, 756]  val [757, 761]
-      Fold 1 : train [0, 761]  val [762, 766]
-      Fold 2 : train [0, 766]  val [767, 771]
-      Fold 3 : train [0, 771]  val [772, 776]
-      Fold 4 : train [0, 776]  val [777, 781]
+      ...     (see get_fold_boundaries for full layout)
     PyTorch Lightning Trainer
       max_epochs=50, accelerator="gpu", devices=1
       gradient_clip_val=0.1
       EarlyStopping(val_loss, patience=5, min_delta=1e-4)
       LearningRateMonitor(epoch)
+    Optimizer: AdamW(lr=1e-3, weight_decay=1e-3)
+    Scheduler: CosineAnnealingLR(T_max=50, eta_min=1e-6)
 
   INFERENCE:
-    For each fold: tft.predict(test_dataloader, mode="raw")
-    p50 channel (index 3 of 7 quantiles) extracted: pred[:, :, 3]
-    5-fold p50 arrays stacked and median-compressed:
-      final_preds = np.median(all_fold_p50_matrices, axis=0)
+    trainer.predict(coral_model, test_dataloader)
+    → predict_step() calls decode_median(coral_probs)
+      ŷ_i = Σ_k I(p̂_{ik} ≥ 0.5) × 0.1  (Conditional Median)
+    5-fold decoded predictions stacked → np.median(axis=0) ensemble
+
+  VALIDATION MONITOR (per epoch, printed by CORALTFTWrapper):
+    1. CDF Saturation Entropy per drought bin
+    2. Conditional Median MAE / Bias per bin
+    3. Tail Recovery Delta: true 4.0–5.0 labels → ŷ > 3.5?
 
   POST-INFERENCE:
-    Conservative < 0.10 zero-floor:
-      final_preds = np.where(final_preds < 0.10, 0.0, final_preds)
-    Physical clip  : np.clip(final_preds, 0.0, 5.0)
+    np.clip(final_preds, 0, 5)   physical constraint
+    Zero-floor suppressed (ordinal BCE naturally learns y=0 signal).
     Test Set 6-tier Binned Distribution printed before submission write.
 
   SUBMISSION:
-    2248 rows × 6 columns  |  region_id, pred_week1 … pred_week5
+    2248 rows × 6 cols | region_id, pred_week1 … pred_week5
 
-v36 Changes over v35
----------------------
-  [INTRODUCE] TemporalFusionTransformer (pytorch_forecasting) — full TFT architecture.
-  [INTRODUCE] TimeSeriesDataSet — raw sequential 13-week encoder / 5-week decoder.
-  [INTRODUCE] QuantileLoss() (7 quantiles) — pinball objective optimisation.
-  [INTRODUCE] PyTorch Lightning Trainer — GPU-accelerated training w/ callbacks.
-  [INTRODUCE] 5-Fold Rolling Time-Based CV (no group leak; clean temporal windows).
-  [INTRODUCE] p50 (q=0.5, index 3) median channel extraction during inference.
-  [INTRODUCE] Asymmetrical 5-fold ensemble: np.median(all_fold_p50, axis=0).
-  [INTRODUCE] Conservative < 0.10 zero-floor (replaces probability hurdle gate).
+v37 Changes over v36
+--------------------
+  [INTRODUCE] CORALTFTWrapper — full CORAL ordinal CDF pipeline.
+  [INTRODUCE] QuantileLoss(quantiles=[0.5]) as TFT output_size=1 placeholder.
+  [INTRODUCE] Masked Ordinal BCE loss (inside CORALTFTWrapper).
+  [INTRODUCE] Conditional Median Decoder (Σ I(p≥0.5)·Δt).
+  [INTRODUCE] CDF Saturation Entropy + Tail Recovery monitor (per epoch).
+  [INTRODUCE] trainer.predict() + torch.cat() ensemble collection.
+  [INTRODUCE] Expanded 33-feature unknown-real matrix.
+  [INTRODUCE] TorchNormalizer(method="identity") — raw score preservation.
 
-  [ABOLISH]   LGBMRegressor / LGBMClassifier Hurdle architecture.
-  [ABOLISH]   354-dimensional tabular flattening matrix.
-  [ABOLISH]   Per-region Z-score anomaly normalisation.
-  [ABOLISH]   Manual Hurdle gating + per-week threshold calibration.
-  [ABOLISH]   StratifiedGroupKFold (replaced by rolling temporal CV).
+  [ABOLISH]   QuantileLoss() as training objective.
+  [ABOLISH]   p50 extraction (index 3 of 7 quantiles).
+  [ABOLISH]   extract_p50() function.
+  [ABOLISH]   Conservative < 0.10 zero-floor.
 """
 
 import os
@@ -93,12 +116,16 @@ from src.dataset import (
     WINDOW_SIZE,
     HORIZON,
     N_FOLDS,
+    ORDINAL_K,
+    ORDINAL_DELTA_T,
+    ORDINAL_THRESHOLDS,
     load_data,
     get_fold_boundaries,
     build_training_dataset,
     build_val_dataset,
     build_test_inference_dataset,
 )
+from src.model import CORALTFTWrapper, CORAL_K, CORAL_DELTA_T
 
 # ---------------------------------------------------------------------------
 # Config
@@ -106,24 +133,20 @@ from src.dataset import (
 MODELS_DIR = os.path.join(ROOT, "models")
 os.makedirs(MODELS_DIR, exist_ok=True)
 
-BATCH_SIZE  : int   = 256
-NUM_WORKERS : int   = 4
+BATCH_SIZE  : int   = 1024
+NUM_WORKERS : int   = 8    # [v37.1] PCIe bandwidth maximisation
 MAX_EPOCHS  : int   = 50
-LR          : float = 1e-3
+LR          : float = 2e-3  # [v37.1] peak LR for warmup-cosine schedule
 
-# TFT architecture hyper-parameters
+# TFT backbone hyper-parameters
+# output_size = 1 → scalar logit for the CORAL head
+# QuantileLoss(quantiles=[0.5]) is a placeholder to size output_layer to 1 neuron;
+# the loss is never computed in training (CORALTFTWrapper overrides training_step).
 TFT_HIDDEN_SIZE            : int   = 64
 TFT_ATTENTION_HEAD_SIZE    : int   = 4
 TFT_DROPOUT                : float = 0.2
 TFT_HIDDEN_CONTINUOUS_SIZE : int   = 32
-TFT_OUTPUT_SIZE            : int   = 7   # 7 quantiles: [0.02, 0.1, 0.25, 0.5, 0.75, 0.9, 0.98]
 TFT_PLATEAU_PATIENCE       : int   = 4
-
-# p50 is index 3 in [0.02, 0.10, 0.25, 0.50, 0.75, 0.90, 0.98]
-P50_IDX : int = 3
-
-# Conservative zero-floor
-ZERO_FLOOR_THRESHOLD : float = 0.10
 
 # ---------------------------------------------------------------------------
 # Diagnostics helpers
@@ -160,20 +183,20 @@ def print_test_binned_distribution(final_preds: np.ndarray, log_fn) -> None:
     Print the 6-tier drought intensity bin distribution for the final
     test predictions.  Called immediately before writing submission.csv.
     """
-    flat = final_preds.ravel()
+    flat  = final_preds.ravel()
     total = len(flat)
 
     log_fn("")
-    log_fn("  " + "=" * 88)
-    log_fn("  TEST SET BINNED PREDICTION MATRIX  [v36 TFT p50 Inference Diagnostic]")
-    log_fn("  Empirical distribution of median-ensembled, zero-floored, clipped preds")
-    log_fn("  " + "=" * 88)
+    log_fn("  " + "=" * 90)
+    log_fn("  TEST SET BINNED PREDICTION MATRIX  [v37 CORAL-TFT Conditional Median Inference]")
+    log_fn("  Empirical distribution of median-ensembled, clipped decoded predictions")
+    log_fn("  " + "=" * 90)
     header = (
         f"  {'Bin / Drought Category':<52}  {'Count':>8}  "
         f"{'% Share':>9}  {'AvgPred':>9}  {'MinPred':>9}  {'MaxPred':>9}"
     )
     log_fn(header)
-    log_fn("  " + "-" * 86)
+    log_fn("  " + "-" * 88)
 
     for idx, label in enumerate(TEST_BIN_LABELS):
         mask  = _test_bin_mask(flat, idx)
@@ -193,7 +216,7 @@ def print_test_binned_distribution(final_preds: np.ndarray, log_fn) -> None:
                 f"{avg_p:>9.4f}  {min_p:>9.4f}  {max_p:>9.4f}"
             )
 
-    log_fn("  " + "-" * 86)
+    log_fn("  " + "-" * 88)
     log_fn(f"  Total predictions : {total:,}")
     log_fn(f"  Exact-zero fraction: {(flat == 0.0).mean():.4f}  "
            f"({(flat == 0.0).sum():,} of {total:,})")
@@ -203,39 +226,8 @@ def print_test_binned_distribution(final_preds: np.ndarray, log_fn) -> None:
     log_fn(f"  p50   : {np.percentile(flat, 50):.4f}  "
            f"p90  : {np.percentile(flat, 90):.4f}  "
            f"p99  : {np.percentile(flat, 99):.4f}  Max : {flat.max():.4f}")
-    log_fn("  " + "=" * 88)
+    log_fn("  " + "=" * 90)
     log_fn("")
-
-
-# ---------------------------------------------------------------------------
-# p50 extraction helper
-# ---------------------------------------------------------------------------
-
-def extract_p50(raw_predictions, p50_idx: int = P50_IDX) -> np.ndarray:
-    """
-    Extract the p50 (median) quantile channel from TFT raw predictions.
-
-    pytorch_forecasting 1.x returns a NamedTuple-like object. The quantile
-    prediction tensor is accessible at .prediction with shape
-    (n_samples, max_prediction_length, output_size).
-
-    Returns
-    -------
-    p50 : np.ndarray  shape (n_samples, max_prediction_length)
-    """
-    # Robust extraction — handle both attribute names across PF versions
-    if hasattr(raw_predictions, "prediction"):
-        pred_tensor = raw_predictions.prediction
-    elif hasattr(raw_predictions, "output"):
-        pred_tensor = raw_predictions.output
-    else:
-        # Assume raw tensor was returned directly
-        pred_tensor = raw_predictions
-
-    # Move to CPU and convert
-    if hasattr(pred_tensor, "cpu"):
-        pred_tensor = pred_tensor.cpu()
-    return pred_tensor[:, :, p50_idx].numpy().astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -250,27 +242,27 @@ def main():
         print(msg)
         log_lines.append(str(msg))
 
-    # -- 0. Banner -------------------------------------------------------------
-    log("=" * 95)
-    log("Drought Forecasting Pipeline  v36  (Temporal Fusion Transformer)")
-    log("Model   : TemporalFusionTransformer  (pytorch_forecasting)  + QuantileLoss()")
+    # -- 0. Banner --------------------------------------------------------------
+    log("=" * 97)
+    log("Drought Forecasting Pipeline  v37  (CORAL-TFT — Ordinal CDF Paradigm)")
+    log("Model   : CORALTFTWrapper  (TemporalFusionTransformer + CORAL Consistent Bias Head)")
     log("Input   : Raw 13-week sequential meteorological windows per region")
-    log("          NO tabular flattening  |  NO manual Z-score normalisation")
-    log("Output  : 7 quantiles [0.02–0.98]  →  p50 (index 3) extracted for submission")
-    log("Ensemble: 5-Fold Rolling CV  →  np.median(p50 across folds, axis=0)")
-    log("ZeroFloor : preds < 0.10  →  0.0  (conservative micro-noise suppression)")
+    log("          33 unknown reals | 2 known reals (sin/cos) | NO Z-score normalisation")
+    log("Backbone: TFT (output_size=1) → scalar logit per step")
+    log(f"CORAL   : K={ORDINAL_K} thresholds Δt={ORDINAL_DELTA_T} → [{ORDINAL_THRESHOLDS[0]}…{ORDINAL_THRESHOLDS[-1]}]")
+    log("Loss    : Masked Ordinal BCE  z_{ik}=1 iff y≥t_k | Anti-anchor zero-mass gradient")
+    log("Decode  : Conditional Median  ŷ = Σ_k I(p̂_k≥0.5)·0.1")
+    log("Ensemble: 5-Fold Rolling CV  →  np.median(decoded, axis=0)")
     log("Clip    : np.clip(0.0, 5.0)  physical constraint")
-    log("=" * 95)
+    log("=" * 97)
     log("")
-    log("TFT Architecture:")
+    log("TFT Backbone Architecture:")
     log(f"  hidden_size            = {TFT_HIDDEN_SIZE}")
     log(f"  attention_head_size    = {TFT_ATTENTION_HEAD_SIZE}")
     log(f"  dropout                = {TFT_DROPOUT}")
     log(f"  hidden_continuous_size = {TFT_HIDDEN_CONTINUOUS_SIZE}")
-    log(f"  output_size            = {TFT_OUTPUT_SIZE}  "
-        f"(quantiles: 0.02, 0.10, 0.25, 0.50, 0.75, 0.90, 0.98)")
-    log(f"  loss                   = QuantileLoss()")
-    log(f"  learning_rate          = {LR}")
+    log(f"  output_size            = 1  (scalar logit; QuantileLoss([0.5]) sizing placeholder)")
+    log(f"  learning_rate          = {LR}  (AdamW; CosineAnnealingLR in CORALTFTWrapper)")
     log(f"  max_epochs             = {MAX_EPOCHS}")
     log(f"  batch_size             = {BATCH_SIZE}")
     log("")
@@ -280,7 +272,7 @@ def main():
         log(f"  Fold {k}: train time_idx [0, {te}]  →  val time_idx [{vs}, {ve}]")
     log("")
 
-    # -- 1. Load data ----------------------------------------------------------
+    # -- 1. Load data -----------------------------------------------------------
     log("Loading processed data ...")
     train_df, test_df = load_data()
     log(f"  train_df : {train_df.shape}  |  test_df : {test_df.shape}")
@@ -295,36 +287,48 @@ def main():
     log(f"  mean={scores.mean():.4f}  std={scores.std():.4f}  "
         f"min={scores.min():.4f}  max={scores.max():.4f}")
     log(f"  Zero-fraction : {(scores == 0.0).mean():.4f}  "
-        f"({(scores == 0.0).sum():,} rows)")
+        f"({(scores == 0.0).sum():,} rows)  — the 1.0 Anchor Degradation source")
     log(f"  Non-zero      : {(scores > 0.0).mean():.4f}  "
         f"({(scores > 0.0).sum():,} rows)")
+    log(f"  p90={np.percentile(scores, 90):.4f}  "
+        f"p99={np.percentile(scores, 99):.4f}  "
+        f"tail(≥4.0)={(scores >= 4.0).sum():,} rows")
 
-    # -- 2. 5-Fold Rolling TFT Training Loop -----------------------------------
-    log(f"\n{'='*95}")
-    log("5-Fold Rolling Time-Based TFT Training")
-    log(f"  Each fold trains a separate TFT and predicts the test set.")
-    log(f"  p50 predictions are collected and median-ensembled post-training.")
-    log(f"{'='*95}")
+    # Ordinal encoding preview
+    log(f"\n[v37] Ordinal CDF Encoding Preview:")
+    log(f"  K={ORDINAL_K} thresholds step Δt={ORDINAL_DELTA_T}")
+    log(f"  y=0.0 → z=[0,0,...,0]  (all-zero, 59.63% of training samples)")
+    log(f"  y=2.3 → z=[1 (×23), 0 (×27)]  (moderate drought)")
+    log(f"  y=4.5 → z=[1 (×45), 0 (×5)]   (extreme drought)")
+    log(f"  y=5.0 → z=[1,1,...,1]           (maximum drought)")
 
-    all_fold_p50_matrices : list[np.ndarray] = []   # each (2248, 5)
-    fold_val_losses       : list[float]      = []
-    test_dataset          = None    # built once in fold 0 and reused
-    test_ordered_regions  : list[str] = []
+    # -- 2. 5-Fold Rolling CORAL-TFT Training Loop ─────────────────────────────
+    log(f"\n{'='*97}")
+    log("5-Fold Rolling Time-Based CORAL-TFT Training")
+    log(f"  Each fold trains a CORALTFTWrapper using Masked Ordinal BCE.")
+    log(f"  Conditional Median decoded predictions are collected per fold.")
+    log(f"  5-fold decoded arrays are median-ensembled post-training.")
+    log(f"{'='*97}")
+
+    all_fold_decoded     : list[np.ndarray] = []   # each (2248, 5)
+    fold_val_bce_losses  : list[float]      = []
+    test_dataset         = None
+    test_ordered_regions : list[str]        = []
 
     for fold_k in range(N_FOLDS):
 
         fold_t0 = time.time()
         train_end, val_start, val_end = get_fold_boundaries(fold_k)
 
-        log(f"\n{'='*95}")
-        log(f"FOLD {fold_k + 1} / {N_FOLDS}  [TFT Rolling CV]")
+        log(f"\n{'='*97}")
+        log(f"FOLD {fold_k + 1} / {N_FOLDS}  [CORAL-TFT Rolling CV]")
         log(f"  train time_idx : [0, {train_end}]  "
             f"(= {train_end + 1} weeks × 2248 regions)")
         log(f"  val   time_idx : [{val_start}, {val_end}]  "
             f"(= {val_end - val_start + 1} weeks × 2248 regions)")
-        log(f"{'='*95}")
+        log(f"{'='*97}")
 
-        # -- 2a. Build datasets for this fold ----------------------------------
+        # -- 2a. Build datasets for this fold -----------------------------------
         fold_train_df = train_df[train_df["time_idx"] <= train_end].copy()
         fold_ctx_df   = train_df[train_df["time_idx"] <= val_end  ].copy()
 
@@ -346,41 +350,60 @@ def main():
             log(f"  test inference dataset size: {len(test_dataset):,} samples "
                 f"(= 2248 regions × 1 window)")
 
-        # -- 2c. DataLoaders ---------------------------------------------------
+        # -- 2c. DataLoaders ----------------------------------------------------
+        # [v37.1] pin_memory=True → page-locked PCIe transfers for GPU throughput
         train_dataloader = training_dataset.to_dataloader(
-            train      = True,
-            batch_size = BATCH_SIZE,
-            num_workers= NUM_WORKERS,
+            train       = True,
+            batch_size  = BATCH_SIZE,
+            num_workers = NUM_WORKERS,
+            pin_memory  = True,
         )
         val_dataloader = val_dataset.to_dataloader(
             train       = False,
             batch_size  = BATCH_SIZE,
             num_workers = NUM_WORKERS,
+            pin_memory  = True,
         )
         test_dataloader = test_dataset.to_dataloader(
             train       = False,
             batch_size  = BATCH_SIZE,
             num_workers = NUM_WORKERS,
+            pin_memory  = True,
         )
 
-        # -- 2d. Initialise TFT model ------------------------------------------
-        log(f"\n  Initialising TemporalFusionTransformer (fold {fold_k}) ...")
-        tft = TemporalFusionTransformer.from_dataset(
+        # -- 2d. Build TFT backbone with output_size=1 --------------------------
+        # QuantileLoss(quantiles=[0.5]) is used ONLY to set output_size=1 in the
+        # TFT's output_layer.  The loss is never computed — CORALTFTWrapper owns
+        # the full training / validation step with Masked Ordinal BCE.
+        log(f"\n  Initialising TFT backbone (output_size=1, fold {fold_k}) ...")
+        tft_backbone = TemporalFusionTransformer.from_dataset(
             training_dataset,
             learning_rate             = LR,
             hidden_size               = TFT_HIDDEN_SIZE,
             attention_head_size       = TFT_ATTENTION_HEAD_SIZE,
             dropout                   = TFT_DROPOUT,
             hidden_continuous_size    = TFT_HIDDEN_CONTINUOUS_SIZE,
-            output_size               = TFT_OUTPUT_SIZE,
-            loss                      = QuantileLoss(),
+            loss                      = QuantileLoss(quantiles=[0.5]),
             reduce_on_plateau_patience= TFT_PLATEAU_PATIENCE,
-            log_interval              = 10,
-            log_val_interval          = 1,
+            log_interval              = -1,   # suppress TFT's internal logging
+            log_val_interval          = -1,
         )
-        log(f"  Parameter count: {sum(p.numel() for p in tft.parameters()):,}")
+        log(f"  TFT backbone parameter count: "
+            f"{sum(p.numel() for p in tft_backbone.parameters()):,}")
 
-        # -- 2e. Lightning Trainer ---------------------------------------------
+        # -- 2e. Wrap in CORAL head ─────────────────────────────────────────────
+        log(f"\n  Wrapping TFT in CORALTFTWrapper (fold {fold_k}) ...")
+        coral_model = CORALTFTWrapper(
+            tft_backbone = tft_backbone,
+            n_ordinal    = CORAL_K,
+            lr           = LR,
+            max_epochs   = MAX_EPOCHS,
+        )
+        log(coral_model.architecture_summary())
+        log(f"  Total CORAL-TFT parameter count: {coral_model.count_parameters():,}")
+        log(f"  CORAL bias_raw initial shape    : {tuple(coral_model.coral_bias_raw.shape)}")
+
+        # -- 2f. Lightning Trainer ─────────────────────────────────────────────
         callbacks = [
             EarlyStopping(
                 monitor   = "val_loss",
@@ -392,145 +415,192 @@ def main():
             LearningRateMonitor(logging_interval="epoch"),
         ]
 
+        # [v37.1] gradient_clip_val=1.0 + norm algorithm shields attention heads
+        # from divergent gradient spikes across 50 ordinal dimensions.
         trainer = pl.Trainer(
-            max_epochs       = MAX_EPOCHS,
-            accelerator      = "gpu",
-            devices          = 1,
-            gradient_clip_val= 0.1,
-            callbacks        = callbacks,
-            enable_progress_bar = True,
-            logger           = True,    # default TensorBoard logger
+            max_epochs              = MAX_EPOCHS,
+            accelerator             = "gpu",
+            devices                 = 1,
+            gradient_clip_val       = 1.0,
+            gradient_clip_algorithm = "norm",
+            callbacks               = callbacks,
+            enable_progress_bar     = True,
+            logger                  = True,
         )
 
-        log(f"\n  Fitting TFT (fold {fold_k})  ...  "
+        log(f"\n  Fitting CORALTFTWrapper (fold {fold_k})  ...  "
             f"[max_epochs={MAX_EPOCHS}, early_stop patience=5]")
+        log(f"  Loss: Masked Ordinal BCE  |  Decode: Conditional Median  ŷ=Σ I(p≥0.5)·0.1")
         trainer.fit(
-            tft,
+            coral_model,
             train_dataloaders = train_dataloader,
             val_dataloaders   = val_dataloader,
         )
 
-        # Capture best validation loss
+        # Capture best validation BCE loss
         best_val_loss = trainer.callback_metrics.get("val_loss", float("nan"))
         if hasattr(best_val_loss, "item"):
             best_val_loss = float(best_val_loss.item())
         else:
             best_val_loss = float(best_val_loss)
-        fold_val_losses.append(best_val_loss)
+        fold_val_bce_losses.append(best_val_loss)
 
         stopped_epoch = trainer.current_epoch
         log(f"\n  [Fold {fold_k}] Training complete.")
-        log(f"  Stopped at epoch : {stopped_epoch}")
-        log(f"  Best val_loss    : {best_val_loss:.6f}")
+        log(f"  Stopped at epoch      : {stopped_epoch}")
+        log(f"  Best val_loss (BCE)   : {best_val_loss:.6f}")
 
-        # -- 2f. Inference: extract p50 ----------------------------------------
-        log(f"\n  Running test inference (fold {fold_k}) ...")
-        tft.eval()
+        # Log final CORAL bias statistics
+        biases_np = coral_model.get_monotonic_biases().detach().cpu().numpy()
+        log(f"  CORAL biases [b_1..b_50]:")
+        log(f"    b_1 (lowest threshold)  = {biases_np[0]:.4f}")
+        log(f"    b_25 (mid threshold)    = {biases_np[24]:.4f}")
+        log(f"    b_50 (highest threshold)= {biases_np[-1]:.4f}")
+        log(f"    range = [{biases_np.min():.4f}, {biases_np.max():.4f}]  "
+            f"(monotone: {(np.diff(biases_np) <= 0).all()})")
 
-        # return_x=False: we use test_ordered_regions for region mapping —
-        # no need to unpack group index tensors.
-        # In pytorch_forecasting 1.x, predict() returns a NamedTuple-like
-        # structure; capture the full result and let extract_p50() handle it.
-        pred_result = tft.predict(
-            test_dataloader,
-            mode     = "raw",
-            return_x = False,
-        )
+        # -- 2g. Inference: Conditional Median Decoded predictions ─────────────
+        log(f"\n  Running test inference (fold {fold_k}) — Conditional Median Decoder ...")
+        # trainer.predict() calls coral_model.predict_step() → decode_median()
+        preds_list = trainer.predict(coral_model, test_dataloader)
 
-        # Extract p50 quantile channel  (index 3 in 7-quantile output)
-        p50_fold = extract_p50(pred_result, p50_idx=P50_IDX)
-        # p50_fold shape: (n_samples, HORIZON) = (2248, 5)
+        # preds_list: list of (B, HORIZON) CPU tensors per batch
+        # Stack and convert to numpy
+        decoded_fold = torch.cat(preds_list, dim=0).numpy().astype(np.float32)
+        # decoded_fold shape: (2248, 5)
 
-        log(f"  p50_fold shape         : {p50_fold.shape}")
-        log(f"  p50_fold stats  mean={p50_fold.mean():.4f}  "
-            f"std={p50_fold.std():.4f}  "
-            f"min={p50_fold.min():.4f}  max={p50_fold.max():.4f}")
+        log(f"  decoded_fold shape      : {decoded_fold.shape}")
+        log(f"  decoded_fold stats:")
+        log(f"    mean={decoded_fold.mean():.4f}  std={decoded_fold.std():.4f}  "
+            f"min={decoded_fold.min():.4f}  max={decoded_fold.max():.4f}")
+        log(f"    zero-frac = {(decoded_fold == 0.0).mean():.4f}  "
+            f"p90={np.percentile(decoded_fold, 90):.4f}  "
+            f"p99={np.percentile(decoded_fold, 99):.4f}")
 
-        all_fold_p50_matrices.append(p50_fold)
+        all_fold_decoded.append(decoded_fold)
 
         fold_elapsed = time.time() - fold_t0
         log(f"  Fold {fold_k} elapsed : {fold_elapsed:.1f}s  ({fold_elapsed/60:.1f} min)")
 
-    # -- 3. Cross-fold summary -------------------------------------------------
-    log(f"\n{'='*95}")
-    log(f"5-Fold Rolling CV Summary  [v36 TFT QuantileLoss]")
-    log(f"{'='*95}")
-    for k, vl in enumerate(fold_val_losses):
-        log(f"  Fold {k}: best val_loss = {vl:.6f}")
-    finite_losses = [v for v in fold_val_losses if not np.isnan(v)]
+        # ======================================================================
+        # [v37.1 新增] 系統級垃圾回收與記憶體清空 (防禦跨 Fold Memory Leak)
+        # ======================================================================
+        import gc
+        
+        # 1. 斷開當前折的佔用大量記憶體的物件引用
+        del trainer
+        del coral_model
+        del tft_backbone
+        del train_dataloader
+        del val_dataloader
+        if fold_k != 0: # fold 0 的 test_dataloader 還要保留給後面用
+            # 如果你在迴圈內有重建 test_dataloader，才需要刪除它。
+            # 根據你目前的程式碼，test_dataloader 只有在 fold 0 建立，後面重複使用，
+            # 所以不要刪除 test_dataloader, test_dataset, training_dataset, val_dataset
+            pass
+        
+        # 刪除佔據大記憶體的 Dataset 物件
+        del training_dataset
+        del val_dataset
+        del fold_train_df
+        del fold_ctx_df
+
+        # 2. 強制引發 Python 系統級垃圾回收（釋放主記憶體 RAM / /dev/shm）
+        gc.collect()
+
+        # 3. 強制清空 CUDA 顯存快取（釋放 GPU VRAM）
+        torch.cuda.empty_cache()
+        # ======================================================================
+
+
+    # -- 3. Cross-fold summary --------------------------------------------------
+    log(f"\n{'='*97}")
+    log(f"5-Fold Rolling CV Summary  [v37 CORAL-TFT Masked Ordinal BCE]")
+    log(f"{'='*97}")
+    for k, vl in enumerate(fold_val_bce_losses):
+        log(f"  Fold {k}: best val_loss (Ordinal BCE) = {vl:.6f}")
+    finite_losses = [v for v in fold_val_bce_losses if not np.isnan(v)]
     if finite_losses:
         log(f"\n  Mean val_loss : {np.mean(finite_losses):.6f}  "
             f"±  {np.std(finite_losses):.6f}")
-        log(f"  Best fold     : {int(np.argmin(fold_val_losses))} "
+        log(f"  Best fold     : {int(np.argmin(fold_val_bce_losses))} "
             f"(val_loss = {min(finite_losses):.6f})")
 
-    # -- 4. Asymmetrical ensemble compression ----------------------------------
-    log(f"\n{'='*95}")
-    log(f"[v36] 5-Fold p50 Ensemble Compression")
-    log(f"  Strategy: np.median(all_fold_p50_matrices, axis=0)")
-    log(f"{'='*95}")
+    # -- 4. 5-Fold Conditional Median Ensemble ─────────────────────────────────
+    log(f"\n{'='*97}")
+    log(f"[v37] 5-Fold Conditional Median Ensemble Compression")
+    log(f"  Strategy: np.median(all_fold_decoded, axis=0)")
+    log(f"  Each fold produces ŷ = Σ_k I(p̂_k≥0.5)·0.1 (step 0.1, K=50)")
+    log(f"{'='*97}")
 
     # Stack to (N_FOLDS, 2248, 5) then collapse via strict median
-    p50_stack   = np.stack(all_fold_p50_matrices, axis=0)   # (5, 2248, 5)
-    final_preds = np.median(p50_stack, axis=0)               # (2248, 5)
+    decoded_stack = np.stack(all_fold_decoded, axis=0)    # (5, 2248, 5)
+    final_preds   = np.median(decoded_stack, axis=0)      # (2248, 5)
 
-    log(f"  p50_stack shape        : {p50_stack.shape}")
-    log(f"  final_preds shape      : {final_preds.shape}")
-    log(f"  Pre-floor stats: mean={final_preds.mean():.4f}  "
+    log(f"  decoded_stack shape : {decoded_stack.shape}")
+    log(f"  final_preds shape   : {final_preds.shape}")
+    log(f"  Pre-clip stats: mean={final_preds.mean():.4f}  "
         f"std={final_preds.std():.4f}  "
         f"min={final_preds.min():.4f}  max={final_preds.max():.4f}")
 
-    # -- 5. Conservative zero-floor (<0.10) ------------------------------------
-    log(f"\n[v36] Conservative Zero-Floor  (threshold < {ZERO_FLOOR_THRESHOLD})")
-    before_zero_frac = float((final_preds == 0.0).mean())
-    final_preds = np.where(final_preds < ZERO_FLOOR_THRESHOLD, 0.0, final_preds)
-    after_zero_frac  = float((final_preds == 0.0).mean())
+    # Per-fold zero-fractions (ordinal BCE tail escape audit)
+    log(f"\n  Per-fold zero-fraction of decoded predictions:")
+    for k, d in enumerate(all_fold_decoded):
+        log(f"    Fold {k}: zero-frac={( d==0.0).mean():.4f}  "
+            f"p90={np.percentile(d, 90):.4f}  max={d.max():.4f}")
 
-    log(f"  Zero fraction before floor : {before_zero_frac:.4f}")
-    log(f"  Zero fraction after  floor : {after_zero_frac:.4f}")
-    log(f"  Micro-noise eliminated     : {after_zero_frac - before_zero_frac:.4f}")
-
-    # -- 6. Physical clip [0, 5] -----------------------------------------------
+    # -- 5. Physical clip [0, 5] ───────────────────────────────────────────────
+    # Note: No zero-floor applied in v37.
+    # Ordinal BCE with CORAL naturally learns to predict p̂ → 0 for all thresholds
+    # when drought score = 0.0, producing ŷ = 0.0 via conditional median.
+    # An artificial floor would incorrectly suppress genuine near-zero predictions.
     final_submission = np.clip(final_preds, 0.0, 5.0).astype(np.float32)
 
-    log(f"\n  Post-clip stats [0, 5]:")
+    log(f"\n  Post-clip stats [0, 5] (no zero-floor in v37 — ordinal BCE handles zeros):")
     log(f"    mean={final_submission.mean():.4f}  "
         f"std={final_submission.std():.4f}  "
         f"min={final_submission.min():.4f}  "
         f"max={final_submission.max():.4f}")
+    log(f"    zero-frac = {(final_submission == 0.0).mean():.4f}")
 
-    # -- 7. Test Set Binned Distribution Audit ---------------------------------
-    log(f"\n{'='*95}")
-    log(f"[v36] Test Set 6-Tier Binned Distribution Audit")
-    log(f"{'='*95}")
+    # -- 6. Test Set Binned Distribution Audit ─────────────────────────────────
+    log(f"\n{'='*97}")
+    log(f"[v37] Test Set 6-Tier Binned Distribution Audit")
+    log(f"{'='*97}")
     print_test_binned_distribution(final_submission, log)
 
-    # -- 8. Submission diagnostics  -------------------------------------------
-    log("[v36 Submission Prediction Diagnostics]")
-    flat    = final_submission.ravel()
-    p50_v   = float(np.percentile(flat, 50))
-    p75_v   = float(np.percentile(flat, 75))
-    p90_v   = float(np.percentile(flat, 90))
-    p95_v   = float(np.percentile(flat, 95))
-    p99_v   = float(np.percentile(flat, 99))
+    # -- 7. Submission diagnostics ─────────────────────────────────────────────
+    log("[v37 Submission Prediction Diagnostics  — Conditional Median Decoded]")
+    flat  = final_submission.ravel()
+    p50_v = float(np.percentile(flat, 50))
+    p75_v = float(np.percentile(flat, 75))
+    p90_v = float(np.percentile(flat, 90))
+    p95_v = float(np.percentile(flat, 95))
+    p99_v = float(np.percentile(flat, 99))
     log(f"  n={len(flat):,}  mean={flat.mean():.4f}  std={flat.std():.4f}")
     log(f"  p50={p50_v:.4f}  p75={p75_v:.4f}  p90={p90_v:.4f}  "
         f"p95={p95_v:.4f}  p99={p99_v:.4f}  max={flat.max():.4f}")
     log(f"  Exact zero fraction: {(flat == 0.0).mean():.4f}")
 
     if p99_v < 1.5:
-        log("  *** WARNING: p99 < 1.5 -- predictions may be under-dispersed! ***")
+        log("  *** WARNING: p99 < 1.5 — predictions may be under-dispersed! "
+            "CORAL tail recovery may need more epochs. ***")
     else:
-        log(f"  ✓ p99 >= 1.5 -- prediction dynamic range is healthy.")
+        log(f"  ✓ p99 >= 1.5 — prediction dynamic range is healthy.")
 
-    # -- 9. Build submission DataFrame -----------------------------------------
+    # Tail recovery audit on final ensemble
+    tail_mask = (flat >= 3.5)
+    tail_frac = tail_mask.mean()
+    log(f"  Predictions ≥ 3.5 (tail recovery signal) : "
+        f"{tail_frac:.4f}  ({tail_mask.sum():,} / {len(flat):,})")
+    if tail_frac > 0.001:
+        log("  ✓ Non-trivial tail recovery detected — escaped 1.0 anchor sink!")
+    else:
+        log("  ✗ Very few predictions ≥ 3.5 — ensemble may still be anchor-biased")
+
+    # -- 8. Build submission DataFrame ─────────────────────────────────────────
     log("\nFormatting submission.csv ...")
 
-    # Map prediction rows back to region_ids.
-    # test_ordered_regions was built by sorted(unique region_ids in inference_df).
-    # The test_dataloader iterates through samples in the order they were created
-    # by TimeSeriesDataSet, which follows the sorted region + time_idx order of
-    # the inference dataframe (one sample per region).
     assert len(test_ordered_regions) == final_submission.shape[0], (
         f"Region count mismatch: {len(test_ordered_regions)} regions vs "
         f"{final_submission.shape[0]} prediction rows."
@@ -556,7 +626,7 @@ def main():
     sub_path   = os.path.join(ROOT, "submission.csv")
     submission.to_csv(sub_path, index=False)
 
-    # -- 10. Sanity checks -----------------------------------------------------
+    # -- 9. Sanity checks ───────────────────────────────────────────────────────
     assert len(submission) == 2248, f"Expected 2248 rows, got {len(submission)}"
     assert list(submission.columns) == [
         "region_id", "pred_week1", "pred_week2",
@@ -577,23 +647,24 @@ def main():
     log(f"  Columns: {list(submission.columns)}")
     log(f"\n  Preview:\n{submission.head(5).to_string(index=False)}")
 
-    # -- 11. Total elapsed time -----------------------------------------------
+    # -- 10. Total elapsed time ─────────────────────────────────────────────────
     elapsed = time.time() - t0
     log(f"\nTotal elapsed: {elapsed:.1f}s  ({elapsed/60:.1f} min)")
 
-    log_path = os.path.join(ROOT, "_training_log_36th.txt")
+    log_path = os.path.join(ROOT, "_training_log_37th.txt")
     with open(log_path, "w") as fh:
         fh.write("\n".join(log_lines))
     print(f"\nTraining log saved  →  {log_path}")
 
     return {
-        "fold_val_losses"   : fold_val_losses,
-        "p50_stack_shape"   : p50_stack.shape,
-        "final_preds_shape" : final_submission.shape,
-        "submission"        : submission,
-        "sub_max"           : float(flat.max()),
-        "sub_p99"           : p99_v,
-        "zero_frac_final"   : float((flat == 0.0).mean()),
+        "fold_val_bce_losses"  : fold_val_bce_losses,
+        "decoded_stack_shape"  : decoded_stack.shape,
+        "final_preds_shape"    : final_submission.shape,
+        "submission"           : submission,
+        "sub_max"              : float(flat.max()),
+        "sub_p99"              : p99_v,
+        "zero_frac_final"      : float((flat == 0.0).mean()),
+        "tail_recovery_frac"   : float(tail_frac),
     }
 
 

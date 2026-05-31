@@ -3,6 +3,7 @@ import numpy as np
 
 def diagnostic_eda():
     print("載入處理後的數據...")
+    # 假設你的檔案路徑正確，若有不同請自行調整
     train = pd.read_csv("data/processed/train_processed.csv")
     test = pd.read_csv("data/processed/test_processed.csv")
 
@@ -27,21 +28,24 @@ def diagnostic_eda():
     print(test_counts.describe())
 
     # 2. Rolling Feature 的初始階段失真檢查 (Domain Shift)
-    # 由於 min_periods=1，測試集前幾週的 rolling sum 會因數據不足而產生嚴重的人為偏差
+    # 修改為配合資料中的 prec_roll_sum_4w 特徵
     print("\n=== [2] 特徵分佈偏移檢查 (Rolling Features) ===")
     
-    if "prec_roll_sum_13w" in test.columns:
-        # 取出 Train 中任意一段連續 14 週的 13w rolling sum 平均值作為基準 (排除前 13 週)
-        train_stable = train.groupby("region_id").apply(lambda x: x.iloc[13:27]["prec_roll_sum_13w"].mean()).mean()
+    if "prec_roll_sum_4w" in test.columns:
+        # 取出 Train 中一段穩定的期間 (排除前 4 週，取第 4 到 17 週的平均作為基準)
+        train_stable = train.groupby("region_id").apply(lambda x: x.iloc[4:18]["prec_roll_sum_4w"].mean()).mean()
         
-        # 比較 Test 第一週與第十三週的 rolling sum
-        test_w1 = test.groupby("region_id").first()["prec_roll_sum_13w"].mean()
-        test_w13 = test.groupby("region_id").nth(12)["prec_roll_sum_13w"].mean() if test_counts.max() >= 13 else np.nan
+        # 比較 Test 第一週與第四週 (滿 4 週) 的 rolling sum
+        test_w1 = test.groupby("region_id").first()["prec_roll_sum_4w"].mean()
+        # 抓取第 4 週的資料 (index 3) 來確認特徵穩定的狀態
+        test_w4 = test.groupby("region_id").nth(3)["prec_roll_sum_4w"].mean() if test_counts.max() >= 4 else np.nan
         
-        print(f"Train 穩定狀態 (13w sum): {train_stable:.4f}")
+        print(f"Train 穩定狀態 (4w sum 基準): {train_stable:.4f}")
         print(f"Test 第 1 週狀態 (實際僅 1 週 sum): {test_w1:.4f}")
-        print(f"Test 第 13 週狀態 (實際滿 13 週 sum): {test_w13:.4f}")
-        print("-> 若 Test 第 1 週顯著低於 Train 穩定狀態，代表特徵在推論初期發生嚴重的尺度塌陷。")
+        print(f"Test 第 4 週狀態 (實際滿 4 週 sum): {test_w4:.4f}")
+        print("-> 若 Test 第 1 週顯著低於 Train 穩定狀態，代表測試集初期的 Rolling 特徵發生尺度塌陷。")
+    else:
+        print("未在資料中找到 'prec_roll_sum_4w' 特徵，跳過此檢查。")
 
     # 3. 檢查 NaN 狀態
     print("\n=== [3] NaN 殘留檢查 ===")
