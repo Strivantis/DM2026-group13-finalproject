@@ -119,22 +119,21 @@ TS_SHIFT_WEEKS = 26
 DROP_COLS = ["wb_tmp", "dp_tmp", "surf_tmp", "wind_max", "dow_sin"]
 
 # Precipitation columns to log1p-transform (handle right-skew)
-# v26: prec_roll_sum_4w, prec_lag1w, prec_lag2w removed (cross-week bleed purge)
+# v26: prec_roll_sum_4w re-added alongside prec and prec_week_max
 PREC_COLS = [
     "prec",
     "prec_week_max",
+    "prec_roll_sum_4w",
 ]
 
 # Feature columns fed to the model (order matters for scaler alignment)
-# v26 Clean Slate: 27 features
+# 29 features total (27 base + 2 rolling features re-added):
 #   base weather (10) + enriched weekly stats (11) + cyclic calendar (2)
-#   + drought proxy (2) + target encoding (2) = 27
+#   + drought proxy (4) + target encoding (2) = 29
 #
-# PURGED vs v25 (12 tokens removed):
-#   prec_roll_sum_4w, tmp_roll_mean_4w, humidity_roll_mean_4w  (3 cross-week rolling)
-#   tmp_lag1w, humidity_lag1w, prec_lag1w, wind_lag1w           (4 lag-1)
-#   tmp_lag2w, humidity_lag2w, prec_lag2w, wind_lag2w           (4 lag-2)
-#   deficit_roll_cum_4w                                          (1 cross-week rolling)
+# Re-added vs v26:
+#   prec_roll_sum_4w   : 4-week rolling precipitation sum
+#   deficit_roll_cum_4w: 4-week cumulative PET deficit
 FEATURE_COLS = [
     # --- base weather (10) [v22: wind_max removed] ---
     "prec", "surf_pre", "humidity",
@@ -147,11 +146,12 @@ FEATURE_COLS = [
     "prec_week_max", "surf_pre_week_max",
     # --- cyclical calendar (2) [v9: replaces month + week_of_year] ---
     "week_sin", "week_cos",
-    # --- drought proxy index (2) [v26: deficit_roll_cum_4w purged] ---
+    # --- drought proxy index (4) [prec_roll_sum_4w + deficit_roll_cum_4w re-added] ---
     "pet", "deficit",
+    "prec_roll_sum_4w", "deficit_roll_cum_4w",
     # --- target encoding (2) [v9: leakage-free region stats, injected in train.py] ---
     "region_mean_score", "region_zero_prob",
-]   # total = 27 features  |  flat dim = 27 x 13 = 351
+]   # total = 29 features  |  flat dim = 29 x 13 = 377  (+29 deltas = 406)
 
 
 # ---------------------------------------------------------------------------
