@@ -1,46 +1,38 @@
 """
-model.py -- v37 CORAL-TFT: Consistent Rank Logits Head over TFT Backbone
-==========================================================================
+model.py -- v38 CORAL-TFT: Parametric τ-Decoder (OOF Grid Search Calibrated)
+==============================================================================
 
-v37 Paradigm: Ordinal CDF Forecasting with CORAL Consistent Bias Head
+v38 Paradigm: Ordinal CDF Forecasting with Fold-Specific τ Calibration
 -----------------------------------------------------------------------
-  Problem (v22–v36): Continuous-loss regression suffers from "1.0 Anchor
-    Degradation".  59.63% zero targets drown gradient signals, forcing all
-    predictions to cluster at 1.0.
+  Problem (v37): The hardcoded 0.5 probability threshold in decode_median()
+    is sub-optimal. Different folds may benefit from different decision
+    frontiers in the CDF survival probability space.
 
-  Solution (v37) — CORALTFTWrapper:
-    1. TFT Backbone: The TemporalFusionTransformer (pytorch_forecasting) with
-       output_size=1 generates a single unbounded scalar logit per time-step.
+  Solution (v38) — Parametric τ-Decoder + OOF Grid Search:
+    1. TFT Backbone (unchanged from v37): scalar logit per time-step.
        All Variable Selection Networks and Multi-Head Spatio-Temporal Attention
        layers are fully preserved.  Hidden state: d_model = TFT_HIDDEN_SIZE.
 
-    2. CORAL Consistent Bias Head (NEW):
-       a. Shared scalar projection: g(H_{i,t}) — one linear layer, weights
-          shared across ALL 50 ordinal thresholds (CORAL structural constraint).
-       b. Monotonic Ordered Biases: B = [b_1, b_2, ..., b_50] where
-          b_1 > b_2 > ... > b_50 is enforced via:
-            increments = softplus(raw_params)   (positive)
-            biases     = -cumsum(increments)    (strictly decreasing)
-       c. CDF probability vector:
-            p̂_{ik} = σ( g(H_{i,t}) + b_k )   k = 1..50
-          Monotonic bias sharing guarantees: p̂_{i1} ≥ p̂_{i2} ≥ ... ≥ p̂_{i50}
-          (survival probabilities decrease monotonically — physically correct).
+    2. CORAL Consistent Bias Head (unchanged from v37):
+       p̂_{ik} = σ( g(H_{i,t}) + b_k )   k = 1..50
+       Monotonic bias guarantees: p̂_{i1} ≥ p̂_{i2} ≥ ... ≥ p̂_{i50}
 
-    3. Masked Ordinal BCE Loss:
-         L_v37 = -1/K ∑_k [ z_{ik} log(p̂_{ik}) + (1-z_{ik}) log(1-p̂_{ik}) ]
-       where z_{ik} = 1 iff y_i ≥ t_k, else 0.
-       Absolute-zero samples (z = 0 everywhere) produce zero gradient on
-       high-drought bins as p̂ → 0, freeing tail thresholds to learn from
-       active drought signatures without zero-mass drag-down.
+    3. Masked Ordinal BCE Loss (unchanged from v37):
+         L = -1/K ∑_k [ z_k log(p̂_k) + (1-z_k) log(1-p̂_k) ]
 
-    4. Conditional Median Decoder (inference):
-         ŷ_i = Σ_k  I(p̂_{ik} ≥ 0.5) × Δt      (Δt = 0.1)
-       Count of thresholds with survival ≥ 50% times step size.
+    4. [v38 NEW] Parametric τ-Decoder:
+         ŷ_i = Σ_k  I(p̂_{ik} ≥ τ) × Δt      (Δt = 0.1)
+       τ is no longer hardcoded to 0.5 — it is calibrated per fold via OOF
+       grid search over τ ∈ [0.40, 0.75] (36 candidates, step ≈ 0.01).
+       Implemented as decode_with_tau(coral_probs, tau).
 
-    5. CDF Saturation Entropy Monitor (validation):
-       H = -[p log p + (1-p) log(1-p)]  per threshold
-       Low mean entropy → well-polarized distributions (healthy learning).
-       Printed each validation epoch alongside Tail Recovery Delta.
+    5. [v38 NEW] predict_step() returns dict {'coral_probs', 'target'}
+       to support the OOF calibrator in train.py:
+         - Val predict: extract coral_probs + true targets → search best τ
+         - Test predict: extract coral_probs → apply fold-specific best_tau
+
+    6. CDF Saturation Entropy Monitor (unchanged from v37):
+       H = -[p log p + (1-p) log(1-p)]  per threshold.
 
 Architecture Summary
 --------------------
@@ -54,31 +46,32 @@ Architecture Summary
 
 Training
 --------
-  Optimizer : AdamW(lr=1e-3, weight_decay=1e-3)
-  Scheduler : CosineAnnealingLR(T_max=50, eta_min=1e-6)
-  Loss      : Masked Ordinal BCE (mean over B × T × K)
-  Batch     : 256 / 512
+  Optimizer : AdamW(lr=2e-3, weight_decay=1e-3)
+  Scheduler : 3-epoch Linear Warmup → CosineAnnealingLR(T_max=47, eta_min=1e-6)
+  Loss      : Masked Ordinal BCE with label smoothing (z ∈ [0.01, 0.99])
+  Batch     : 1024
   Epochs    : 50 (hard limit, early stopping patience=5)
+
+Calibration (v38 NEW)
+---------------------
+  After trainer.fit() per fold:
+    1. trainer.predict(val) → coral_probs (N, 5, 50) + targets (N, 5)
+    2. Grid search τ ∈ [0.40, 0.75] (36 candidates) by OOF MAE
+    3. Apply best_tau to test inference: ŷ = Σ I(p̂ ≥ best_tau) × 0.1
 
 Legacy
 ------
   DroughtSequenceNet (v33 — Dual Dilated Conv1d + BiLSTM + Region Embedding)
-  is retained below as a legacy alias.  Not used in v37.
+  is retained below as a legacy alias.  Not used in v38.
 
-v37 Changes over v36
+v38 Changes over v37
 --------------------
-  [v37] INTRODUCE: CORALTFTWrapper(pl.LightningModule) — CORAL CDF head.
-  [v37] INTRODUCE: coral_bias_raw Parameter + get_monotonic_biases().
-  [v37] INTRODUCE: _ordinal_bce_loss() — Masked Ordinal Binary Cross-Entropy.
-  [v37] INTRODUCE: decode_median() — Conditional Median Integration (Δt=0.1).
-  [v37] INTRODUCE: _cdf_saturation_entropy() — per-threshold polarization audit.
-  [v37] INTRODUCE: on_validation_epoch_end() monitoring printout with:
-                   - CDF Saturation Entropy by drought bin
-                   - Per-bin Conditional Median MAE / Bias
-                   - Tail Recovery Delta (true labels 4.0–5.0 → ŷ > 3.5)
-  [v37] ABOLISH   : QuantileLoss / continuous regression output head.
-  [v37] ABOLISH   : p50 / quantile channel extraction.
-  [v37] RETAIN    : TFT backbone architecture (VSN, attention, LSTM encoder/decoder).
+  [v38] INTRODUCE: decode_with_tau(coral_probs, tau) — Parametric τ-Decoder.
+  [v38] UPGRADE  : predict_step() now returns dict {'coral_probs', 'target'}
+                   instead of decoded y_hat tensor, enabling OOF calibration.
+  [v38] RETAIN   : decode_median() — kept for monitoring use in validation step.
+  [v38] RETAIN   : All v37 training/validation/loss/entropy machinery.
+  [v38] ABOLISH  : Hardcoded τ=0.5 as the sole inference threshold.
 """
 
 import numpy as np
@@ -105,7 +98,7 @@ _CORAL_THRESHOLDS_LIST: list[float] = [
 
 class CORALTFTWrapper(pl.LightningModule):
     """
-    v37 CORAL-TFT Lightning Module.
+    v38 CORAL-TFT Lightning Module — Parametric τ-Decoder with OOF Calibration.
 
     Wraps a ``TemporalFusionTransformer`` (with output_size=1) as a scalar
     logit extractor, then applies the CORAL Consistent Bias Head to produce
@@ -118,7 +111,7 @@ class CORALTFTWrapper(pl.LightningModule):
         Used as a pure feature extractor — its own training_step/loss
         are never invoked.
     n_ordinal    : int   — number of ordinal thresholds K (default 50)
-    lr           : float — base learning rate for AdamW (default 1e-3)
+    lr           : float — base learning rate for AdamW (default 2e-3)
     max_epochs   : int   — T_max for CosineAnnealingLR (default 50)
     """
 
@@ -126,7 +119,7 @@ class CORALTFTWrapper(pl.LightningModule):
         self,
         tft_backbone : TemporalFusionTransformer,
         n_ordinal    : int   = CORAL_K,
-        lr           : float = 2e-3,   # [v37.1] peak LR for warmup-cosine schedule
+        lr           : float = 2e-3,
         max_epochs   : int   = 50,
     ):
         super().__init__()
@@ -236,15 +229,9 @@ class CORALTFTWrapper(pl.LightningModule):
         ordinal_labels : torch.Tensor,
     ) -> torch.Tensor:
         """
-        Masked Ordinal Binary Cross-Entropy Loss  (L_v37).
+        Masked Ordinal Binary Cross-Entropy Loss.
 
           L = -1/K ∑_k [ z_k log(p̂_k) + (1-z_k) log(1-p̂_k) ]
-
-        Gradient anti-anchor mechanism:
-          For absolute-zero samples (z=0 everywhere), as p̂ → 0 for high-
-          drought bins, log(1-p̂) → 0 and the gradient contribution vanishes.
-          This liberates high-severity thresholds to learn from active drought
-          signatures without being dragged down by the 59.63% zero mass.
 
         Parameters
         ----------
@@ -263,7 +250,7 @@ class CORALTFTWrapper(pl.LightningModule):
         return bce.mean()
 
     # -----------------------------------------------------------------------
-    # Conditional Median Decoder
+    # Conditional Median Decoder (v37 fixed τ=0.5 — retained for monitoring)
     # -----------------------------------------------------------------------
 
     @staticmethod
@@ -276,11 +263,9 @@ class CORALTFTWrapper(pl.LightningModule):
 
           ŷ_i = Σ_k  I(p̂_{ik} ≥ 0.5) × Δt
 
-        Count of thresholds where survival probability ≥ 50%, multiplied by
-        the step size Δt=0.1.  This estimates the conditional median:
-          - All 50 thresholds passed (p ≥ 0.5) → ŷ = 5.0
-          - No threshold passed      (p < 0.5) → ŷ = 0.0  (absolute zero)
-          - 23 thresholds passed               → ŷ = 2.3  (moderate drought)
+        NOTE (v38): Retained for use in validation_step() monitoring only.
+        Inference in train.py now uses decode_with_tau() with a fold-specific
+        τ calibrated by OOF grid search.
 
         Parameters
         ----------
@@ -292,6 +277,43 @@ class CORALTFTWrapper(pl.LightningModule):
         y_hat : Tensor (...) — shape identical to coral_probs with K dim removed
         """
         return (coral_probs >= 0.5).float().sum(dim=-1) * delta_t
+
+    # -----------------------------------------------------------------------
+    # [v38 NEW] Parametric τ-Decoder — fold-specific calibrated threshold
+    # -----------------------------------------------------------------------
+
+    @staticmethod
+    def decode_with_tau(
+        coral_probs : torch.Tensor,
+        tau         : float = 0.5,
+    ) -> torch.Tensor:
+        """
+        Parametric τ-Decoder: accumulate step weights of 0.1 for every bin
+        where the survival confidence breaches the calibrated threshold τ.
+
+          ŷ_i = Σ_k  I(p̂_{ik} ≥ τ) × Δt      (Δt = 0.1)
+
+        τ is the Decision Threshold Quantile Calibrator, determined per fold
+        by an OOF 1D grid search over τ ∈ [0.40, 0.75] (36 candidates).
+        Choosing τ < 0.5 produces more non-zero predictions (liberal decoding);
+        τ > 0.5 suppresses low-confidence drought signals (conservative).
+
+        Parameters
+        ----------
+        coral_probs : Tensor (B, T, K=50)
+            Survival probability tensor from the CORAL head.
+            σ(scalar_logit + b_k), values in (0, 1), monotonically decreasing
+            along the K dimension.
+        tau : float
+            The Decision Threshold Quantile Calibrator (default 0.5).
+            Optimal value found by OOF MAE grid search in train.py.
+
+        Returns
+        -------
+        y_hat : Tensor (B, T)
+            Decoded drought scores in multiples of 0.1 (range [0.0, 5.0]).
+        """
+        return torch.sum(coral_probs >= tau, dim=-1) * CORAL_DELTA_T
 
     # -----------------------------------------------------------------------
     # CDF Saturation Entropy Monitor
@@ -306,10 +328,6 @@ class CORALTFTWrapper(pl.LightningModule):
         Per-element binary entropy of the predicted CDF probability vector.
 
           H_{ik} = -[ p̂_{ik} log(p̂_{ik}) + (1-p̂_{ik}) log(1-p̂_{ik}) ]
-
-        Interpretation:
-          - Entropy → 0 : p̂ near 0 or 1 (polarised, confident CDF step)
-          - Entropy → log(2) ≈ 0.693 : p̂ ≈ 0.5 (uncertain, blurred boundary)
 
         Well-trained CORAL produces low entropy everywhere EXCEPT at the
         transition threshold, indicating clean CDF step-function behaviour.
@@ -332,7 +350,7 @@ class CORALTFTWrapper(pl.LightningModule):
 
     def training_step(self, batch: tuple, batch_idx: int) -> torch.Tensor:
         """
-        Single training iteration with Masked Ordinal BCE Loss.
+        Single training iteration with Masked Ordinal BCE Loss + label smoothing.
 
         Batch structure from TimeSeriesDataSet:
             batch = (x_dict, (y_values, y_weights))
@@ -390,7 +408,7 @@ class CORALTFTWrapper(pl.LightningModule):
 
         loss = self._ordinal_bce_loss(coral_probs, ordinal_labels)
 
-        # Conditional median decoded predictions
+        # Conditional median decoded predictions (fixed τ=0.5 for monitoring)
         y_hat = self.decode_median(coral_probs)            # (B, HORIZON)
 
         # CDF Saturation Entropy (lower = more polarized)
@@ -423,17 +441,11 @@ class CORALTFTWrapper(pl.LightningModule):
 
     def on_validation_epoch_end(self) -> None:
         """
-        V37 Validation Monitor — printed once per epoch after all val batches:
+        Validation Monitor — printed once per epoch after all val batches:
 
           1. CDF Saturation Entropy per drought bin
-             Verify probabilities polarize cleanly toward {0, 1} in extreme
-             bins instead of scattering around blurred means.
-
           2. Per-bin Conditional Median MAE / Bias
-             Drought resolution bins: [0], (0–1], (1–2], (2–3], (3–4], (4–5]
-
-          3. Tail Recovery Delta
-             True labels in [4.0, 5.0]: verify ŷ > 3.5 (escape from 1.0 sink).
+          3. Tail Recovery Delta: true 4.0–5.0 → ŷ > 3.5?
         """
         if not self._val_outputs:
             return
@@ -449,7 +461,7 @@ class CORALTFTWrapper(pl.LightningModule):
         epoch = self.current_epoch
 
         print(f"\n{'='*74}")
-        print(f"  [v37 CORAL Validation Monitor]  Epoch {epoch}")
+        print(f"  [v38 CORAL Validation Monitor]  Epoch {epoch}")
         print(f"{'='*74}")
 
         # ── 1. Overall CDF Saturation Entropy ──────────────────────────────
@@ -459,14 +471,16 @@ class CORALTFTWrapper(pl.LightningModule):
         mean_entropy_overall = h.mean()
 
         # Entropy by drought bin (split probs by true score bracket)
-        bin_defs   = [(0.0, 0.0, "[0]"),
-                      (0.0, 1.0, "(0–1]"),
-                      (1.0, 2.0, "(1–2]"),
-                      (2.0, 3.0, "(2–3]"),
-                      (3.0, 4.0, "(3–4]"),
-                      (4.0, 5.0, "(4–5]")]
+        bin_defs = [
+            (0.0, 0.0, "[0]"),
+            (0.0, 1.0, "(0-1]"),
+            (1.0, 2.0, "(1-2]"),
+            (2.0, 3.0, "(2-3]"),
+            (3.0, 4.0, "(3-4]"),
+            (4.0, 5.0, "(4-5]"),
+        ]
 
-        print(f"\n  CDF Saturation Entropy  (↓ better, log2≈0.693 = random)")
+        print(f"\n  CDF Saturation Entropy  (down better, log2~0.693 = random)")
         print(f"  {'Bin':<10}  {'N':>7}  {'Entropy':>10}  {'Polarized?':>12}")
         print(f"  {'-'*48}")
 
@@ -480,13 +494,13 @@ class CORALTFTWrapper(pl.LightningModule):
                 print(f"  {label:<10}  {0:>7}  {'N/A':>10}  {'N/A':>12}")
                 continue
             bin_h     = h[mask].mean()
-            polarized = "✓ clean" if bin_h < 0.35 else ("≈ ok" if bin_h < 0.5 else "✗ blurred")
+            polarized = "clean" if bin_h < 0.35 else ("ok" if bin_h < 0.5 else "blurred")
             print(f"  {label:<10}  {n:>7,}  {bin_h:>10.4f}  {polarized:>12}")
 
         print(f"\n  Overall entropy : {mean_entropy_overall:.4f}")
 
         # ── 2. Per-bin Conditional Median MAE / Bias ───────────────────────
-        print(f"\n  Conditional Median Decoded Stats (ŷ = Σ I(p≥0.5)·Δt)")
+        print(f"\n  Conditional Median Decoded Stats (y_hat = sum I(p>=0.5)*dt)")
         print(f"  {'Bin':<10}  {'N':>7}  {'MAE':>8}  {'Bias':>8}  "
               f"{'AvgPred':>9}  {'AvgTrue':>9}")
         print(f"  {'-'*62}")
@@ -501,8 +515,8 @@ class CORALTFTWrapper(pl.LightningModule):
                 print(f"  {label:<10}  {0:>7}  {'N/A':>8}  {'N/A':>8}  "
                       f"{'N/A':>9}  {'N/A':>9}")
                 continue
-            mae  = np.abs(all_y_hat[mask] - all_y_true[mask]).mean()
-            bias = (all_y_hat[mask] - all_y_true[mask]).mean()
+            mae      = np.abs(all_y_hat[mask] - all_y_true[mask]).mean()
+            bias     = (all_y_hat[mask] - all_y_true[mask]).mean()
             avg_pred = all_y_hat[mask].mean()
             avg_true = all_y_true[mask].mean()
             print(f"  {label:<10}  {n:>7,}  {mae:>8.4f}  {bias:>8.4f}  "
@@ -510,7 +524,7 @@ class CORALTFTWrapper(pl.LightningModule):
 
         # ── 3. Tail Recovery Delta ─────────────────────────────────────────
         tail_mask = (all_y_true >= 4.0) & (all_y_true <= 5.0)
-        print(f"\n  Tail Recovery Delta  [true label ∈ [4.0, 5.0]]")
+        print(f"\n  Tail Recovery Delta  [true label in [4.0, 5.0]]")
         n_tail = tail_mask.sum()
         if n_tail == 0:
             print(f"  No extreme drought samples in this validation fold.")
@@ -520,20 +534,20 @@ class CORALTFTWrapper(pl.LightningModule):
             tail_mae      = np.abs(tail_preds - all_y_true[tail_mask]).mean()
             tail_avg_pred = tail_preds.mean()
             print(f"  N={n_tail:,}  avg_pred={tail_avg_pred:.4f}  MAE={tail_mae:.4f}"
-                  f"  pred≥3.5: {tail_recovery:.1%}")
+                  f"  pred>=3.5: {tail_recovery:.1%}")
             if tail_recovery >= 0.5:
-                print("  ✓ TAIL RECOVERY ACTIVE — model has escaped the 1.0 anchor sink!")
+                print("  TAIL RECOVERY ACTIVE — model has escaped the 1.0 anchor sink!")
             else:
-                print("  ✗ Tail anchor still dominant "
+                print("  Tail anchor still dominant "
                       "(expected in early epochs; watch entropy trend)")
 
         # ── 4. Global prediction distribution ─────────────────────────────
-        print(f"\n  Global ŷ Distribution:")
+        print(f"\n  Global y_hat Distribution:")
         print(f"  mean={all_y_hat.mean():.4f}  std={all_y_hat.std():.4f}  "
               f"p50={np.percentile(all_y_hat, 50):.4f}  "
               f"p90={np.percentile(all_y_hat, 90):.4f}  "
               f"max={all_y_hat.max():.4f}")
-        print(f"  zero-frac(ŷ) = {(all_y_hat == 0.0).mean():.4f}  |  "
+        print(f"  zero-frac(y_hat) = {(all_y_hat == 0.0).mean():.4f}  |  "
               f"zero-frac(y_true) = {(all_y_true == 0.0).mean():.4f}")
         print(f"{'='*74}\n")
 
@@ -541,26 +555,40 @@ class CORALTFTWrapper(pl.LightningModule):
         self._val_outputs.clear()
 
     # -----------------------------------------------------------------------
-    # Lightning: predict step (inference)
+    # [v38] Lightning: predict step — returns dict for OOF tau-calibration
     # -----------------------------------------------------------------------
 
     def predict_step(
         self,
-        batch      : tuple,
-        batch_idx  : int,
+        batch         : tuple,
+        batch_idx     : int,
         dataloader_idx: int = 0,
-    ) -> torch.Tensor:
+    ) -> dict:
         """
-        Inference step using Conditional Median Decoder.
+        [v38] Inference step returning raw CORAL probabilities and target.
+
+        Returns a dict instead of a decoded tensor to support the OOF
+        grid search calibrator in train.py:
+          - Val predict:  coral_probs + target -> find best_tau by MAE scan
+          - Test predict: coral_probs -> apply best_tau -> decoded_fold
+
+        The tau-decoding (decode_with_tau) is performed externally in train.py
+        after the fold-specific best_tau is determined.
 
         Returns
         -------
-        y_hat : Tensor (B, HORIZON)  — decoded drought forecasts
+        dict with keys:
+            'coral_probs' : Tensor (B, HORIZON, K=50) - raw CDF survival probs
+            'target'      : Tensor (B, HORIZON)        - ground-truth scores
+                            (all-zero dummy for test; valid labels for val)
         """
-        x, _        = batch
-        coral_probs = self(x)                 # (B, HORIZON, K)
-        y_hat       = self.decode_median(coral_probs)   # (B, HORIZON)
-        return y_hat.cpu()
+        x, y_data   = batch
+        y           = y_data[0] if isinstance(y_data, (tuple, list)) else y_data
+        coral_probs = self(x)               # (B, HORIZON, K=50)
+        return {
+            "coral_probs": coral_probs.cpu(),  # (B, HORIZON, 50)
+            "target"     : y.cpu(),            # (B, HORIZON)
+        }
 
     # -----------------------------------------------------------------------
     # Lightning: optimiser configuration
@@ -568,10 +596,10 @@ class CORALTFTWrapper(pl.LightningModule):
 
     def configure_optimizers(self) -> dict:
         """
-        [v37.1] AdamW + 3-epoch Linear Warmup → CosineAnnealingLR(T_max=47).
+        AdamW + 3-epoch Linear Warmup -> CosineAnnealingLR(T_max=47).
 
-        Phase 1 (epochs 0–2): LinearLR ramps lr/3 → lr  (3 epochs)
-        Phase 2 (epochs 3–49): CosineAnnealingLR decays lr → 1e-6 (47 epochs)
+        Phase 1 (epochs 0-2): LinearLR ramps lr/3 -> lr  (3 epochs)
+        Phase 2 (epochs 3-49): CosineAnnealingLR decays lr -> 1e-6 (47 epochs)
         Combined via SequentialLR with milestones=[3].
 
         Optimises BOTH the TFT backbone parameters and the CORAL bias parameters
@@ -619,44 +647,45 @@ class CORALTFTWrapper(pl.LightningModule):
 
     def architecture_summary(self) -> str:
         lines = [
-            "CORALTFTWrapper Architecture (v37 — CORAL Consistent Bias Head + TFT Backbone)",
+            "CORALTFTWrapper Architecture (v38 — Parametric tau-Decoder + OOF Calibration)",
             "=" * 85,
             "",
             "  == TFT Backbone (Feature Extractor) ==",
             "  TemporalFusionTransformer  (pytorch_forecasting)",
-            "    Variable Selection Networks  → gated residual encoding",
-            "    Multi-Head Temporal Self-Attention  → spatio-temporal context",
-            "    Encoder LSTM + Decoder LSTM  → multi-step state propagation",
-            f"    output_size = 1  →  scalar logit  g(H_{{i,t}})  per decoder step",
-            "    INPUT  : (B, 13-week encoder + 5-week decoder, 35 features)",
-            "    OUTPUT : (B, 5, 1)  — scalar logit per prediction week",
+            "    Variable Selection Networks  -> gated residual encoding",
+            "    Multi-Head Temporal Self-Attention  -> spatio-temporal context",
+            "    Encoder LSTM + Decoder LSTM  -> multi-step state propagation",
+            f"    output_size = 1  ->  scalar logit  g(H_{{i,t}})  per decoder step",
+            "    INPUT  : (B, 13-week encoder + 5-week decoder, 37 features)",
+            "    OUTPUT : (B, 5, 1)  -- scalar logit per prediction week",
             "",
             "  == CORAL Consistent Bias Head ==",
             f"  coral_bias_raw  : nn.Parameter  shape ({self.n_ordinal},)  [unconstrained]",
-            f"  get_monotonic_biases():",
-            "    increments = softplus(coral_bias_raw)   → (K,)  positive",
-            "    biases     = -cumsum(increments)         → (K,)  strictly decreasing",
+            "  get_monotonic_biases():",
+            "    increments = softplus(coral_bias_raw)   -> (K,)  positive",
+            "    biases     = -cumsum(increments)         -> (K,)  strictly decreasing",
             "    Guarantees:  b_1 > b_2 > ... > b_K",
             "",
             "  Forward pass:",
             "    scalar_logit     : (B, T=5, 1)    [from TFT backbone]",
             "    biases           : (K=50,)         [CORAL biases]",
-            f"    coral_probs     : (B, 5, {self.n_ordinal})  = σ(scalar + biases)",
-            "    Invariant: p̂_1 ≥ p̂_2 ≥ ... ≥ p̂_K  (monotone survival probs)",
+            f"    coral_probs     : (B, 5, {self.n_ordinal})  = sigma(scalar + biases)",
+            "    Invariant: p1 >= p2 >= ... >= pK  (monotone survival probs)",
             "",
             "  == Masked Ordinal BCE Loss ==",
-            "  z_{ik} = 1 if y_i ≥ t_k, else 0   (50-step binary label vector)",
-            "  L = -1/K ∑_k [ z_k log(p̂_k) + (1-z_k) log(1-p̂_k) ]",
-            "  Zero-sample anti-anchor: absolute-zero inputs → zero-gradient on",
-            "  high-drought bins as p̂ → 0, freeing tail thresholds.",
+            "  z_{ik} = 1 if y_i >= t_k, else 0   (50-step binary label vector)",
+            "  Label smoothing: z_smooth = z * 0.98 + 0.01  in [0.01, 0.99]",
+            "  L = BCE(p_hat, z_smooth)   [prevents overconfidence at hard boundaries]",
             "",
-            "  == Conditional Median Decoder (inference) ==",
-            "  ŷ = Σ_k  I(p̂_k ≥ 0.5) × 0.1",
+            "  == [v38] Parametric tau-Decoder (OOF Calibrated) ==",
+            "  predict_step() -> dict {'coral_probs': (B,5,50), 'target': (B,5)}",
+            "  OOF grid search: tau in np.linspace(0.40, 0.75, 36)  per fold",
+            "  Decode: y_hat = sum_k  I(p_k >= best_tau) * 0.1",
             "",
             "  == Training ==",
             f"  Optimizer  : AdamW(lr={self.lr}, weight_decay=1e-3)",
-            f"  Scheduler  : CosineAnnealingLR(T_max={self.max_epochs}, eta_min=1e-6)",
-            "  Loss       : Masked Ordinal BCE",
+            "  Scheduler  : 3-epoch Linear Warmup -> CosineAnnealingLR(T_max=47)",
+            "  Loss       : Masked Ordinal BCE + label smoothing",
             "",
             f"  Total trainable parameters : {self.count_parameters():,}",
             "=" * 85,
@@ -670,14 +699,14 @@ class CORALTFTWrapper(pl.LightningModule):
 
 class DroughtSequenceNet(nn.Module):
     """
-    v33 Geo-Memory Hybrid Sequence Network  (LEGACY — not used in v37).
+    v33 Geo-Memory Hybrid Sequence Network  (LEGACY — not used in v38).
 
     Three parallel branches:
       - Branch A (Dual-layer Dilated Conv1d):  multi-week local anomaly detector.
       - Branch B (Spatial Dropout + BiLSTM):  long-term cumulative process memory.
       - Branch C (Region Embedding):           16-dim geographical identity vector.
 
-    Retained as legacy alias.  v37 uses CORALTFTWrapper.
+    Retained as legacy alias.  v38 uses CORALTFTWrapper.
     """
 
     def __init__(

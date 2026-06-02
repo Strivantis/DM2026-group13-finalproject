@@ -1,0 +1,582 @@
+=================================================================================================
+Drought Forecasting Pipeline  v38  (CORAL-TFT — Parametric tau-Decoder + OOF Calibration)
+Model   : CORALTFTWrapper  (TemporalFusionTransformer + CORAL Consistent Bias Head)
+Input   : Raw 13-week sequential meteorological windows per region
+          37 unknown reals | 2 known reals (sin/cos) | NO Z-score normalisation
+Backbone: TFT (output_size=1) -> scalar logit per step
+CORAL   : K=50 thresholds dt=0.1 -> [0.1...5.0]
+Loss    : Masked Ordinal BCE  z_{ik}=1 iff y>=t_k | Anti-anchor zero-mass gradient
+[v38] Decode  : Parametric tau-Decoder  y_hat = sum_k I(p_k >= best_tau) * 0.1
+[v38] Calibrate: OOF 1D Grid Search  tau in [0.40, 0.75] (36 candidates) per fold
+Ensemble: 5-Fold Rolling CV  ->  np.median(decoded, axis=0)
+Clip    : np.clip(0.0, 5.0)  physical constraint
+=================================================================================================
+
+TFT Backbone Architecture:
+  hidden_size            = 64
+  attention_head_size    = 4
+  dropout                = 0.2
+  hidden_continuous_size = 32
+  output_size            = 1  (scalar logit; QuantileLoss([0.5]) sizing placeholder)
+  learning_rate          = 0.002  (AdamW; CosineAnnealingLR in CORALTFTWrapper)
+  max_epochs             = 50
+  batch_size             = 1024
+
+5-Fold Rolling Time-Based CV Boundaries:
+  Fold 0: train time_idx [0, 756]  →  val time_idx [757, 761]
+  Fold 1: train time_idx [0, 761]  →  val time_idx [762, 766]
+  Fold 2: train time_idx [0, 766]  →  val time_idx [767, 771]
+  Fold 3: train time_idx [0, 771]  →  val time_idx [772, 776]
+  Fold 4: train time_idx [0, 776]  →  val time_idx [777, 781]
+
+Loading processed data ...
+  train_df : (1757936, 45)  |  test_df : (29224, 45)
+  train regions : 2,248
+  test  regions : 2,248
+
+[v38.3] Regional Prior Dictionary Loaded:
+  Source   : /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/data/processed/region_priors.csv
+  Regions  : 2,248 entries
+  zero_prob range : [0.0908, 0.9156]  mean=0.5963
+  Fallback  : 0.5963 (macro mean) for any missing region_id
+
+[Training Target Distribution]
+  mean=0.8357  std=1.2615  min=0.0000  max=5.0000
+  Zero-fraction : 0.5963  (1,048,333 rows)  — the 1.0 Anchor Degradation source
+  Non-zero      : 0.4037  (709,603 rows)
+  p90=3.0000  p99=5.0000  tail(≥4.0)=101,396 rows
+
+[v37] Ordinal CDF Encoding Preview:
+  K=50 thresholds step Δt=0.1
+  y=0.0 → z=[0,0,...,0]  (all-zero, 59.63% of training samples)
+  y=2.3 → z=[1 (×23), 0 (×27)]  (moderate drought)
+  y=4.5 → z=[1 (×45), 0 (×5)]   (extreme drought)
+  y=5.0 → z=[1,1,...,1]           (maximum drought)
+
+=================================================================================================
+5-Fold Rolling Time-Based CORAL-TFT Training
+  Each fold trains a CORALTFTWrapper using Masked Ordinal BCE.
+  Conditional Median decoded predictions are collected per fold.
+  5-fold decoded arrays are median-ensembled post-training.
+=================================================================================================
+
+=================================================================================================
+FOLD 1 / 5  [CORAL-TFT Rolling CV]
+  train time_idx : [0, 756]  (= 757 weeks × 2248 regions)
+  val   time_idx : [757, 761]  (= 5 weeks × 2248 regions)
+=================================================================================================
+
+  Building TimeSeriesDataSet (training fold 0) ...
+  Building TimeSeriesDataSet (validation fold 0) ...
+  training dataset size      : 1,663,520 samples
+  validation dataset size    : 2,248 samples
+
+  Building test inference TimeSeriesDataSet (fold 0 encoders) ...
+  test inference dataset size: 2,248 samples (= 2248 regions × 1 window)
+
+  Initialising TFT backbone (output_size=1, fold 0) ...
+  TFT backbone parameter count: 682,881
+
+  Wrapping TFT in CORALTFTWrapper (fold 0) ...
+CORALTFTWrapper Architecture (v38 — Parametric tau-Decoder + OOF Calibration)
+=====================================================================================
+
+  == TFT Backbone (Feature Extractor) ==
+  TemporalFusionTransformer  (pytorch_forecasting)
+    Variable Selection Networks  -> gated residual encoding
+    Multi-Head Temporal Self-Attention  -> spatio-temporal context
+    Encoder LSTM + Decoder LSTM  -> multi-step state propagation
+    output_size = 1  ->  scalar logit  g(H_{i,t})  per decoder step
+    INPUT  : (B, 13-week encoder + 5-week decoder, 37 features)
+    OUTPUT : (B, 5, 1)  -- scalar logit per prediction week
+
+  == CORAL Consistent Bias Head ==
+  coral_bias_raw  : nn.Parameter  shape (50,)  [unconstrained]
+  get_monotonic_biases():
+    increments = softplus(coral_bias_raw)   -> (K,)  positive
+    biases     = -cumsum(increments)         -> (K,)  strictly decreasing
+    Guarantees:  b_1 > b_2 > ... > b_K
+
+  Forward pass:
+    scalar_logit     : (B, T=5, 1)    [from TFT backbone]
+    biases           : (K=50,)         [CORAL biases]
+    coral_probs     : (B, 5, 50)  = sigma(scalar + biases)
+    Invariant: p1 >= p2 >= ... >= pK  (monotone survival probs)
+
+  == Masked Ordinal BCE Loss ==
+  z_{ik} = 1 if y_i >= t_k, else 0   (50-step binary label vector)
+  Label smoothing: z_smooth = z * 0.98 + 0.01  in [0.01, 0.99]
+  L = BCE(p_hat, z_smooth)   [prevents overconfidence at hard boundaries]
+
+  == [v38] Parametric tau-Decoder (OOF Calibrated) ==
+  predict_step() -> dict {'coral_probs': (B,5,50), 'target': (B,5)}
+  OOF grid search: tau in np.linspace(0.40, 0.75, 36)  per fold
+  Decode: y_hat = sum_k  I(p_k >= best_tau) * 0.1
+
+  == Training ==
+  Optimizer  : AdamW(lr=0.002, weight_decay=1e-3)
+  Scheduler  : 3-epoch Linear Warmup -> CosineAnnealingLR(T_max=47)
+  Loss       : Masked Ordinal BCE + label smoothing
+
+  Total trainable parameters : 682,931
+=====================================================================================
+  Total CORAL-TFT parameter count: 682,931
+  CORAL bias_raw initial shape    : (50,)
+
+  Fitting CORALTFTWrapper (fold 0)  ...  [max_epochs=50, early_stop patience=5]
+  Loss: Masked Ordinal BCE  |  Decode: Conditional Median  ŷ=Σ I(p≥0.5)·0.1
+
+  [Fold 0] Training complete.
+  Stopped at epoch      : 14
+  Best val_loss (BCE)   : 0.218460
+  CORAL biases [b_1..b_50]:
+    b_1 (lowest threshold)  = -0.6468
+    b_25 (mid threshold)    = -4.9850
+    b_50 (highest threshold)= -8.8263
+    range = [-8.8263, -0.6468]  (monotone: True)
+
+  [v38] Running OOF val predict for tau calibration (fold 0) ...
+  ==> [Fold 0 Calibrated] Best Tau = 0.5300 | Val OOF MAE = 0.4509
+  tau grid search range: [0.40, 0.75]  (36 candidates)
+
+  [v38.3] Running test inference (fold 0) — Per-Region tau_i Calibration ...
+  decoded_fold shape      : (2248, 5)
+  [v38.3] Per-region tau_i stats:
+    mean=0.6525  std=0.1299  min=0.4500  max=0.7500
+    at_guardrail_low(0.45)  : 0 regions
+    at_guardrail_high(0.75) : 1,271 regions
+  decoded_fold stats [v38.3 per-region tau_i]:
+    mean=0.8748  std=0.9210  min=0.0000  max=5.0000
+    zero-frac = 0.3771  p90=2.0000  p99=4.0000
+  Fold 0 elapsed : 6120.7s  (102.0 min)
+
+=================================================================================================
+FOLD 2 / 5  [CORAL-TFT Rolling CV]
+  train time_idx : [0, 761]  (= 762 weeks × 2248 regions)
+  val   time_idx : [762, 766]  (= 5 weeks × 2248 regions)
+=================================================================================================
+
+  Building TimeSeriesDataSet (training fold 1) ...
+  Building TimeSeriesDataSet (validation fold 1) ...
+  training dataset size      : 1,674,760 samples
+  validation dataset size    : 2,248 samples
+
+  Initialising TFT backbone (output_size=1, fold 1) ...
+  TFT backbone parameter count: 682,881
+
+  Wrapping TFT in CORALTFTWrapper (fold 1) ...
+CORALTFTWrapper Architecture (v38 — Parametric tau-Decoder + OOF Calibration)
+=====================================================================================
+
+  == TFT Backbone (Feature Extractor) ==
+  TemporalFusionTransformer  (pytorch_forecasting)
+    Variable Selection Networks  -> gated residual encoding
+    Multi-Head Temporal Self-Attention  -> spatio-temporal context
+    Encoder LSTM + Decoder LSTM  -> multi-step state propagation
+    output_size = 1  ->  scalar logit  g(H_{i,t})  per decoder step
+    INPUT  : (B, 13-week encoder + 5-week decoder, 37 features)
+    OUTPUT : (B, 5, 1)  -- scalar logit per prediction week
+
+  == CORAL Consistent Bias Head ==
+  coral_bias_raw  : nn.Parameter  shape (50,)  [unconstrained]
+  get_monotonic_biases():
+    increments = softplus(coral_bias_raw)   -> (K,)  positive
+    biases     = -cumsum(increments)         -> (K,)  strictly decreasing
+    Guarantees:  b_1 > b_2 > ... > b_K
+
+  Forward pass:
+    scalar_logit     : (B, T=5, 1)    [from TFT backbone]
+    biases           : (K=50,)         [CORAL biases]
+    coral_probs     : (B, 5, 50)  = sigma(scalar + biases)
+    Invariant: p1 >= p2 >= ... >= pK  (monotone survival probs)
+
+  == Masked Ordinal BCE Loss ==
+  z_{ik} = 1 if y_i >= t_k, else 0   (50-step binary label vector)
+  Label smoothing: z_smooth = z * 0.98 + 0.01  in [0.01, 0.99]
+  L = BCE(p_hat, z_smooth)   [prevents overconfidence at hard boundaries]
+
+  == [v38] Parametric tau-Decoder (OOF Calibrated) ==
+  predict_step() -> dict {'coral_probs': (B,5,50), 'target': (B,5)}
+  OOF grid search: tau in np.linspace(0.40, 0.75, 36)  per fold
+  Decode: y_hat = sum_k  I(p_k >= best_tau) * 0.1
+
+  == Training ==
+  Optimizer  : AdamW(lr=0.002, weight_decay=1e-3)
+  Scheduler  : 3-epoch Linear Warmup -> CosineAnnealingLR(T_max=47)
+  Loss       : Masked Ordinal BCE + label smoothing
+
+  Total trainable parameters : 682,931
+=====================================================================================
+  Total CORAL-TFT parameter count: 682,931
+  CORAL bias_raw initial shape    : (50,)
+
+  Fitting CORALTFTWrapper (fold 1)  ...  [max_epochs=50, early_stop patience=5]
+  Loss: Masked Ordinal BCE  |  Decode: Conditional Median  ŷ=Σ I(p≥0.5)·0.1
+
+  [Fold 1] Training complete.
+  Stopped at epoch      : 10
+  Best val_loss (BCE)   : 0.254011
+  CORAL biases [b_1..b_50]:
+    b_1 (lowest threshold)  = -0.6438
+    b_25 (mid threshold)    = -4.8246
+    b_50 (highest threshold)= -8.5432
+    range = [-8.5432, -0.6438]  (monotone: True)
+
+  [v38] Running OOF val predict for tau calibration (fold 1) ...
+  ==> [Fold 1 Calibrated] Best Tau = 0.4800 | Val OOF MAE = 0.5166
+  tau grid search range: [0.40, 0.75]  (36 candidates)
+
+  [v38.3] Running test inference (fold 1) — Per-Region tau_i Calibration ...
+  decoded_fold shape      : (2248, 5)
+  [v38.3] Per-region tau_i stats:
+    mean=0.6555  std=0.1286  min=0.4500  max=0.7500
+    at_guardrail_low(0.45)  : 0 regions
+    at_guardrail_high(0.75) : 1,293 regions
+  decoded_fold stats [v38.3 per-region tau_i]:
+    mean=0.8208  std=0.8959  min=0.0000  max=5.0000
+    zero-frac = 0.3819  p90=2.0000  p99=4.0000
+  Fold 1 elapsed : 6471.0s  (107.8 min)
+
+=================================================================================================
+FOLD 3 / 5  [CORAL-TFT Rolling CV]
+  train time_idx : [0, 766]  (= 767 weeks × 2248 regions)
+  val   time_idx : [767, 771]  (= 5 weeks × 2248 regions)
+=================================================================================================
+
+  Building TimeSeriesDataSet (training fold 2) ...
+  Building TimeSeriesDataSet (validation fold 2) ...
+  training dataset size      : 1,686,000 samples
+  validation dataset size    : 2,248 samples
+
+  Initialising TFT backbone (output_size=1, fold 2) ...
+  TFT backbone parameter count: 682,881
+
+  Wrapping TFT in CORALTFTWrapper (fold 2) ...
+CORALTFTWrapper Architecture (v38 — Parametric tau-Decoder + OOF Calibration)
+=====================================================================================
+
+  == TFT Backbone (Feature Extractor) ==
+  TemporalFusionTransformer  (pytorch_forecasting)
+    Variable Selection Networks  -> gated residual encoding
+    Multi-Head Temporal Self-Attention  -> spatio-temporal context
+    Encoder LSTM + Decoder LSTM  -> multi-step state propagation
+    output_size = 1  ->  scalar logit  g(H_{i,t})  per decoder step
+    INPUT  : (B, 13-week encoder + 5-week decoder, 37 features)
+    OUTPUT : (B, 5, 1)  -- scalar logit per prediction week
+
+  == CORAL Consistent Bias Head ==
+  coral_bias_raw  : nn.Parameter  shape (50,)  [unconstrained]
+  get_monotonic_biases():
+    increments = softplus(coral_bias_raw)   -> (K,)  positive
+    biases     = -cumsum(increments)         -> (K,)  strictly decreasing
+    Guarantees:  b_1 > b_2 > ... > b_K
+
+  Forward pass:
+    scalar_logit     : (B, T=5, 1)    [from TFT backbone]
+    biases           : (K=50,)         [CORAL biases]
+    coral_probs     : (B, 5, 50)  = sigma(scalar + biases)
+    Invariant: p1 >= p2 >= ... >= pK  (monotone survival probs)
+
+  == Masked Ordinal BCE Loss ==
+  z_{ik} = 1 if y_i >= t_k, else 0   (50-step binary label vector)
+  Label smoothing: z_smooth = z * 0.98 + 0.01  in [0.01, 0.99]
+  L = BCE(p_hat, z_smooth)   [prevents overconfidence at hard boundaries]
+
+  == [v38] Parametric tau-Decoder (OOF Calibrated) ==
+  predict_step() -> dict {'coral_probs': (B,5,50), 'target': (B,5)}
+  OOF grid search: tau in np.linspace(0.40, 0.75, 36)  per fold
+  Decode: y_hat = sum_k  I(p_k >= best_tau) * 0.1
+
+  == Training ==
+  Optimizer  : AdamW(lr=0.002, weight_decay=1e-3)
+  Scheduler  : 3-epoch Linear Warmup -> CosineAnnealingLR(T_max=47)
+  Loss       : Masked Ordinal BCE + label smoothing
+
+  Total trainable parameters : 682,931
+=====================================================================================
+  Total CORAL-TFT parameter count: 682,931
+  CORAL bias_raw initial shape    : (50,)
+
+  Fitting CORALTFTWrapper (fold 2)  ...  [max_epochs=50, early_stop patience=5]
+  Loss: Masked Ordinal BCE  |  Decode: Conditional Median  ŷ=Σ I(p≥0.5)·0.1
+
+  [Fold 2] Training complete.
+  Stopped at epoch      : 10
+  Best val_loss (BCE)   : 0.216325
+  CORAL biases [b_1..b_50]:
+    b_1 (lowest threshold)  = -0.6468
+    b_25 (mid threshold)    = -4.8056
+    b_50 (highest threshold)= -8.5331
+    range = [-8.5331, -0.6468]  (monotone: True)
+
+  [v38] Running OOF val predict for tau calibration (fold 2) ...
+  ==> [Fold 2 Calibrated] Best Tau = 0.5700 | Val OOF MAE = 0.4439
+  tau grid search range: [0.40, 0.75]  (36 candidates)
+
+  [v38.3] Running test inference (fold 2) — Per-Region tau_i Calibration ...
+  decoded_fold shape      : (2248, 5)
+  [v38.3] Per-region tau_i stats:
+    mean=0.6526  std=0.1303  min=0.4500  max=0.7500
+    at_guardrail_low(0.45)  : 0 regions
+    at_guardrail_high(0.75) : 1,294 regions
+  decoded_fold stats [v38.3 per-region tau_i]:
+    mean=0.9324  std=1.0648  min=0.0000  max=5.0000
+    zero-frac = 0.3718  p90=2.0000  p99=5.0000
+  Fold 2 elapsed : 4433.3s  (73.9 min)
+
+=================================================================================================
+FOLD 4 / 5  [CORAL-TFT Rolling CV]
+  train time_idx : [0, 771]  (= 772 weeks × 2248 regions)
+  val   time_idx : [772, 776]  (= 5 weeks × 2248 regions)
+=================================================================================================
+
+  Building TimeSeriesDataSet (training fold 3) ...
+  Building TimeSeriesDataSet (validation fold 3) ...
+  training dataset size      : 1,697,240 samples
+  validation dataset size    : 2,248 samples
+
+  Initialising TFT backbone (output_size=1, fold 3) ...
+  TFT backbone parameter count: 682,881
+
+  Wrapping TFT in CORALTFTWrapper (fold 3) ...
+CORALTFTWrapper Architecture (v38 — Parametric tau-Decoder + OOF Calibration)
+=====================================================================================
+
+  == TFT Backbone (Feature Extractor) ==
+  TemporalFusionTransformer  (pytorch_forecasting)
+    Variable Selection Networks  -> gated residual encoding
+    Multi-Head Temporal Self-Attention  -> spatio-temporal context
+    Encoder LSTM + Decoder LSTM  -> multi-step state propagation
+    output_size = 1  ->  scalar logit  g(H_{i,t})  per decoder step
+    INPUT  : (B, 13-week encoder + 5-week decoder, 37 features)
+    OUTPUT : (B, 5, 1)  -- scalar logit per prediction week
+
+  == CORAL Consistent Bias Head ==
+  coral_bias_raw  : nn.Parameter  shape (50,)  [unconstrained]
+  get_monotonic_biases():
+    increments = softplus(coral_bias_raw)   -> (K,)  positive
+    biases     = -cumsum(increments)         -> (K,)  strictly decreasing
+    Guarantees:  b_1 > b_2 > ... > b_K
+
+  Forward pass:
+    scalar_logit     : (B, T=5, 1)    [from TFT backbone]
+    biases           : (K=50,)         [CORAL biases]
+    coral_probs     : (B, 5, 50)  = sigma(scalar + biases)
+    Invariant: p1 >= p2 >= ... >= pK  (monotone survival probs)
+
+  == Masked Ordinal BCE Loss ==
+  z_{ik} = 1 if y_i >= t_k, else 0   (50-step binary label vector)
+  Label smoothing: z_smooth = z * 0.98 + 0.01  in [0.01, 0.99]
+  L = BCE(p_hat, z_smooth)   [prevents overconfidence at hard boundaries]
+
+  == [v38] Parametric tau-Decoder (OOF Calibrated) ==
+  predict_step() -> dict {'coral_probs': (B,5,50), 'target': (B,5)}
+  OOF grid search: tau in np.linspace(0.40, 0.75, 36)  per fold
+  Decode: y_hat = sum_k  I(p_k >= best_tau) * 0.1
+
+  == Training ==
+  Optimizer  : AdamW(lr=0.002, weight_decay=1e-3)
+  Scheduler  : 3-epoch Linear Warmup -> CosineAnnealingLR(T_max=47)
+  Loss       : Masked Ordinal BCE + label smoothing
+
+  Total trainable parameters : 682,931
+=====================================================================================
+  Total CORAL-TFT parameter count: 682,931
+  CORAL bias_raw initial shape    : (50,)
+
+  Fitting CORALTFTWrapper (fold 3)  ...  [max_epochs=50, early_stop patience=5]
+  Loss: Masked Ordinal BCE  |  Decode: Conditional Median  ŷ=Σ I(p≥0.5)·0.1
+
+  [Fold 3] Training complete.
+  Stopped at epoch      : 7
+  Best val_loss (BCE)   : 0.214463
+  CORAL biases [b_1..b_50]:
+    b_1 (lowest threshold)  = -0.6488
+    b_25 (mid threshold)    = -4.6275
+    b_50 (highest threshold)= -8.2274
+    range = [-8.2274, -0.6488]  (monotone: True)
+
+  [v38] Running OOF val predict for tau calibration (fold 3) ...
+  ==> [Fold 3 Calibrated] Best Tau = 0.7500 | Val OOF MAE = 0.3605
+  tau grid search range: [0.40, 0.75]  (36 candidates)
+
+  [v38.3] Running test inference (fold 3) — Per-Region tau_i Calibration ...
+  decoded_fold shape      : (2248, 5)
+  [v38.3] Per-region tau_i stats:
+    mean=0.6681  std=0.1210  min=0.4500  max=0.7500
+    at_guardrail_low(0.45)  : 0 regions
+    at_guardrail_high(0.75) : 1,358 regions
+  decoded_fold stats [v38.3 per-region tau_i]:
+    mean=0.9272  std=1.0345  min=0.0000  max=5.0000
+    zero-frac = 0.3403  p90=2.1000  p99=4.1000
+  Fold 3 elapsed : 3109.2s  (51.8 min)
+
+=================================================================================================
+FOLD 5 / 5  [CORAL-TFT Rolling CV]
+  train time_idx : [0, 776]  (= 777 weeks × 2248 regions)
+  val   time_idx : [777, 781]  (= 5 weeks × 2248 regions)
+=================================================================================================
+
+  Building TimeSeriesDataSet (training fold 4) ...
+  Building TimeSeriesDataSet (validation fold 4) ...
+  training dataset size      : 1,708,480 samples
+  validation dataset size    : 2,248 samples
+
+  Initialising TFT backbone (output_size=1, fold 4) ...
+  TFT backbone parameter count: 682,881
+
+  Wrapping TFT in CORALTFTWrapper (fold 4) ...
+CORALTFTWrapper Architecture (v38 — Parametric tau-Decoder + OOF Calibration)
+=====================================================================================
+
+  == TFT Backbone (Feature Extractor) ==
+  TemporalFusionTransformer  (pytorch_forecasting)
+    Variable Selection Networks  -> gated residual encoding
+    Multi-Head Temporal Self-Attention  -> spatio-temporal context
+    Encoder LSTM + Decoder LSTM  -> multi-step state propagation
+    output_size = 1  ->  scalar logit  g(H_{i,t})  per decoder step
+    INPUT  : (B, 13-week encoder + 5-week decoder, 37 features)
+    OUTPUT : (B, 5, 1)  -- scalar logit per prediction week
+
+  == CORAL Consistent Bias Head ==
+  coral_bias_raw  : nn.Parameter  shape (50,)  [unconstrained]
+  get_monotonic_biases():
+    increments = softplus(coral_bias_raw)   -> (K,)  positive
+    biases     = -cumsum(increments)         -> (K,)  strictly decreasing
+    Guarantees:  b_1 > b_2 > ... > b_K
+
+  Forward pass:
+    scalar_logit     : (B, T=5, 1)    [from TFT backbone]
+    biases           : (K=50,)         [CORAL biases]
+    coral_probs     : (B, 5, 50)  = sigma(scalar + biases)
+    Invariant: p1 >= p2 >= ... >= pK  (monotone survival probs)
+
+  == Masked Ordinal BCE Loss ==
+  z_{ik} = 1 if y_i >= t_k, else 0   (50-step binary label vector)
+  Label smoothing: z_smooth = z * 0.98 + 0.01  in [0.01, 0.99]
+  L = BCE(p_hat, z_smooth)   [prevents overconfidence at hard boundaries]
+
+  == [v38] Parametric tau-Decoder (OOF Calibrated) ==
+  predict_step() -> dict {'coral_probs': (B,5,50), 'target': (B,5)}
+  OOF grid search: tau in np.linspace(0.40, 0.75, 36)  per fold
+  Decode: y_hat = sum_k  I(p_k >= best_tau) * 0.1
+
+  == Training ==
+  Optimizer  : AdamW(lr=0.002, weight_decay=1e-3)
+  Scheduler  : 3-epoch Linear Warmup -> CosineAnnealingLR(T_max=47)
+  Loss       : Masked Ordinal BCE + label smoothing
+
+  Total trainable parameters : 682,931
+=====================================================================================
+  Total CORAL-TFT parameter count: 682,931
+  CORAL bias_raw initial shape    : (50,)
+
+  Fitting CORALTFTWrapper (fold 4)  ...  [max_epochs=50, early_stop patience=5]
+  Loss: Masked Ordinal BCE  |  Decode: Conditional Median  ŷ=Σ I(p≥0.5)·0.1
+
+  [Fold 4] Training complete.
+  Stopped at epoch      : 10
+  Best val_loss (BCE)   : 0.134237
+  CORAL biases [b_1..b_50]:
+    b_1 (lowest threshold)  = -0.6469
+    b_25 (mid threshold)    = -4.8133
+    b_50 (highest threshold)= -8.5186
+    range = [-8.5186, -0.6469]  (monotone: True)
+
+  [v38] Running OOF val predict for tau calibration (fold 4) ...
+  ==> [Fold 4 Calibrated] Best Tau = 0.4500 | Val OOF MAE = 0.2427
+  tau grid search range: [0.40, 0.75]  (36 candidates)
+
+  [v38.3] Running test inference (fold 4) — Per-Region tau_i Calibration ...
+  decoded_fold shape      : (2248, 5)
+  [v38.3] Per-region tau_i stats:
+    mean=0.6539  std=0.1278  min=0.4500  max=0.7500
+    at_guardrail_low(0.45)  : 0 regions
+    at_guardrail_high(0.75) : 1,272 regions
+  decoded_fold stats [v38.3 per-region tau_i]:
+    mean=0.8654  std=0.9097  min=0.0000  max=5.0000
+    zero-frac = 0.3673  p90=2.0000  p99=4.0000
+  Fold 4 elapsed : 4468.7s  (74.5 min)
+
+=================================================================================================
+5-Fold Rolling CV Summary  [v37 CORAL-TFT Masked Ordinal BCE]
+=================================================================================================
+  Fold 0: best val_loss (Ordinal BCE) = 0.218460
+  Fold 1: best val_loss (Ordinal BCE) = 0.254011
+  Fold 2: best val_loss (Ordinal BCE) = 0.216325
+  Fold 3: best val_loss (Ordinal BCE) = 0.214463
+  Fold 4: best val_loss (Ordinal BCE) = 0.134237
+
+  Mean val_loss : 0.207499  ±  0.039439
+  Best fold     : 4 (val_loss = 0.134237)
+
+=================================================================================================
+[v37] 5-Fold Conditional Median Ensemble Compression
+  Strategy: np.median(all_fold_decoded, axis=0)
+  Each fold produces ŷ = Σ_k I(p̂_k≥0.5)·0.1 (step 0.1, K=50)
+=================================================================================================
+  decoded_stack shape : (5, 2248, 5)
+  final_preds shape   : (2248, 5)
+  Pre-clip stats: mean=0.8447  std=0.8894  min=0.0000  max=5.0000
+
+  Per-fold zero-fraction of decoded predictions:
+    Fold 0: zero-frac=0.3771  p90=2.0000  max=5.0000
+    Fold 1: zero-frac=0.3819  p90=2.0000  max=5.0000
+    Fold 2: zero-frac=0.3718  p90=2.0000  max=5.0000
+    Fold 3: zero-frac=0.3403  p90=2.1000  max=5.0000
+    Fold 4: zero-frac=0.3673  p90=2.0000  max=5.0000
+
+  Post-clip stats [0, 5] (no zero-floor in v37 — ordinal BCE handles zeros):
+    mean=0.8447  std=0.8894  min=0.0000  max=5.0000
+    zero-frac = 0.3593
+
+=================================================================================================
+[v37] Test Set 6-Tier Binned Distribution Audit
+=================================================================================================
+
+  ==========================================================================================
+  TEST SET BINNED PREDICTION MATRIX  [v37 CORAL-TFT Conditional Median Inference]
+  Empirical distribution of median-ensembled, clipped decoded predictions
+  ==========================================================================================
+  Bin / Drought Category                                   Count    % Share    AvgPred    MinPred    MaxPred
+  ----------------------------------------------------------------------------------------
+  Bin 0  [Absolute Zero       preds == 0.0        ]        4,038     35.93%     0.0000     0.0000     0.0000
+  Bin 1  [Mild Drought        0.0 < preds <= 1.0  ]        4,638     41.26%     0.8582     0.1000     1.0000
+  Bin 2  [Moderate Drought    1.0 < preds <= 2.0  ]        1,855     16.50%     1.7956     1.1000     2.0000
+  Bin 3  [Severe Drought      2.0 < preds <= 3.0  ]          559      4.97%     2.8687     2.1000     3.0000
+  Bin 4  [Extreme Drought     3.0 < preds <= 4.0  ]          143      1.27%     3.8161     3.1000     4.0000
+  Bin 5  [Exceptional Drought 4.0 < preds <= 5.0  ]            7      0.06%     4.8714     4.1000     5.0000
+  ----------------------------------------------------------------------------------------
+  Total predictions : 11,240
+  Exact-zero fraction: 0.3593  (4,038 of 11,240)
+  Non-zero fraction  : 0.6407  (7,202 of 11,240)
+  Mean  : 0.8447  Std : 0.8894
+  p50   : 1.0000  p90  : 2.0000  p99  : 3.9610  Max : 5.0000
+  ==========================================================================================
+
+[v37 Submission Prediction Diagnostics  — Conditional Median Decoded]
+  n=11,240  mean=0.8447  std=0.8894
+  p50=1.0000  p75=1.0000  p90=2.0000  p95=3.0000  p99=3.9610  max=5.0000
+  Exact zero fraction: 0.3593
+  ✓ p99 >= 1.5 — prediction dynamic range is healthy.
+  Predictions ≥ 3.5 (tail recovery signal) : 0.0109  (122 / 11,240)
+  ✓ Non-trivial tail recovery detected — escaped 1.0 anchor sink!
+
+Formatting submission.csv ...
+  ✓ Submission assertion passed: 2248 rows, 6 columns.
+  ✓ No NaN values in submission.
+  ✓ All predictions in [0, 5]  (np.clip physical guard enforced).
+
+  submission.csv  →  /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/submission.csv
+  Rows (excl. header): 2248
+  Columns: ['region_id', 'pred_week1', 'pred_week2', 'pred_week3', 'pred_week4', 'pred_week5']
+
+  Preview:
+region_id  pred_week1  pred_week2  pred_week3  pred_week4  pred_week5
+       R1         0.5         0.1         0.0         0.0         0.0
+    R1001         1.0         1.0         1.0         1.0         1.0
+    R1002         1.0         1.0         1.4         1.9         1.0
+    R1005         1.0         1.0         0.0         0.0         0.0
+    R1006         1.0         1.0         1.0         0.0         0.0
+
+Total elapsed: 24607.6s  (410.1 min)

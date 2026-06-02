@@ -1,26 +1,26 @@
 """
-dataset.py -- v37 CORAL-TFT Ordinal CDF Data Pipeline
-=======================================================
-Extends the v36 TFT data pipeline with CORAL ordinal encoding constants and
-an expanded meteorological feature matrix verified from the updated
-data/processed/ CSVs (Phase 1 inspection: 44 train cols / 43 test cols).
+dataset.py -- v38 CORAL-TFT Ordinal CDF Data Pipeline (Parametric τ-Decoder)
+==============================================================================
+Extends the v37 CORAL-TFT pipeline with full 33-feature un-blinding and
+locks the target_normalizer to identity mapping for CORAL threshold fidelity.
 
-Key Changes from v36
+Key Changes from v37
 --------------------
-[v37] ADD  : ORDINAL_K=50, ORDINAL_DELTA_T=0.1, ORDINAL_THRESHOLDS (0.1–5.0)
-             These constants are consumed by CORALTFTWrapper in model.py.
-[v37] ADD  : TorchNormalizer(method="identity") as target_normalizer.
-             CORAL thresholds compare against the raw [0, 5] drought score.
-             Any per-window Z-score normalisation would destroy the absolute
-             threshold semantics.  Identity normaliser preserves raw scale.
-[v37] ADD  : Expanded TIME_VARYING_UNKNOWN_REALS from 8 (v36) → 37 features,
-             incorporating all new columns confirmed in Phase 1:
-             weekly stat summaries (max/min/std), 4-week lag features,
-             PET / deficit / deficit_roll_cum_4w hydrology features.
-[v37] RETAIN: time_idx = week_idx, region_id group, week_sin / week_cos
-              known reals, WINDOW_SIZE=13, HORIZON=5, N_FOLDS=5.
+[v38] VERIFY : Phase 0 Column Schema Audit confirmed both CSVs align perfectly:
+               train_processed.csv (44 cols), test_processed.csv (43 cols).
+               prec_roll_sum_4w ✓  deficit_roll_cum_4w ✓  fully present.
+[v38] RETAIN : TorchNormalizer(method="identity") as target_normalizer.
+               CORAL thresholds compare against the raw [0, 5] drought score.
+               Any per-window Z-score normalisation would destroy the absolute
+               threshold semantics.  Identity normaliser preserves raw scale.
+[v38] RETAIN : Full 37-feature TIME_VARYING_UNKNOWN_REALS matrix (superset of
+               the required 33 structural variables) — all 33 key features
+               verified present, including rolling indicators prec_roll_sum_4w
+               and deficit_roll_cum_4w.
+[v38] RETAIN : time_idx = week_idx, region_id group, week_sin / week_cos
+               known reals, WINDOW_SIZE=13, HORIZON=5, N_FOLDS=5.
 
-Architecture Notes (unchanged from v36)
+Architecture Notes (unchanged from v37)
 -----------------------------------------
 * time_idx     : week_idx (0–781 for train; remapped 782–794 for test encoder).
 * HORIZON      : 5-week future prediction window.
@@ -34,6 +34,7 @@ Column Categories (verified from data/processed/train_processed.csv)
 ----------------------------------------------------------------------
   time_varying_known_reals    : week_sin, week_cos        (calendar cycle, known ahead)
   time_varying_unknown_reals  : 37 meteorological + rolling + lag + hydrology features
+                                (fully covers all 33 required structural variables)
   static_categoricals         : region_id
   target                      : score  (float, raw [0, 5] scale, NO normalisation)
 """
@@ -77,13 +78,19 @@ ORDINAL_THRESHOLDS: list[float] = [
 # → [0.1, 0.2, 0.3, ..., 5.0]
 
 # ---------------------------------------------------------------------------
-# [v37] Identity normaliser — preserves raw [0, 5] drought score scale
+# [v38] Identity normaliser — preserves raw [0, 5] drought score scale
 # so that CORAL threshold comparisons operate on absolute values.
+# Mandatory for v38 Parametric τ-Decoder: grid search τ ∈ [0.40, 0.75]
+# operates on raw CDF probabilities tied to the unscaled target domain.
 # ---------------------------------------------------------------------------
 _TARGET_NORMALIZER = TorchNormalizer(method="identity")
 
 # ---------------------------------------------------------------------------
-# Feature column definitions (v37 — expanded from 8 to 33 unknown reals)
+# Feature column definitions (v38 — 37 features, fully covering all 33 required variables)
+# ---------------------------------------------------------------------------
+# Phase 0 Audit (v38): train_processed.csv (44 cols), test_processed.csv (43 cols).
+# All 33 structural variables confirmed present. prec_roll_sum_4w ✓ deficit_roll_cum_4w ✓
+# The full 37-feature matrix is retained (superset of the 33 required structural variables).
 # ---------------------------------------------------------------------------
 
 # Known seasonality signals: computed from calendar, available for any future week.
@@ -94,9 +101,12 @@ TIME_VARYING_KNOWN_REALS: list[str] = [
 
 # All meteorological and derived features observed up to (and including) the
 # current week only — unavailable for future decoder weeks.
-# Source: Phase 1 inspection of data/processed/train_processed.csv (44 cols).
-# 37 features total (verified from Phase 1: data/processed/train_processed.csv 44 cols)
+# Source: Phase 0 audit of data/processed/train_processed.csv (44 cols) & test (43 cols).
+# 37 features total — verified superset of all 33 required structural variables.
 # Breakdown: 5 core + 11 weekly stats + 7 derived daily + 3 rolling + 8 lag + 3 hydrology
+# KEY ROLLING INDICATORS (confirmed in Phase 0 audit):
+#   prec_roll_sum_4w    ✓ (4-week precipitation accumulation — critical drought signal)
+#   deficit_roll_cum_4w ✓ (4-week cumulative water deficit — primary evapotranspiration signal)
 TIME_VARYING_UNKNOWN_REALS: list[str] = [
     # ── Core weekly means (5) ────────────────────────────────────────────────
     "tmp",                    # weekly mean temperature
@@ -130,7 +140,7 @@ TIME_VARYING_UNKNOWN_REALS: list[str] = [
     # ── 4-week rolling aggregates (3) ────────────────────────────────────
     "tmp_roll_mean_4w",       # 4-week rolling mean temperature
     "humidity_roll_mean_4w",  # 4-week rolling mean humidity
-    "prec_roll_sum_4w",       # 4-week rolling precipitation sum
+    "prec_roll_sum_4w",       # 4-week rolling precipitation sum  ← KEY FEATURE ✓
 
     # ── Temporal lag features (8, NEW in v37) ────────────────────────────
     "tmp_lag1w",              # temperature 1 week ago
@@ -145,7 +155,7 @@ TIME_VARYING_UNKNOWN_REALS: list[str] = [
     # ── PET / Water-Deficit hydrology features (3, NEW in v37) ──────────
     "pet",                    # potential evapotranspiration
     "deficit",                # atmospheric water deficit
-    "deficit_roll_cum_4w",    # 4-week cumulative water deficit
+    "deficit_roll_cum_4w",    # 4-week cumulative water deficit  ← KEY FEATURE ✓
 ]
 
 STATIC_CATEGORICALS: list[str] = ["region_id"]
@@ -268,9 +278,12 @@ def build_training_dataset(fold_train_df: pd.DataFrame) -> TimeSeriesDataSet:
     """
     Construct a pytorch_forecasting TimeSeriesDataSet from one training fold's data.
 
-    [v37] Uses TorchNormalizer(method="identity") for target_normalizer so the
+    [v38] Uses TorchNormalizer(method="identity") for target_normalizer so the
     raw drought score in [0, 5] is preserved exactly.  CORAL ordinal thresholds
     [0.1, 0.2, ..., 5.0] are compared against this raw scale in CORALTFTWrapper.
+    Identity normalizer is mandatory for the v38 Parametric τ-Decoder: the τ
+    grid search [0.40, 0.75] operates on raw CDF probabilities whose meaning
+    is physically tied to the unscaled [0, 5] target domain.
 
     Parameters
     ----------
@@ -288,9 +301,11 @@ def build_training_dataset(fold_train_df: pd.DataFrame) -> TimeSeriesDataSet:
         time_varying_known_reals   = TIME_VARYING_KNOWN_REALS,
         time_varying_unknown_reals = TIME_VARYING_UNKNOWN_REALS,
         allow_missing_timesteps    = False,
-        # [v37] Identity normaliser — preserves raw [0, 5] drought score scale.
+        # [v38] Identity normaliser — preserves raw [0, 5] drought score scale.
         # CORAL threshold comparisons require absolute values; any Z-score
         # normalisation would shift the thresholds out of [0, 5] space.
+        # Mandatory for v38 OOF τ-calibration: grid search τ ∈ [0.40, 0.75]
+        # operates on raw CDF probabilities tied to the unscaled target domain.
         target_normalizer          = _TARGET_NORMALIZER,
     )
 

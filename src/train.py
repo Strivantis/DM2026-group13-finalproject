@@ -244,15 +244,16 @@ def main():
 
     # -- 0. Banner --------------------------------------------------------------
     log("=" * 97)
-    log("Drought Forecasting Pipeline  v37  (CORAL-TFT — Ordinal CDF Paradigm)")
+    log("Drought Forecasting Pipeline  v38  (CORAL-TFT — Parametric tau-Decoder + OOF Calibration)")
     log("Model   : CORALTFTWrapper  (TemporalFusionTransformer + CORAL Consistent Bias Head)")
     log("Input   : Raw 13-week sequential meteorological windows per region")
-    log("          33 unknown reals | 2 known reals (sin/cos) | NO Z-score normalisation")
-    log("Backbone: TFT (output_size=1) → scalar logit per step")
-    log(f"CORAL   : K={ORDINAL_K} thresholds Δt={ORDINAL_DELTA_T} → [{ORDINAL_THRESHOLDS[0]}…{ORDINAL_THRESHOLDS[-1]}]")
-    log("Loss    : Masked Ordinal BCE  z_{ik}=1 iff y≥t_k | Anti-anchor zero-mass gradient")
-    log("Decode  : Conditional Median  ŷ = Σ_k I(p̂_k≥0.5)·0.1")
-    log("Ensemble: 5-Fold Rolling CV  →  np.median(decoded, axis=0)")
+    log("          37 unknown reals | 2 known reals (sin/cos) | NO Z-score normalisation")
+    log("Backbone: TFT (output_size=1) -> scalar logit per step")
+    log(f"CORAL   : K={ORDINAL_K} thresholds dt={ORDINAL_DELTA_T} -> [{ORDINAL_THRESHOLDS[0]}...{ORDINAL_THRESHOLDS[-1]}]")
+    log("Loss    : Masked Ordinal BCE  z_{ik}=1 iff y>=t_k | Anti-anchor zero-mass gradient")
+    log("[v38] Decode  : Parametric tau-Decoder  y_hat = sum_k I(p_k >= best_tau) * 0.1")
+    log("[v38] Calibrate: OOF 1D Grid Search  tau in [0.40, 0.75] (36 candidates) per fold")
+    log("Ensemble: 5-Fold Rolling CV  ->  np.median(decoded, axis=0)")
     log("Clip    : np.clip(0.0, 5.0)  physical constraint")
     log("=" * 97)
     log("")
@@ -280,6 +281,24 @@ def main():
     log(f"  test  regions : {test_df['region_id'].nunique():,}")
     assert train_df["region_id"].nunique() == 2248, "Expected 2248 train regions"
     assert test_df["region_id"].nunique()  == 2248, "Expected 2248 test regions"
+
+    # -- [v38.3] Load regional historical drought structural priors ─────────────
+    # 1. Read regional historical drought structural priors
+    priors_path = os.path.join(ROOT, "data", "processed", "region_priors.csv")
+    if not os.path.exists(priors_path):
+        raise FileNotFoundError(f"找不到先驗字典: {priors_path}")
+    priors_df = pd.read_csv(priors_path)
+
+    # 2. Build explicit map correlation dictionary: region_id -> region_zero_prob
+    region_zero_prob_dict = dict(zip(priors_df["region_id"], priors_df["region_zero_prob"]))
+
+    log(f"\n[v38.3] Regional Prior Dictionary Loaded:")
+    log(f"  Source   : {priors_path}")
+    log(f"  Regions  : {len(region_zero_prob_dict):,} entries")
+    log(f"  zero_prob range : [{min(region_zero_prob_dict.values()):.4f}, "
+        f"{max(region_zero_prob_dict.values()):.4f}]  "
+        f"mean={sum(region_zero_prob_dict.values())/len(region_zero_prob_dict):.4f}")
+    log(f"  Fallback  : 0.5963 (macro mean) for any missing region_id")
 
     # Target distribution summary
     scores = train_df["score"].values
@@ -459,23 +478,103 @@ def main():
         log(f"    range = [{biases_np.min():.4f}, {biases_np.max():.4f}]  "
             f"(monotone: {(np.diff(biases_np) <= 0).all()})")
 
-        # -- 2g. Inference: Conditional Median Decoded predictions ─────────────
-        log(f"\n  Running test inference (fold {fold_k}) — Conditional Median Decoder ...")
-        # trainer.predict() calls coral_model.predict_step() → decode_median()
-        preds_list = trainer.predict(coral_model, test_dataloader)
+        # ======================================================================
+        # [v38] Phase 3: OOF 1D Grid Search Calibrator
+        # After trainer.fit(), use the validation set to find the best tau
+        # that minimises out-of-fold MAE before touching the test horizon.
+        # ======================================================================
+        log(f"\n  [v38] Running OOF val predict for tau calibration (fold {fold_k}) ...")
+        # 1. Isolate the out-of-fold validation set's prediction probabilities and ground-truth values
+        val_predictions = trainer.predict(coral_model, val_dataloader)
+        # val_predictions: list of dicts with keys 'coral_probs' and 'target'
+        val_coral_probs = torch.cat([x["coral_probs"] for x in val_predictions], dim=0).numpy()
+        val_y_true      = torch.cat([x["target"]      for x in val_predictions], dim=0).numpy()
+        # val_coral_probs shape : (N_val, HORIZON, K=50)
+        # val_y_true      shape : (N_val, HORIZON)
 
-        # preds_list: list of (B, HORIZON) CPU tensors per batch
-        # Stack and convert to numpy
-        decoded_fold = torch.cat(preds_list, dim=0).numpy().astype(np.float32)
-        # decoded_fold shape: (2248, 5)
+        # 2. Execute a 1D grid search over 36 evenly spaced candidates to locate the optimal splitting frontier
+        tau_grid    = np.linspace(0.40, 0.75, 36)
+        best_tau    = 0.5
+        min_fold_mae = float("inf")
 
+        for tau in tau_grid:
+            # Utilise the newly refactored parametric decoding logic
+            y_val_pred   = np.sum(val_coral_probs >= tau, axis=-1) * 0.1
+            current_mae  = np.mean(np.abs(val_y_true - y_val_pred))
+
+            if current_mae < min_fold_mae:
+                min_fold_mae = current_mae
+                best_tau     = tau
+
+        log(f"  ==> [Fold {fold_k} Calibrated] Best Tau = {best_tau:.4f} | "
+            f"Val OOF MAE = {min_fold_mae:.4f}")
+
+        # Log tau grid scan summary
+        log(f"  tau grid search range: [{tau_grid[0]:.2f}, {tau_grid[-1]:.2f}]  "
+            f"({len(tau_grid)} candidates)")
+
+        # Free val prediction buffers before test inference
+        del val_predictions, val_coral_probs, val_y_true
+
+        # ======================================================================
+        # [v38] Phase 3 (cont.): Deploy fold-specific best_tau to infer the unseen test horizon
+        # ======================================================================
+        # ======================================================================
+        # [v38.3] Per-Region Percentile Calibration (tau_i) Decoder
+        # Replaces global best_tau with a region-specific threshold derived from
+        # each zone's historical zero-drought density in region_priors.csv.
+        # ======================================================================
+        log(f"\n  [v38.3] Running test inference (fold {fold_k}) — Per-Region tau_i Calibration ...")
+        test_predictions = trainer.predict(coral_model, test_dataloader)
+        # test_predictions: list of dicts with keys 'coral_probs' and 'target'
+        test_coral_probs = torch.cat(
+            [x["coral_probs"] for x in test_predictions], dim=0
+        ).numpy()
+        # test_coral_probs shape: (2248, 5, 50) -> representing σ(logit + b_k)
+        # Ensure 'test_ordered_regions' aligns exactly with the 2248 matrix array sorting order
+
+        decoded_fold_list = []
+        tau_i_values = []   # collect for diagnostics
+        for i, region_id in enumerate(test_ordered_regions):
+            # 1. Retrieve historical zero-score empirical frequency baseline
+            # Fallback to macro expectation 0.5963 if mapping is missing
+            p_zero_prior = region_zero_prob_dict.get(region_id, 0.5963)
+
+            # 2. Extract the continuous 5-week sequence onset probabilities (Bin index 0 mapping >= 0.1)
+            # base_probs shape: (5,)
+            base_probs = test_coral_probs[i, :, 0]
+
+            # 3. Formulate the dynamic target percentile threshold tau_i scaled to 0-100 index range
+            calibrated_tau_i = np.percentile(base_probs, p_zero_prior * 100)
+
+            # 4. Apply physical defense guardrails to insulate local volatility spikes
+            tau_i = np.clip(calibrated_tau_i, 0.45, 0.75)
+
+            # 5. Execute discrete conditional summation using the micro-calibrated tau_i bounds
+            # Step weights of 0.1 apply strictly when survival confidence clears regional threshold
+            region_pred = np.sum(test_coral_probs[i] >= tau_i, axis=-1) * 0.1
+            decoded_fold_list.append(region_pred)
+            tau_i_values.append(float(tau_i))
+
+        # Re-compress historical sequence stack back into matrix architecture of shape (2248, 5)
+        decoded_fold = np.stack(decoded_fold_list, axis=0).astype(np.float32)
+
+        tau_arr = np.array(tau_i_values)
         log(f"  decoded_fold shape      : {decoded_fold.shape}")
-        log(f"  decoded_fold stats:")
+        log(f"  [v38.3] Per-region tau_i stats:")
+        log(f"    mean={tau_arr.mean():.4f}  std={tau_arr.std():.4f}  "
+            f"min={tau_arr.min():.4f}  max={tau_arr.max():.4f}")
+        log(f"    at_guardrail_low(0.45)  : {(tau_arr == 0.45).sum():,} regions")
+        log(f"    at_guardrail_high(0.75) : {(tau_arr == 0.75).sum():,} regions")
+        log(f"  decoded_fold stats [v38.3 per-region tau_i]:")
         log(f"    mean={decoded_fold.mean():.4f}  std={decoded_fold.std():.4f}  "
             f"min={decoded_fold.min():.4f}  max={decoded_fold.max():.4f}")
         log(f"    zero-frac = {(decoded_fold == 0.0).mean():.4f}  "
             f"p90={np.percentile(decoded_fold, 90):.4f}  "
             f"p99={np.percentile(decoded_fold, 99):.4f}")
+
+        # Free test prediction buffer and working lists
+        del test_predictions, test_coral_probs, decoded_fold_list, tau_i_values, tau_arr
 
         all_fold_decoded.append(decoded_fold)
 
@@ -483,32 +582,14 @@ def main():
         log(f"  Fold {fold_k} elapsed : {fold_elapsed:.1f}s  ({fold_elapsed/60:.1f} min)")
 
         # ======================================================================
-        # [v37.1 新增] 系統級垃圾回收與記憶體清空 (防禦跨 Fold Memory Leak)
+        # [v38] Phase 4: Hard RAM/VRAM Memory Purge Defense
+        # Eliminate PyTorch Lightning background process cache build-ups and
+        # prevent segmentation faults during multiple fold execution handshakes.
         # ======================================================================
         import gc
-        
-        # 1. 斷開當前折的佔用大量記憶體的物件引用
-        del trainer
-        del coral_model
-        del tft_backbone
-        del train_dataloader
-        del val_dataloader
-        if fold_k != 0: # fold 0 的 test_dataloader 還要保留給後面用
-            # 如果你在迴圈內有重建 test_dataloader，才需要刪除它。
-            # 根據你目前的程式碼，test_dataloader 只有在 fold 0 建立，後面重複使用，
-            # 所以不要刪除 test_dataloader, test_dataset, training_dataset, val_dataset
-            pass
-        
-        # 刪除佔據大記憶體的 Dataset 物件
-        del training_dataset
-        del val_dataset
-        del fold_train_df
-        del fold_ctx_df
-
-        # 2. 強制引發 Python 系統級垃圾回收（釋放主記憶體 RAM / /dev/shm）
+        del trainer, coral_model, train_dataloader, val_dataloader, training_dataset, val_dataset
+        del fold_train_df, fold_ctx_df
         gc.collect()
-
-        # 3. 強制清空 CUDA 顯存快取（釋放 GPU VRAM）
         torch.cuda.empty_cache()
         # ======================================================================
 
@@ -651,7 +732,7 @@ def main():
     elapsed = time.time() - t0
     log(f"\nTotal elapsed: {elapsed:.1f}s  ({elapsed/60:.1f} min)")
 
-    log_path = os.path.join(ROOT, "_training_log_37th.txt")
+    log_path = os.path.join(ROOT, "_training_log_38th.txt")
     with open(log_path, "w") as fh:
         fh.write("\n".join(log_lines))
     print(f"\nTraining log saved  →  {log_path}")
