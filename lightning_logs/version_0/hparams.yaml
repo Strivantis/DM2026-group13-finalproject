@@ -1,0 +1,7 @@
+hidden_size: 64
+lr: 0.001
+n_features: 40
+n_heads: 4
+n_ordinal: 50
+patch_len: 4
+stride: 2

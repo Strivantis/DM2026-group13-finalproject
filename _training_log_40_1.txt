@@ -1,0 +1,53 @@
+python src/train.py
+Seed set to 42
+============================================================
+[v40] Loading data …
+  Train: (1757936, 44)  |  Test: (29224, 43)
+  Regions: 2248 train  / 2248 test
+  Global zero-prior fallback: 0.5963
+
+[v40] Building datasets …
+  Total unique regions: 2248
+  Train windows: 1,551,120
+  Val   windows: 168,600
+  Test  regions: 2248
+
+[v40] Instantiating CORALPatchTSTWrapper …
+Seed set to 1
+  Trainable parameters: 152,752
+GPU available: True (cuda), used: True
+TPU available: False, using: 0 TPU cores
+
+[v40] Training …
+LOCAL_RANK: 0 - CUDA_VISIBLE_DEVICES: [0]
+
+  | Name         | Type              | Params | Mode 
+-----------------------------------------------------------
+0 | backbone     | PatchTST_backbone | 152 K  | train
+1 | feat_norm    | LayerNorm         | 80     | train
+2 | logit_proj   | Linear            | 41     | train
+  | other params | n/a               | 50     | n/a  
+-----------------------------------------------------------
+152 K     Trainable params
+3         Non-trainable params
+152 K     Total params
+0.611     Total estimated model params size (MB)
+89        Modules in train mode
+0         Modules in eval mode
+Epoch 0: 100%|████████████████████████████████████| 1514/1514 [06:15<00:00,  4.03it/s, v_num=0, val_loss=0.541, val_mae=0.890, train_loss=1.000]Metric val_mae improved. New best score: 0.890                                                                                                  
+Epoch 0, global step 1514: 'val_mae' reached 0.88991 (best 0.88991), saving model to '/home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/v40/coral_patchtst_v40_epoch=00_val_mae=0.8899.ckpt' as top 1
+Epoch 1: 100%|████████████████████████████████████| 1514/1514 [06:15<00:00,  4.03it/s, v_num=0, val_loss=0.393, val_mae=0.815, train_loss=0.541]Metric val_mae improved by 0.075 >= min_delta = 0.0. New best score: 0.815                                                                      
+Epoch 1, global step 3028: 'val_mae' reached 0.81476 (best 0.81476), saving model to '/home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/v40/coral_patchtst_v40_epoch=01_val_mae=0.8148.ckpt' as top 1
+Epoch 2: 100%|████████████████████████████████████| 1514/1514 [06:15<00:00,  4.03it/s, v_num=0, val_loss=0.365, val_mae=0.718, train_loss=0.443]Metric val_mae improved by 0.097 >= min_delta = 0.0. New best score: 0.718                                                                      
+Epoch 2, global step 4542: 'val_mae' reached 0.71805 (best 0.71805), saving model to '/home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/v40/coral_patchtst_v40_epoch=02_val_mae=0.7180.ckpt' as top 1
+Epoch 3: 100%|████████████████████████████████████| 1514/1514 [06:15<00:00,  4.03it/s, v_num=0, val_loss=0.355, val_mae=0.646, train_loss=0.422]Metric val_mae improved by 0.072 >= min_delta = 0.0. New best score: 0.646                                                                      
+Epoch 3, global step 6056: 'val_mae' reached 0.64558 (best 0.64558), saving model to '/home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/v40/coral_patchtst_v40_epoch=03_val_mae=0.6456.ckpt' as top 1
+Epoch 4: 100%|████████████████████████████████████| 1514/1514 [06:15<00:00,  4.03it/s, v_num=0, val_loss=0.348, val_mae=0.618, train_loss=0.415]Metric val_mae improved by 0.028 >= min_delta = 0.0. New best score: 0.618                                                                      
+Epoch 4, global step 7570: 'val_mae' reached 0.61779 (best 0.61779), saving model to '/home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/v40/coral_patchtst_v40_epoch=04_val_mae=0.6178.ckpt' as top 1
+Epoch 5: 100%|████████████████████████████████████| 1514/1514 [06:15<00:00,  4.03it/s, v_num=0, val_loss=0.346, val_mae=0.609, train_loss=0.408]Metric val_mae improved by 0.009 >= min_delta = 0.0. New best score: 0.609                                                                      
+Epoch 5, global step 9084: 'val_mae' reached 0.60852 (best 0.60852), saving model to '/home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/v40/coral_patchtst_v40_epoch=05_val_mae=0.6085.ckpt' as top 1
+Epoch 6: 100%|████████████████████████████████████| 1514/1514 [06:15<00:00,  4.03it/s, v_num=0, val_loss=0.348, val_mae=0.604, train_loss=0.401]Metric val_mae improved by 0.004 >= min_delta = 0.0. New best score: 0.604                                                                      
+Epoch 6, global step 10598: 'val_mae' reached 0.60418 (best 0.60418), saving model to '/home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/v40/coral_patchtst_v40_epoch=06_val_mae=0.6042.ckpt' as top 1
+Epoch 7:  23%|████████▌                            | 349/1514 [01:23<04:40,  4.16it/s, v_num=0, val_loss=0.348, val_mae=0.604, train_loss=0.401]^C
+Detected KeyboardInterrupt, attempting graceful shutdown ...
+Epoch 7:  23%|██▎       | 349/1514 [01:24<04:43,  4.11it/s, v_num=0, val_loss=0.348, val_mae=0.604, train_loss=0.401]                           
