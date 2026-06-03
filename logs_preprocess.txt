@@ -1,0 +1,9 @@
+[preprocess] stride=3 window=91 F=122
+[train] regions=400 samples=102000
+[train] regions=800 samples=204000
+[train] regions=1200 samples=306000
+[train] regions=1600 samples=408000
+[train] regions=2000 samples=510000
+[train] DONE regions=2248 samples=573240 feats=122 y_mean=0.8366
+[test] DONE regions=2248 feats=122
+[preprocess] all artifacts written to artifacts/

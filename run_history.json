@@ -1,0 +1,52 @@
+[
+  {
+    "iteration": "v1",
+    "timestamp": "2026-06-03T11:59:21",
+    "submission_file": "submission_v1.csv",
+    "message": "v1 baseline: LightGBMx5 91d-window aggregates + region climatology, MAE obj (val macro MAE 0.5345)",
+    "model": "LightGBM x5 (one per forecast week), objective=L1/MAE",
+    "features": {
+      "n_features": 122,
+      "window": 91,
+      "horizons": [
+        7,
+        14,
+        21,
+        28,
+        35
+      ],
+      "stride": 3,
+      "groups": "per-weather-col {mean,std,min,max,last,last7,last28,trend} + precip sums/dry-days + seasonality + per-region score climatology"
+    },
+    "hyperparameters": {
+      "params": {
+        "objective": "regression_l1",
+        "metric": "l1",
+        "learning_rate": 0.03,
+        "num_leaves": 63,
+        "min_child_samples": 200,
+        "feature_fraction": 0.8,
+        "bagging_fraction": 0.8,
+        "bagging_freq": 1,
+        "lambda_l2": 1.0,
+        "max_depth": -1,
+        "num_threads": 0,
+        "verbosity": -1,
+        "seed": 42
+      },
+      "num_rounds": 3000,
+      "early_stop": 150,
+      "val_frac": 0.15,
+      "stride": 3
+    },
+    "macro_val_mae": 0.5344657867619012,
+    "per_week_val_mae": {
+      "week1": 0.5145603975029498,
+      "week2": 0.5241704932599689,
+      "week3": 0.5341102449158593,
+      "week4": 0.5430686708623782,
+      "week5": 0.5564191272683501
+    },
+    "online_mae": 0.8917
+  }
+]

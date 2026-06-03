@@ -1,0 +1,7 @@
+data/
+__pycache__/
+*.pyc
+.claude/
+logs_train.txt
+*.csv
+*.md
