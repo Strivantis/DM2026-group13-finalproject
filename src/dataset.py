@@ -1,10 +1,11 @@
 """
-dataset.py – Tabular dataset construction for drought score forecasting (v45).
+dataset.py – Tabular dataset construction for drought score forecasting (v47).
 
 Flat feature matrix layout per sample:
-  29 features × 13 weeks = 377 week-major columns (feat_w1 … feat_w13)
-  + 29 explicit trend deltas (feat_delta = feat_w13 – feat_w1)
-  = 406 total dimensions
+  FEATURE_COLS declares 29 features; DROP_COLS prunes 6 at runtime.
+  Effective: 23 features × 13 weeks = 299 week-major columns (feat_w1 … feat_w13)
+  + 23 explicit trend deltas (feat_w13 – feat_w1)
+  = 322 total dimensions
 
 CV: 5-Fold StratifiedGroupKFold.
   Strata: K-Means cluster_id (10 climate ecosystems) when present in df,
@@ -23,11 +24,18 @@ from src.preprocess import add_drought_index
 WINDOW_SIZE = 13   # look-back weeks (matches test-set horizon)
 HORIZON     = 5    # forecast horizon (weeks)
 
-# Adversarial / collinear columns dropped before model input
-DROP_COLS = ["wb_tmp", "dp_tmp", "surf_tmp", "wind_max", "dow_sin"]
+# Adversarial / collinear columns pruned before model input.
+# week_sin/cos: seasonal proxy leaks target (train/test month distributions differ).
+# Extreme-variability stats: near-perfect adversarial AUC against score label.
+DROP_COLS = [
+    "wb_tmp", "dp_tmp", "surf_tmp", "wind_max", "dow_sin",
+    "prec_week_max", "surf_pre_week_max",
+    "tmp_week_std", "humidity_week_std",
+    "week_cos", "week_sin"
+]
 
 # Precipitation columns that receive log1p transform (only in non-V29 path)
-PREC_COLS = ["prec", "prec_week_max", "prec_roll_sum_4w"]
+PREC_COLS = ["prec", "prec_roll_sum_4w"]
 
 # 29-feature input set (order preserved for flat-matrix alignment)
 FEATURE_COLS = [
@@ -47,7 +55,7 @@ FEATURE_COLS = [
     "prec_roll_sum_4w", "deficit_roll_cum_4w",
     # target encoding (2) – injected by train.py per fold, not in CSVs
     "region_mean_score", "region_zero_prob",
-]   # 29 features | flat dim = 29 × 13 + 29 = 406
+]   # 29 declared; 6 overlap DROP_COLS → 23 effective | flat dim = 23 × 13 + 23 = 322
 
 
 # ---------------------------------------------------------------------------

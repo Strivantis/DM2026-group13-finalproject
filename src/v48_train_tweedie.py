@@ -1,25 +1,22 @@
 """
-train.py – Drought Score Forecasting Pipeline (v47).
+v48_train_tweedie.py – Drought Score Forecasting Pipeline (v48).
 
-Architecture: Decoupled Dual-Tree Hurdle (LightGBM)
-  Model A – LGBMRegressor  objective=regression_l1  (conditional median)
-  Model B – LGBMClassifier objective=binary          (drought probability)
-  Per CV fold × per forecast week → 5 folds × 5 weeks = 25 model pairs.
+Architecture: Single Tweedie Tree (LightGBM)
+  One LGBMRegressor per fold × forecast week → 5 folds × 5 weeks = 25 models.
+  Tweedie variance_power=1.65 (compound Poisson-Gamma) natively handles zero-
+  inflation and right-skewed scores; no explicit hurdle gate required.
 
 Feature space: 23 effective features × 13 weeks + 23 deltas = 322 dimensions
                (FEATURE_COLS declares 29; DROP_COLS prunes 6 at runtime).
 
 Inference:
-  l1_median  = np.median(Model-A preds, axis=folds)   robust to outlier folds
-  prob_mean  = np.mean(Model-B probs,  axis=folds)    probability averaging
-  final      = np.where(prob_mean < 0.5, 0.0, l1_median)
-  final      = np.clip(final, 0.0, 5.0)
+  final = np.median(tweedie_fold_preds, axis=folds)
+  final = np.clip(final, 0.0, 5.0)
 
 Outputs:
   submission.csv
-  models/lgbm_a_fold{k}_week{w}.pkl
-  models/lgbm_b_fold{k}_week{w}.pkl
-  _training_log_47th.txt
+  models/lgbm_tweedie_fold{k}_week{w}.pkl
+  _training_log_48th.txt
 """
 
 import os
@@ -30,10 +27,10 @@ import pickle
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 
-import lightgbm
+import lightgbm as lgb
 import numpy as np
 import pandas as pd
-from lightgbm import LGBMRegressor, LGBMClassifier
+from lightgbm import LGBMRegressor
 import gc
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -70,6 +67,23 @@ os.makedirs(MODELS_DIR, exist_ok=True)
 N_FOLDS         = 5
 N_FLAT_FEATURES = WINDOW_SIZE * len(FEATURE_COLS) + len(FEATURE_COLS)  # 406 declared; 322 effective after DROP_COLS
 
+TWEEDIE_PARAMS = dict(
+    objective              = "tweedie",
+    tweedie_variance_power = 1.65,   # compound Poisson-Gamma: weakens zero-mass singularity, preserves continuous range
+    metric                 = "l1",   # early stopping monitors MAE, not Tweedie deviance
+    learning_rate          = 0.04,
+    max_depth              = 6,
+    num_leaves             = 31,
+    min_child_samples      = 300,    # guards against memorising extreme-score outliers
+    subsample              = 0.8,
+    colsample_bytree       = 0.8,
+    n_estimators           = 30000,
+    device                 = "gpu",
+    n_jobs                 = -1,
+    random_state           = 42,
+    verbose                = -1,
+)
+
 
 # ---------------------------------------------------------------------------
 # Per-fold leakage-free target encoding
@@ -84,8 +98,8 @@ def _compute_te_stats(df: pd.DataFrame) -> tuple:
 
     Returns
     -------
-    te_map       : dict  region_id → (mean_score, zero_prob)
-    global_mean  : float
+    te_map           : dict  region_id → (mean_score, zero_prob)
+    global_mean      : float
     global_zero_prob : float
     """
     te_stats = (
@@ -157,7 +171,7 @@ def print_binned_error_matrix(
     """Print per-drought-interval MAE breakdown for one CV fold."""
     log_fn("")
     log_fn("  " + "=" * 80)
-    log_fn(f"  BINNED ERROR MATRIX  --  Fold {fold_k}  (OOF Hurdle-Gated)")
+    log_fn(f"  BINNED ERROR MATRIX  --  Fold {fold_k}  (OOF Tweedie)")
     log_fn("  " + "=" * 80)
     log_fn(
         f"  {'Interval':<50}  {'Count':>7}  {'AvgTrue':>8}  "
@@ -193,12 +207,12 @@ def main():
         log_lines.append(str(msg))
 
     log("=" * 90)
-    log("Drought Forecasting Pipeline  v47  (Decoupled Dual-Tree Hurdle)")
-    log("Model A: LGBMRegressor regression_l1  |  Model B: LGBMClassifier binary")
+    log("Drought Forecasting Pipeline  v48  (Single Tweedie Tree)")
+    log(f"Tweedie variance_power={TWEEDIE_PARAMS['tweedie_variance_power']}  "
+        f"early_stopping on l1  |  25 models (5 folds × 5 weeks)")
     log(f"Feature space: 23 effective × {WINDOW_SIZE} weeks + 23 deltas = 322 dims "
-        f"({len(FEATURE_COLS)} declared in FEATURE_COLS, DROP_COLS prunes 6)")
-    log("OOF gate:  np.where(prob < 0.5, 0.0, l1_pred)")
-    log("Test gate: np.median(A, axis=folds)  |  np.mean(B, axis=folds)")
+        f"({len(FEATURE_COLS)} declared, DROP_COLS prunes 6)")
+    log("Inference: np.median(fold preds, axis=0)  →  clip(0, 5)")
     log(f"CV: {N_FOLDS}-Fold StratifiedGroupKFold  (strata: climate cluster_id)")
     log("=" * 90)
 
@@ -235,9 +249,9 @@ def main():
     log(f"  train: {train_df.shape}  |  test: {test_df.shape}")
 
     # -- 4. Drop NaN score rows -----------------------------------------------
-    before    = len(train_df)
-    train_df  = train_df.dropna(subset=["score"]).reset_index(drop=True)
-    dropped   = before - len(train_df)
+    before   = len(train_df)
+    train_df = train_df.dropna(subset=["score"]).reset_index(drop=True)
+    dropped  = before - len(train_df)
     if dropped:
         log(f"  Dropped {dropped:,} NaN-score rows.")
 
@@ -246,7 +260,8 @@ def main():
     zero_frac  = (all_scores == 0.0).mean()
     log(f"\n[Target] mean={all_scores.mean():.4f}  std={all_scores.std():.4f}  "
         f"zero={zero_frac:.2%}  positive={1-zero_frac:.2%}")
-    log(f"  flat input dim: 322 effective  (23×{WINDOW_SIZE}+23; DROP_COLS prunes 6 of {len(FEATURE_COLS)} declared)")
+    log(f"  flat input dim: 322 effective  "
+        f"(23×{WINDOW_SIZE}+23; DROP_COLS prunes 6 of {len(FEATURE_COLS)} declared)")
 
     # -- 6. Build CV folds ----------------------------------------------------
     log(f"\n{'='*90}")
@@ -258,14 +273,13 @@ def main():
     for fi, (tg, vg) in enumerate(folds):
         log(f"  Fold {fi}: train_groups={len(tg):,}  val_groups={len(vg):,}")
 
-    # -- 7. Dual-Tree Hurdle Training Loop ------------------------------------
+    # -- 7. Tweedie Training Loop ---------------------------------------------
     log(f"\n{'='*90}")
-    log("Dual-Tree Hurdle Training  (Model A: regression_l1 | Model B: binary)")
+    log("Tweedie Training  (single model per fold × week)")
     log(f"{'='*90}")
 
-    fold_results      = []
-    fold_test_preds_a = []
-    fold_test_preds_b = []
+    fold_results         = []
+    fold_test_preds_list = []
 
     for fold_k, (raw_train_groups, raw_val_groups) in enumerate(folds):
 
@@ -321,175 +335,84 @@ def main():
         X_test_np = np.asfortranarray(X_test_np)
         log(f"  X_test : {X_test_np.shape}")
 
-        # ---- Per-week model pair training -----------------------------------
-        fold_val_preds_l1 = np.zeros_like(y_val_np)
-        fold_val_probs    = np.zeros_like(y_val_np)
-        fold_val_final    = np.zeros_like(y_val_np)
-        fold_test_pred_l1 = np.zeros((X_test_np.shape[0], HORIZON), dtype=np.float32)
-        fold_test_prob    = np.zeros((X_test_np.shape[0], HORIZON), dtype=np.float32)
+        # ---- Per-week Tweedie model -----------------------------------------
+        fold_val_preds  = np.zeros_like(y_val_np)
+        fold_test_preds = np.zeros((X_test_np.shape[0], HORIZON), dtype=np.float32)
 
         for week_idx in range(HORIZON):
             y_train_w = y_train_np[:, week_idx]
             y_val_w   = y_val_np[:,   week_idx]
-            y_train_b = (y_train_w > 0.0).astype(int)
-            y_val_b   = (y_val_w   > 0.0).astype(int)
 
-            ckpt_a = os.path.join(MODELS_DIR, f"lgbm_a_fold{fold_k}_week{week_idx}.pkl")
-            ckpt_b = os.path.join(MODELS_DIR, f"lgbm_b_fold{fold_k}_week{week_idx}.pkl")
+            ckpt = os.path.join(
+                MODELS_DIR, f"lgbm_tweedie_fold{fold_k}_week{week_idx}.pkl"
+            )
 
             log(f"\n  --- Week {week_idx + 1} ---")
 
-            # Model A --------------------------------------------------------
-            if os.path.exists(ckpt_a):
-                log(f"    [RESUME-A] {ckpt_a}")
+            if os.path.exists(ckpt):
+                log(f"    [RESUME] {ckpt}")
                 try:
-                    with open(ckpt_a, "rb") as fh:
-                        model_a = pickle.load(fh)
-                    val_l1_w  = model_a.predict(X_val_np)
-                    test_l1_w = model_a.predict(X_test_np)
-                    mae_a = float(np.mean(np.abs(val_l1_w - y_val_w)))
-                    log(f"    [Model A] best_iter={model_a.best_iteration_}  "
-                        f"val_MAE={mae_a:.4f}  [LOADED]")
+                    with open(ckpt, "rb") as fh:
+                        model = pickle.load(fh)
+                    val_pred_w  = model.predict(X_val_np)
+                    test_pred_w = model.predict(X_test_np)
+                    mae = float(np.mean(np.abs(val_pred_w - y_val_w)))
+                    log(f"    [Tweedie] best_iter={model.best_iteration_}  "
+                        f"val_MAE={mae:.4f}  [LOADED]")
                 except Exception as e:
-                    log(f"    [WARN-A] Checkpoint corrupted ({e}), retraining.")
-                    os.remove(ckpt_a)
-                    model_a = None
+                    log(f"    [WARN] Checkpoint corrupted ({e}), retraining.")
+                    os.remove(ckpt)
+                    model = None
             else:
-                model_a = None
+                model = None
 
-            if model_a is None:
-                model_a = LGBMRegressor(
-                    objective        = "regression_l1",
-                    max_depth        = 6,
-                    num_leaves       = 45,
-                    colsample_bytree = 0.6,
-                    learning_rate    = 0.04,
-                    subsample        = 0.8,
-                    subsample_freq   = 1,
-                    min_child_samples= 300,
-                    n_estimators     = 30000, 
-                    device           = "gpu",
-                    random_state     = 42,
-                    n_jobs           = -1,
-                    verbose          = -1,
-                )
-                model_a.fit(
+            if model is None:
+                model = LGBMRegressor(**TWEEDIE_PARAMS)
+                model.fit(
                     X_train_np, y_train_w,
                     eval_set    = [(X_val_np, y_val_w)],
-                    eval_metric = "mae",
+                    eval_metric = "l1",
                     callbacks   = [
-                        lightgbm.early_stopping(stopping_rounds=400, verbose=False),
-                        lightgbm.log_evaluation(period=1000),
+                        lgb.early_stopping(stopping_rounds=400, verbose=False),
+                        lgb.log_evaluation(period=1000),
                     ],
                 )
-                val_l1_w  = model_a.predict(X_val_np)
-                test_l1_w = model_a.predict(X_test_np)
-                mae_a     = float(np.mean(np.abs(val_l1_w - y_val_w)))
-                log(f"    [Model A] best_iter={model_a.best_iteration_}  "
-                    f"val_MAE={mae_a:.4f}")
-                with open(ckpt_a, "wb") as fh:
-                    pickle.dump(model_a, fh)
-                log(f"    [SAVED-A] {ckpt_a}")
+                val_pred_w  = model.predict(X_val_np)
+                test_pred_w = model.predict(X_test_np)
+                mae = float(np.mean(np.abs(val_pred_w - y_val_w)))
+                log(f"    [Tweedie] best_iter={model.best_iteration_}  val_MAE={mae:.4f}")
+                with open(ckpt, "wb") as fh:
+                    pickle.dump(model, fh)
+                log(f"    [SAVED] {ckpt}")
 
-            fold_val_preds_l1[:, week_idx] = val_l1_w
-            fold_test_pred_l1[:, week_idx] = test_l1_w.astype(np.float32)
-            del model_a
+            fold_val_preds[:, week_idx]  = val_pred_w
+            fold_test_preds[:, week_idx] = test_pred_w.astype(np.float32)
+            del model
             gc.collect()
 
-            # Model B --------------------------------------------------------
-            if os.path.exists(ckpt_b):
-                log(f"    [RESUME-B] {ckpt_b}")
-                try:
-                    with open(ckpt_b, "rb") as fh:
-                        model_b = pickle.load(fh)
-                    val_prob_w  = model_b.predict_proba(X_val_np)[:, 1]
-                    test_prob_w = model_b.predict_proba(X_test_np)[:, 1]
-                    log(f"    [Model B] best_iter={model_b.best_iteration_}  [LOADED]")
-                except Exception as e:
-                    log(f"    [WARN-B] Checkpoint corrupted ({e}), retraining.")
-                    os.remove(ckpt_b)
-                    model_b = None
-            else:
-                model_b = None
-
-            if model_b is None:
-                model_b = LGBMClassifier(
-                    objective        = "binary",
-                    max_depth        = 6,
-                    num_leaves       = 45,
-                    colsample_bytree = 0.6,
-                    learning_rate    = 0.04,
-                    subsample        = 0.8,
-                    subsample_freq   = 1,
-                    min_child_samples= 300,
-                    n_estimators     = 30000, 
-                    device           = "gpu",
-                    random_state     = 42,
-                    n_jobs           = -1,
-                    verbose          = -1,
-                )
-                model_b.fit(
-                    X_train_np, y_train_b,
-                    eval_set    = [(X_val_np, y_val_b)],
-                    eval_metric = "binary_logloss",
-                    callbacks   = [
-                        lightgbm.early_stopping(stopping_rounds=400, verbose=False),
-                        lightgbm.log_evaluation(period=1000),
-                    ],
-                )
-                val_prob_w  = model_b.predict_proba(X_val_np)[:, 1]
-                test_prob_w = model_b.predict_proba(X_test_np)[:, 1]
-                log(f"    [Model B] best_iter={model_b.best_iteration_}")
-                with open(ckpt_b, "wb") as fh:
-                    pickle.dump(model_b, fh)
-                log(f"    [SAVED-B] {ckpt_b}")
-
-            fold_val_probs[:, week_idx]    = val_prob_w
-            fold_test_prob[:, week_idx]    = test_prob_w.astype(np.float32)
-            del model_b
-            gc.collect()
-
-            # OOF hurdle gate -------------------------------------------------
-            oof_final_w = np.where(
-                fold_val_probs[:, week_idx] < 0.5, 0.0,
-                fold_val_preds_l1[:, week_idx]
-            )
-            fold_val_final[:, week_idx] = oof_final_w
-            mae_final    = float(np.mean(np.abs(oof_final_w - y_val_w)))
-            zero_gated   = float((oof_final_w == 0.0).mean())
-            log(f"    [OOF] HurdleMAE={mae_final:.4f}  "
-                f"zero-gated={zero_gated:.2%}")
+            log(f"    [OOF] MAE={float(np.mean(np.abs(fold_val_preds[:, week_idx] - y_val_w))):.4f}")
 
         fold_elapsed = time.time() - fold_t0
 
         # ---- Fold OOF summary -----------------------------------------------
-        week_maes_l1    = [
-            float(np.mean(np.abs(fold_val_preds_l1[:, w] - y_val_np[:, w])))
+        week_maes = [
+            float(np.mean(np.abs(fold_val_preds[:, w] - y_val_np[:, w])))
             for w in range(HORIZON)
         ]
-        week_maes_final = [
-            float(np.mean(np.abs(fold_val_final[:, w] - y_val_np[:, w])))
-            for w in range(HORIZON)
-        ]
-        mean_fold_mae_final = float(np.mean(week_maes_final))
+        mean_fold_mae = float(np.mean(week_maes))
 
-        log(f"\n  [Fold {fold_k}] L1 raw    : " +
-            "  ".join(f"W{i+1}={m:.4f}" for i, m in enumerate(week_maes_l1)))
-        log(f"  [Fold {fold_k}] Hurdle    : " +
-            "  ".join(f"W{i+1}={m:.4f}" for i, m in enumerate(week_maes_final)))
-        log(f"  [Fold {fold_k}] Mean MAE  : {mean_fold_mae_final:.4f}  "
-            f"({fold_elapsed:.1f}s)")
+        log(f"\n  [Fold {fold_k}] Tweedie MAE: " +
+            "  ".join(f"W{i+1}={m:.4f}" for i, m in enumerate(week_maes)))
+        log(f"  [Fold {fold_k}] Mean MAE  : {mean_fold_mae:.4f}  ({fold_elapsed:.1f}s)")
 
         print_binned_error_matrix(
-            y_val_np.ravel(), fold_val_final.ravel(), fold_k, log
+            y_val_np.ravel(), fold_val_preds.ravel(), fold_k, log
         )
 
-        fold_results.append((fold_k, week_maes_l1, week_maes_final, mean_fold_mae_final))
-        fold_test_preds_a.append({"preds": fold_test_pred_l1, "region_ids": test_region_ids})
-        fold_test_preds_b.append({"probs": fold_test_prob,    "region_ids": test_region_ids})
+        fold_results.append((fold_k, week_maes, mean_fold_mae))
+        fold_test_preds_list.append({"preds": fold_test_preds, "region_ids": test_region_ids})
 
-        del X_train_np, y_train_np, X_val_np, y_val_np
-        del fold_val_preds_l1, fold_val_probs, fold_val_final
+        del X_train_np, y_train_np, X_val_np, y_val_np, fold_val_preds
         gc.collect()
 
     # -- 8. CV summary --------------------------------------------------------
@@ -497,10 +420,10 @@ def main():
     log("5-Fold CV Summary")
     log(f"{'='*90}")
     mean_cv_maes = []
-    for fold_k, _, week_maes_final, mean_mae in fold_results:
+    for fold_k, week_maes, mean_mae in fold_results:
         log("  Fold {:d}: {:s}  -> Mean={:.4f}".format(
             fold_k,
-            "  ".join(f"W{i+1}={m:.4f}" for i, m in enumerate(week_maes_final)),
+            "  ".join(f"W{i+1}={m:.4f}" for i, m in enumerate(week_maes)),
             mean_mae,
         ))
         mean_cv_maes.append(mean_mae)
@@ -514,36 +437,24 @@ def main():
         f"(MAE={max(mean_cv_maes):.4f})")
     log("\n  Per-week breakdown:")
     for w in range(HORIZON):
-        wk_maes = [fold_results[k][2][w] for k in range(N_FOLDS)]
-        log(f"    Week {w+1}: mean={np.mean(wk_maes):.4f}  "
-            f"std={np.std(wk_maes):.4f}")
+        wk_maes = [fold_results[k][1][w] for k in range(N_FOLDS)]
+        log(f"    Week {w+1}: mean={np.mean(wk_maes):.4f}  std={np.std(wk_maes):.4f}")
 
-    # -- 9. Asymmetric ensemble blending --------------------------------------
+    # -- 9. Fold ensemble (median) --------------------------------------------
     log(f"\n{'='*90}")
-    log(f"Asymmetric Ensemble  ({N_FOLDS} folds)")
-    log("  Model A → np.median  (robust to fold outliers)")
-    log("  Model B → np.mean    (probability averaging)")
+    log(f"Tweedie Ensemble  ({N_FOLDS} folds  →  np.median)")
     log(f"{'='*90}")
 
-    all_region_ids = fold_test_preds_a[0]["region_ids"]
+    all_region_ids = fold_test_preds_list[0]["region_ids"]
     assert len(all_region_ids) == 2248
 
-    preds_a_stack = np.stack([fp["preds"] for fp in fold_test_preds_a], axis=0)
-    probs_b_stack = np.stack([fp["probs"] for fp in fold_test_preds_b], axis=0)
-
-    l1_median = np.median(preds_a_stack, axis=0)
-    prob_mean  = np.mean(probs_b_stack,  axis=0)
-
-    log(f"  l1_median: mean={l1_median.mean():.4f}  std={l1_median.std():.4f}")
-    log(f"  prob_mean: mean={prob_mean.mean():.4f}  "
-        f"fraction<0.5={( prob_mean < 0.5).mean():.2%}")
-
-    final_preds = np.where(prob_mean < 0.5, 0.0, l1_median)
+    preds_stack = np.stack([fp["preds"] for fp in fold_test_preds_list], axis=0)
+    final_preds = np.median(preds_stack, axis=0)
+    final_preds = np.where(final_preds < 0.05, 0.0, final_preds)
     final_preds = np.clip(final_preds, 0.0, 5.0)
 
-    log(f"  Post-gate: mean={final_preds.mean():.4f}  "
-        f"std={final_preds.std():.4f}  "
-        f"exact-zero={( final_preds == 0.0).mean():.2%}")
+    log(f"  final_preds: mean={final_preds.mean():.4f}  std={final_preds.std():.4f}  "
+        f"exact-zero={(final_preds == 0.0).mean():.2%}")
 
     # -- 10. Submission -------------------------------------------------------
     log("\nFormatting submission.csv ...")
@@ -559,7 +470,7 @@ def main():
         for i, rid in enumerate(all_region_ids)
     ]
     submission = pd.DataFrame(rows)
-    sub_path   = os.path.join(ROOT, "submission.csv")
+    sub_path   = os.path.join(ROOT, "submission_48th.csv")
     submission.to_csv(sub_path, index=False)
 
     assert len(submission) == 2248
@@ -578,7 +489,7 @@ def main():
     elapsed = time.time() - t0
     log(f"\nTotal elapsed: {elapsed:.1f}s  ({elapsed/60:.1f} min)")
 
-    log_path = os.path.join(ROOT, "_training_log_47th.txt")
+    log_path = os.path.join(ROOT, "_training_log_48th.txt")
     with open(log_path, "w") as fh:
         fh.write("\n".join(log_lines))
     print(f"Training log → {log_path}")

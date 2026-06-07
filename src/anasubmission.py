@@ -15,11 +15,14 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FILES = {
     "Baseline (v37)": os.path.join(ROOT, "submission_37th.csv"),
     "V45 Raw": os.path.join(ROOT, "submission_45th.csv"),
-    "V45 Optimized": os.path.join(ROOT, "submission_45thopt.csv"),
-    "V45 L2-Stacked": os.path.join(ROOT, "submission_45thstacked.csv"),
+    # "V45 Optimized": os.path.join(ROOT, "submission_45thopt.csv"),
+    # "V45 L2-Stacked": os.path.join(ROOT, "submission_45thstacked.csv"),
     "V45.1 Raw": os.path.join(ROOT, "submission_45th_30k_ABraw.csv"),
-    "V45.1 30k Naked": os.path.join(ROOT, "submission_45th_30k_naked.csv"),
-    "V45.1 30k 25% Zero": os.path.join(ROOT, "submission_45th_30k_25perzero.csv")
+    # "V45.1 30k Naked": os.path.join(ROOT, "submission_45th_30k_naked.csv"),
+    # "V45.1 30k 25% Zero": os.path.join(ROOT, "submission_45th_30k_25perzero.csv"),
+    "V47 30k Pruned": os.path.join(ROOT, "submission_47th.csv"),
+    "V48 Tweedie": os.path.join(ROOT, "submission_48th.csv"),
+    "V48 Tweedie Snapped": os.path.join(ROOT, "submission_48th_snap.csv")
 }
 
 def get_interval_bins(vals):
