@@ -13,16 +13,22 @@ import seaborn as sns
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FILES = {
-    "Baseline (v37)": os.path.join(ROOT, "submission_37th.csv"),
-    "V45 Raw": os.path.join(ROOT, "submission_45th.csv"),
+    # "Baseline (v37)": os.path.join(ROOT, "submission_37th.csv"),
+    # "V45 Raw": os.path.join(ROOT, "submission_45th.csv"),
     # "V45 Optimized": os.path.join(ROOT, "submission_45thopt.csv"),
     # "V45 L2-Stacked": os.path.join(ROOT, "submission_45thstacked.csv"),
-    "V45.1 Raw": os.path.join(ROOT, "submission_45th_30k_ABraw.csv"),
+    "V45.1 Raw Rounded": os.path.join(ROOT, "submission_45th_30k_ABraw_rounded.csv"),
     # "V45.1 30k Naked": os.path.join(ROOT, "submission_45th_30k_naked.csv"),
     # "V45.1 30k 25% Zero": os.path.join(ROOT, "submission_45th_30k_25perzero.csv"),
-    "V47 30k Pruned": os.path.join(ROOT, "submission_47th.csv"),
-    "V48 Tweedie": os.path.join(ROOT, "submission_48th.csv"),
-    "V48 Tweedie Snapped": os.path.join(ROOT, "submission_48th_snap.csv")
+    # "V47 30k Pruned": os.path.join(ROOT, "submission_47th.csv"),
+    # "V48 Tweedie": os.path.join(ROOT, "submission_48th.csv"),
+    # "V48 Tweedie Snapped": os.path.join(ROOT, "submission_48th_snap.csv"),
+    "V49": os.path.join(ROOT, "submission_49th.csv"),
+    
+    "V49 Post-Argmax": os.path.join(ROOT, "submission_49th_A_arg.csv"),
+    "V49 Post-Optimized": os.path.join(ROOT, "submission_49th_B_opt.csv"),
+    "V49 Post-Stacked": os.path.join(ROOT, "submission_49th_C_stack.csv"),
+    "V49 Post-Meta": os.path.join(ROOT, "submission_49th_meta.csv")
 }
 
 def get_interval_bins(vals):

@@ -27,15 +27,21 @@ HORIZON     = 5    # forecast horizon (weeks)
 # Adversarial / collinear columns pruned before model input.
 # week_sin/cos: seasonal proxy leaks target (train/test month distributions differ).
 # Extreme-variability stats: near-perfect adversarial AUC against score label.
-DROP_COLS = [
-    "wb_tmp", "dp_tmp", "surf_tmp", "wind_max", "dow_sin",
-    "prec_week_max", "surf_pre_week_max",
-    "tmp_week_std", "humidity_week_std",
-    "week_cos", "week_sin"
-]
+# DROP_COLS = [
+#     "wb_tmp", "dp_tmp", "surf_tmp", "wind_max", "dow_sin",
+#     "prec_week_max", "surf_pre_week_max",
+#     "tmp_week_std", "humidity_week_std",
+#     "week_cos", "week_sin"
+# ]
 
-# Precipitation columns that receive log1p transform (only in non-V29 path)
-PREC_COLS = ["prec", "prec_roll_sum_4w"]
+# # Precipitation columns that receive log1p transform (only in non-V29 path)
+# PREC_COLS = ["prec", "prec_roll_sum_4w"]
+
+# [v45_30k] 拿掉昨天加的那些內鬼，只保留最原本的 5 個物理衝突特徵
+DROP_COLS = ["wb_tmp", "dp_tmp", "surf_tmp", "wind_max", "dow_sin"]
+
+# [v45_30k] 把 prec_week_max 加回 log1p 的轉換名單中
+PREC_COLS = ["prec", "prec_week_max", "prec_roll_sum_4w"]
 
 # 29-feature input set (order preserved for flat-matrix alignment)
 FEATURE_COLS = [
