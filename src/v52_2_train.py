@@ -46,7 +46,7 @@ set_seed(42)
 # Config
 # ---------------------------------------------------------------------------
 PROCESSED_DIR = os.path.join(ROOT, "data", "v51_processed") # 資料依然讀 v51 的
-MODELS_DIR    = os.path.join(ROOT, "models","v52_models")
+MODELS_DIR    = os.path.join(ROOT, "models","v52_2_models")
 os.makedirs(MODELS_DIR, exist_ok=True)
 
 N_FOLDS         = 4  # [V52 修正] 配合 4 個季節間隔
@@ -239,16 +239,16 @@ def main():
 
             # --- Model A (LIGHTWEIGHT) ---
             model_a = LGBMRegressor(
-                objective        = "regression_l1",
-                max_depth        = 7,           # 加深
-                num_leaves       = 63,          # 增廣
-                colsample_bytree = 0.5,         # 增加特徵隨機性
-                learning_rate    = 0.05,        # 放慢學習速度
+                objective        = "regression",  # [關鍵修改] 拿掉 _l1，改用預設的 L2/MSE！強迫它重視極端值
+                max_depth        = 7,
+                num_leaves       = 63,
+                colsample_bytree = 0.5,         
+                learning_rate    = 0.02,          # [配合 MSE] 降回 0.02，因為 MSE 梯度變化較大，需要小步慢走
                 subsample        = 0.8,
-                min_child_samples= 150,         # 增強葉子節點約束
-                reg_alpha        = 0,         # 新增 L1 正則化
-                reg_lambda       = 1.0,         # 新增 L2 正則化
-                n_estimators     = 10000,       # 重裝上陣
+                min_child_samples= 150,           
+                reg_alpha        = 0.0,         
+                reg_lambda       = 1.0,         
+                n_estimators     = 10000,       
                 device           = "gpu",
                 random_state     = 42,
                 n_jobs           = -1,
@@ -257,8 +257,8 @@ def main():
             model_a.fit(
                 X_train_np, y_train_w,
                 eval_set    = [(X_val_np, y_val_w)],
-                eval_metric = "mae",
-                callbacks   = [lightgbm.early_stopping(stopping_rounds=200, verbose=False)],
+                eval_metric = "mae",              # [注意] Evaluation 依然用 MAE，因為這是 Leaderboard 指標
+                callbacks   = [lightgbm.early_stopping(stopping_rounds=300, verbose=False)], 
             )
             val_l1_w  = model_a.predict(X_val_np)
             test_l1_w = model_a.predict(X_test_np)
@@ -338,7 +338,7 @@ def main():
     log(f"  4 Folds Model B probs: {np.round(sample_b_probs, 3)}")
 
     # 儲存推論需要的 raw preds (讓 infer.py 可以自由調 Threshold)
-    raw_preds_path = os.path.join(MODELS_DIR, "v52_raw_test_preds.pkl")
+    raw_preds_path = os.path.join(MODELS_DIR, "v52_2_raw_test_preds.pkl")
     with open(raw_preds_path, "wb") as f:
         pickle.dump({
             "preds_a_stack": preds_a_stack,

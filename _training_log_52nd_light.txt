@@ -1,0 +1,206 @@
+==========================================================================================
+Drought Forecasting Pipeline v52 (Cross-Seasonal Time CV | Lightweight)
+Model A: LGBMRegressor regression_l1  |  Model B: LGBMClassifier binary
+Test gate: np.median(A, axis=folds)  |  np.mean(B, axis=folds)
+CV: 4-Fold Time Seasonal CV (Strict no future leakage)
+==========================================================================================
+
+Loading processed data ...
+  train: (1757936, 49)  |  test: (29224, 48)
+
+Refining features ...
+  train: (1757936, 47)  |  test: (29224, 46)
+
+==========================================================================================
+Building 4-Fold Cross-Seasonal CV
+==========================================================================================
+  Folds built: 4
+
+==========================================================================================
+Dual-Tree Hurdle Training (LIGHTWEIGHT EXPLORATION)
+==========================================================================================
+
+==========================================================================================
+FOLD 1 / 4
+  train_groups: 2,248  |  val_groups: 2,248
+==========================================================================================
+  [TE] Computed from 1,746,696 historical records.
+
+  --- Fold 0 | Week 1 ---
+    [Model A] best_iter=17 | val_MAE=0.3115
+    [Model B] best_iter=562
+
+  --- Fold 0 | Week 2 ---
+    [Model A] best_iter=17 | val_MAE=0.2919
+    [Model B] best_iter=420
+
+  --- Fold 0 | Week 3 ---
+    [Model A] best_iter=14 | val_MAE=0.3009
+    [Model B] best_iter=547
+
+  --- Fold 0 | Week 4 ---
+    [Model A] best_iter=15 | val_MAE=0.3149
+    [Model B] best_iter=722
+
+  --- Fold 0 | Week 5 ---
+    [Model A] best_iter=11 | val_MAE=0.3026
+    [Model B] best_iter=527
+
+  [Fold 0] Mean MAE : 0.2724 (268.4s)
+
+  ================================================================================
+  BINNED ERROR MATRIX  --  Fold 0  (OOF Hurdle-Gated)
+  ================================================================================
+  Interval                                              Count   AvgTrue   AvgPred       MAE
+  ------------------------------------------------------------------------------
+  Interval 0  [Absolute Zero       y == 0.0      ]      9,315    0.0000    0.0263    0.0263
+  Interval 1  [Mild Drought        0.0 < y <= 1.0]        779    1.0000    0.4653    0.7539
+  Interval 2  [Moderate Drought    1.0 < y <= 2.0]        622    2.0000    0.8720    1.1326
+  Interval 3  [Severe Drought      2.0 < y <= 3.0]        339    3.0000    0.6036    2.3964
+  Interval 4  [Extreme Drought     3.0 < y <= 4.0]        118    4.0000    0.5571    3.4429
+  Interval 5  [Exceptional Drought 4.0 < y <= 5.0]         67    5.0000    0.4255    4.5745
+  ================================================================================
+
+  [Diagnostics Fold 0] Model B Probability range: Min=0.0006, Max=0.9437
+  [Diagnostics Fold 0] Model A Score       range: Min=-0.0342, Max=2.2822
+
+==========================================================================================
+FOLD 2 / 4
+  train_groups: 2,248  |  val_groups: 2,248
+==========================================================================================
+  [TE] Computed from 1,717,472 historical records.
+
+  --- Fold 1 | Week 1 ---
+    [Model A] best_iter=64 | val_MAE=0.4886
+    [Model B] best_iter=573
+
+  --- Fold 1 | Week 2 ---
+    [Model A] best_iter=75 | val_MAE=0.4746
+    [Model B] best_iter=238
+
+  --- Fold 1 | Week 3 ---
+    [Model A] best_iter=14 | val_MAE=0.4732
+    [Model B] best_iter=408
+
+  --- Fold 1 | Week 4 ---
+    [Model A] best_iter=18 | val_MAE=0.4821
+    [Model B] best_iter=257
+
+  --- Fold 1 | Week 5 ---
+    [Model A] best_iter=14 | val_MAE=0.5122
+    [Model B] best_iter=349
+
+  [Fold 1] Mean MAE : 0.4683 (224.7s)
+
+  ================================================================================
+  BINNED ERROR MATRIX  --  Fold 1  (OOF Hurdle-Gated)
+  ================================================================================
+  Interval                                              Count   AvgTrue   AvgPred       MAE
+  ------------------------------------------------------------------------------
+  Interval 0  [Absolute Zero       y == 0.0      ]      7,161    0.0000    0.1022    0.1022
+  Interval 1  [Mild Drought        0.0 < y <= 1.0]      1,813    1.0000    0.7856    0.7567
+  Interval 2  [Moderate Drought    1.0 < y <= 2.0]      1,180    2.0000    1.2085    1.0001
+  Interval 3  [Severe Drought      2.0 < y <= 3.0]        749    3.0000    1.5679    1.4664
+  Interval 4  [Extreme Drought     3.0 < y <= 4.0]        266    4.0000    1.6169    2.3831
+  Interval 5  [Exceptional Drought 4.0 < y <= 5.0]         71    5.0000    1.5075    3.4925
+  ================================================================================
+
+  [Diagnostics Fold 1] Model B Probability range: Min=0.0007, Max=0.9832
+  [Diagnostics Fold 1] Model A Score       range: Min=-0.1949, Max=4.3567
+
+==========================================================================================
+FOLD 3 / 4
+  train_groups: 2,248  |  val_groups: 2,248
+==========================================================================================
+  [TE] Computed from 1,688,248 historical records.
+
+  --- Fold 2 | Week 1 ---
+    [Model A] best_iter=114 | val_MAE=0.4968
+    [Model B] best_iter=116
+
+  --- Fold 2 | Week 2 ---
+    [Model A] best_iter=24 | val_MAE=0.5069
+    [Model B] best_iter=319
+
+  --- Fold 2 | Week 3 ---
+    [Model A] best_iter=36 | val_MAE=0.5010
+    [Model B] best_iter=367
+
+  --- Fold 2 | Week 4 ---
+    [Model A] best_iter=21 | val_MAE=0.5401
+    [Model B] best_iter=803
+
+  --- Fold 2 | Week 5 ---
+    [Model A] best_iter=26 | val_MAE=0.5640
+    [Model B] best_iter=432
+
+  [Fold 2] Mean MAE : 0.4867 (293.7s)
+
+  ================================================================================
+  BINNED ERROR MATRIX  --  Fold 2  (OOF Hurdle-Gated)
+  ================================================================================
+  Interval                                              Count   AvgTrue   AvgPred       MAE
+  ------------------------------------------------------------------------------
+  Interval 0  [Absolute Zero       y == 0.0      ]      7,253    0.0000    0.1186    0.1186
+  Interval 1  [Mild Drought        0.0 < y <= 1.0]      1,893    1.0000    0.5577    0.7648
+  Interval 2  [Moderate Drought    1.0 < y <= 2.0]        969    2.0000    1.0108    1.2134
+  Interval 3  [Severe Drought      2.0 < y <= 3.0]        586    3.0000    1.6368    1.3868
+  Interval 4  [Extreme Drought     3.0 < y <= 4.0]        445    4.0000    2.0058    1.9942
+  Interval 5  [Exceptional Drought 4.0 < y <= 5.0]         94    5.0000    1.9537    3.0463
+  ================================================================================
+
+  [Diagnostics Fold 2] Model B Probability range: Min=0.0065, Max=0.9927
+  [Diagnostics Fold 2] Model A Score       range: Min=-0.1199, Max=4.1092
+
+==========================================================================================
+FOLD 4 / 4
+  train_groups: 2,248  |  val_groups: 2,248
+==========================================================================================
+  [TE] Computed from 1,659,024 historical records.
+
+  --- Fold 3 | Week 1 ---
+    [Model A] best_iter=284 | val_MAE=0.4995
+    [Model B] best_iter=359
+
+  --- Fold 3 | Week 2 ---
+    [Model A] best_iter=93 | val_MAE=0.5405
+    [Model B] best_iter=326
+
+  --- Fold 3 | Week 3 ---
+    [Model A] best_iter=90 | val_MAE=0.5569
+    [Model B] best_iter=395
+
+  --- Fold 3 | Week 4 ---
+    [Model A] best_iter=99 | val_MAE=0.5647
+    [Model B] best_iter=243
+
+  --- Fold 3 | Week 5 ---
+    [Model A] best_iter=218 | val_MAE=0.5608
+    [Model B] best_iter=435
+
+  [Fold 3] Mean MAE : 0.5170 (250.9s)
+
+  ================================================================================
+  BINNED ERROR MATRIX  --  Fold 3  (OOF Hurdle-Gated)
+  ================================================================================
+  Interval                                              Count   AvgTrue   AvgPred       MAE
+  ------------------------------------------------------------------------------
+  Interval 0  [Absolute Zero       y == 0.0      ]      6,206    0.0000    0.1731    0.1731
+  Interval 1  [Mild Drought        0.0 < y <= 1.0]      2,255    1.0000    0.6998    0.6607
+  Interval 2  [Moderate Drought    1.0 < y <= 2.0]      1,530    2.0000    1.1296    1.0394
+  Interval 3  [Severe Drought      2.0 < y <= 3.0]        753    3.0000    1.8554    1.1668
+  Interval 4  [Extreme Drought     3.0 < y <= 4.0]        470    4.0000    2.4580    1.5420
+  Interval 5  [Exceptional Drought 4.0 < y <= 5.0]         26    5.0000    2.9595    2.0405
+  ================================================================================
+
+  [Diagnostics Fold 3] Model B Probability range: Min=0.0062, Max=0.9880
+  [Diagnostics Fold 3] Model A Score       range: Min=-0.1191, Max=3.8101
+
+==========================================================================================
+  Overall CV MAE: 0.4361  +/-  0.0961
+
+[Test Set Sample 0, Week 1 Diagnostic]
+  4 Folds Model A preds: [0.065 0.507 0.532 0.836]
+  4 Folds Model B probs: [0.748 0.5   0.513 0.564]
+
+Saved raw test predictions to /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/v52_models/v52_raw_test_preds.pkl
