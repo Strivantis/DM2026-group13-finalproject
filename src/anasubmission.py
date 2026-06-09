@@ -20,6 +20,7 @@ FILES = {
     "V45.1 Raw Rounded": os.path.join(ROOT, "submission_45th_30k_ABraw_rounded.csv"),
     # "V45.1 30k Naked": os.path.join(ROOT, "submission_45th_30k_naked.csv"),
     # "V45.1 30k 25% Zero": os.path.join(ROOT, "submission_45th_30k_25perzero.csv"),
+    "V45.1 30k ShiftStretch": os.path.join(ROOT, "submission_45th_30k_ShiftStretch.csv"),
     # "V47 30k Pruned": os.path.join(ROOT, "submission_47th.csv"),
     # "V48 Tweedie": os.path.join(ROOT, "submission_48th.csv"),
     # "V48 Tweedie Snapped": os.path.join(ROOT, "submission_48th_snap.csv"),
