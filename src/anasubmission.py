@@ -23,12 +23,13 @@ FILES = {
     # "V47 30k Pruned": os.path.join(ROOT, "submission_47th.csv"),
     # "V48 Tweedie": os.path.join(ROOT, "submission_48th.csv"),
     # "V48 Tweedie Snapped": os.path.join(ROOT, "submission_48th_snap.csv"),
-    "V49": os.path.join(ROOT, "submission_49th.csv"),
+    "V49 Multi": os.path.join(ROOT, "submission_49th.csv"),
     
-    "V49 Post-Argmax": os.path.join(ROOT, "submission_49th_A_arg.csv"),
-    "V49 Post-Optimized": os.path.join(ROOT, "submission_49th_B_opt.csv"),
-    "V49 Post-Stacked": os.path.join(ROOT, "submission_49th_C_stack.csv"),
-    "V49 Post-Meta": os.path.join(ROOT, "submission_49th_meta.csv")
+    # "V49 Post-Argmax": os.path.join(ROOT, "submission_49th_A_arg.csv"),
+    # "V49 Post-Optimized": os.path.join(ROOT, "submission_49th_B_opt.csv"),
+    # "V49 Post-Stacked": os.path.join(ROOT, "submission_49th_C_stack.csv"),
+    "V49 Multi Post-Meta": os.path.join(ROOT, "submission_49th_meta.csv"),
+    "V50 (A w/o 0)": os.path.join(ROOT, "submission_50th.csv")
 }
 
 def get_interval_bins(vals):

@@ -59,6 +59,7 @@ FEATURE_COLS = [
     # drought proxy (4)
     "pet", "deficit",
     "prec_roll_sum_4w", "deficit_roll_cum_4w",
+    "aridity_index", "heat_shock", "tmp_anomaly",  # <--- [V51 新增這行]
     # target encoding (2) – injected by train.py per fold, not in CSVs
     "region_mean_score", "region_zero_prob",
 ]   # 29 declared; 6 overlap DROP_COLS → 23 effective | flat dim = 23 × 13 + 23 = 322

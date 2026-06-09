@@ -1,0 +1,450 @@
+==========================================================================================
+Drought Forecasting Pipeline  v50  (Positive-Isolation Dual-Tree Hurdle)
+Model A: LGBMRegressor regression_l1  [POSITIVE SAMPLES ONLY]
+Model B: LGBMClassifier binary         [ALL SAMPLES]
+Feature space: 23 effective × 13 weeks + 23 deltas = 322 dims (29 declared in FEATURE_COLS, DROP_COLS prunes 6)
+OOF gate:  np.where(prob < OOF_BEST_THRESHOLD, 0.0, l1_pred)
+Test gate: np.median(A, axis=folds)  |  np.mean(B, axis=folds)  + np.round()
+CV: 5-Fold StratifiedGroupKFold  (strata: climate cluster_id)
+==========================================================================================
+
+Loading processed data ...
+  train: (1757936, 46)  |  test: (29224, 45)
+  FEATURE_COLS (29): sentinel _v29_normalized=present
+
+Refining features ...
+  train: (1757936, 44)  |  test: (29224, 43)
+
+[Target] mean=0.8357  std=1.2615  zero=59.63%  positive=40.37%
+  flat input dim: 322 effective  (23×13+23; DROP_COLS prunes 6 of 29 declared)
+
+==========================================================================================
+5-Fold StratifiedGroupKFold  (group=region_id)
+==========================================================================================
+  Folds built: 5
+  Fold 0: train_groups=1,797  val_groups=451
+  Fold 1: train_groups=1,798  val_groups=450
+  Fold 2: train_groups=1,799  val_groups=449
+  Fold 3: train_groups=1,799  val_groups=449
+  Fold 4: train_groups=1,799  val_groups=449
+
+==========================================================================================
+Dual-Tree Hurdle Training  (Model A: regression_l1 | Model B: binary)
+==========================================================================================
+
+==========================================================================================
+FOLD 1 / 5
+  train_groups: 1,797  |  val_groups: 451
+==========================================================================================
+  [TE] train regions: 1,797  val regions: 451
+  feat_cols: 29 / 29
+  X_train: (1374705, 406)  |  y_train: (1374705, 5)
+  X_val  : (345015, 406)    |  y_val  : (345015, 5)
+  X_test : (2248, 406)
+
+  --- Week 1 ---
+    [Model A] best_iter=15000  val_MAE_full=0.9173
+    [SAVED-A] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_a_fold0_week0.pkl
+    [Model B] best_iter=15000
+    [SAVED-B] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_b_fold0_week0.pkl
+    [OOF] HurdleMAE=0.3152  zero-gated=58.42%
+    [Diag-A-on-zeros] mean=1.1916  median=1.1566  p10=0.7683  p90=1.6494
+    [Model B diag @0.50] TP=126,610 FP=16,856 FN=13,195 TN=188,354 | precision=0.8825  recall=0.9056  FP_AvgModelA=1.5708  (V50 FP penalty per sample)
+
+  --- Week 2 ---
+    [Model A] best_iter=15000  val_MAE_full=0.9351
+    [SAVED-A] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_a_fold0_week1.pkl
+    [Model B] best_iter=14999
+    [SAVED-B] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_b_fold0_week1.pkl
+    [OOF] HurdleMAE=0.3158  zero-gated=58.39%
+    [Diag-A-on-zeros] mean=1.2195  median=1.1841  p10=0.7955  p90=1.6773
+    [Model B diag @0.50] TP=126,707 FP=16,851 FN=12,954 TN=188,503 | precision=0.8826  recall=0.9072  FP_AvgModelA=1.5927  (V50 FP penalty per sample)
+
+  --- Week 3 ---
+    [Model A] best_iter=15000  val_MAE_full=0.9411
+    [SAVED-A] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_a_fold0_week2.pkl
+    [Model B] best_iter=15000
+    [SAVED-B] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_b_fold0_week2.pkl
+    [OOF] HurdleMAE=0.3153  zero-gated=58.44%
+    [Diag-A-on-zeros] mean=1.2305  median=1.1983  p10=0.8129  p90=1.6778
+    [Model B diag @0.50] TP=126,437 FP=16,965 FN=13,072 TN=188,541 | precision=0.8817  recall=0.9063  FP_AvgModelA=1.5861  (V50 FP penalty per sample)
+
+  --- Week 4 ---
+    [Model A] best_iter=15000  val_MAE_full=0.9543
+    [SAVED-A] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_a_fold0_week3.pkl
+    [Model B] best_iter=15000
+    [SAVED-B] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_b_fold0_week3.pkl
+    [OOF] HurdleMAE=0.3162  zero-gated=58.70%
+    [Diag-A-on-zeros] mean=1.2499  median=1.2146  p10=0.8266  p90=1.7046
+    [Model B diag @0.50] TP=125,867 FP=16,613 FN=13,481 TN=189,054 | precision=0.8834  recall=0.9033  FP_AvgModelA=1.5991  (V50 FP penalty per sample)
+
+  --- Week 5 ---
+    [Model A] best_iter=15000  val_MAE_full=0.9598
+    [SAVED-A] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_a_fold0_week4.pkl
+    [Model B] best_iter=15000
+    [SAVED-B] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_b_fold0_week4.pkl
+    [OOF] HurdleMAE=0.3140  zero-gated=59.00%
+    [Diag-A-on-zeros] mean=1.2598  median=1.2233  p10=0.8347  p90=1.7182
+    [Model B diag @0.50] TP=125,255 FP=16,215 FN=13,944 TN=189,601 | precision=0.8854  recall=0.8998  FP_AvgModelA=1.5971  (V50 FP penalty per sample)
+
+  [Fold 0] L1 raw    : W1=0.9173  W2=0.9351  W3=0.9411  W4=0.9543  W5=0.9598
+  [Fold 0] Hurdle    : W1=0.3152  W2=0.3158  W3=0.3153  W4=0.3162  W5=0.3140
+  [Fold 0] Mean MAE  : 0.3153  (7579.4s)
+
+  ================================================================================
+  BINNED ERROR MATRIX  --  Fold 0  (OOF Hurdle-Gated)
+  ================================================================================
+  Interval                                              Count   AvgTrue   AvgPred       MAE
+  ------------------------------------------------------------------------------
+  Interval 0  [Absolute Zero       y == 0.0      ]    1,027,553    0.0000    0.1291    0.1291
+  Interval 1  [Mild Drought        0.0 < y <= 1.0]    299,526    1.0000    1.1871    0.5932
+  Interval 2  [Moderate Drought    1.0 < y <= 2.0]    183,316    2.0000    1.9009    0.4323
+  Interval 3  [Severe Drought      2.0 < y <= 3.0]    115,912    3.0000    2.5713    0.5952
+  Interval 4  [Extreme Drought     3.0 < y <= 4.0]     66,564    4.0000    3.2845    0.7995
+  Interval 5  [Exceptional Drought 4.0 < y <= 5.0]     32,204    5.0000    4.0664    0.9969
+  ================================================================================
+
+
+==========================================================================================
+FOLD 2 / 5
+  train_groups: 1,798  |  val_groups: 450
+==========================================================================================
+  [TE] train regions: 1,798  val regions: 450
+  feat_cols: 29 / 29
+  X_train: (1375470, 406)  |  y_train: (1375470, 5)
+  X_val  : (344250, 406)    |  y_val  : (344250, 5)
+  X_test : (2248, 406)
+
+  --- Week 1 ---
+    [Model A] best_iter=15000  val_MAE_full=0.9067
+    [SAVED-A] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_a_fold1_week0.pkl
+    [Model B] best_iter=14998
+    [SAVED-B] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_b_fold1_week0.pkl
+    [OOF] HurdleMAE=0.3053  zero-gated=59.63%
+    [Diag-A-on-zeros] mean=1.1723  median=1.1470  p10=0.7479  p90=1.6167
+    [Model B diag @0.50] TP=124,459 FP=14,526 FN=14,327 TN=190,938 | precision=0.8955  recall=0.8968  FP_AvgModelA=1.5468  (V50 FP penalty per sample)
+
+  --- Week 2 ---
+    [Model A] best_iter=15000  val_MAE_full=0.9071
+    [SAVED-A] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_a_fold1_week1.pkl
+    [Model B] best_iter=14998
+    [SAVED-B] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_b_fold1_week1.pkl
+    [OOF] HurdleMAE=0.3057  zero-gated=59.71%
+    [Diag-A-on-zeros] mean=1.1741  median=1.1402  p10=0.7580  p90=1.6246
+    [Model B diag @0.50] TP=124,071 FP=14,611 FN=14,590 TN=190,978 | precision=0.8946  recall=0.8948  FP_AvgModelA=1.5504  (V50 FP penalty per sample)
+
+  --- Week 3 ---
+    [Model A] best_iter=15000  val_MAE_full=0.9221
+    [SAVED-A] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_a_fold1_week2.pkl
+    [Model B] best_iter=14998
+    [SAVED-B] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_b_fold1_week2.pkl
+    [OOF] HurdleMAE=0.3063  zero-gated=59.85%
+    [Diag-A-on-zeros] mean=1.1966  median=1.1638  p10=0.7801  p90=1.6426
+    [Model B diag @0.50] TP=123,754 FP=14,447 FN=14,771 TN=191,278 | precision=0.8955  recall=0.8934  FP_AvgModelA=1.5547  (V50 FP penalty per sample)
+
+  --- Week 4 ---
+    [Model A] best_iter=15000  val_MAE_full=0.9369
+    [SAVED-A] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_a_fold1_week3.pkl
+    [Model B] best_iter=15000
+    [SAVED-B] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_b_fold1_week3.pkl
+    [OOF] HurdleMAE=0.3080  zero-gated=59.92%
+    [Diag-A-on-zeros] mean=1.2193  median=1.1834  p10=0.7973  p90=1.6764
+    [Model B diag @0.50] TP=123,452 FP=14,508 FN=14,929 TN=191,361 | precision=0.8948  recall=0.8921  FP_AvgModelA=1.5771  (V50 FP penalty per sample)
+
+  --- Week 5 ---
+    [Model A] best_iter=15000  val_MAE_full=0.9448
+    [SAVED-A] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_a_fold1_week4.pkl
+    [Model B] best_iter=14999
+    [SAVED-B] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_b_fold1_week4.pkl
+    [OOF] HurdleMAE=0.3073  zero-gated=60.22%
+    [Diag-A-on-zeros] mean=1.2324  median=1.2006  p10=0.8046  p90=1.6906
+    [Model B diag @0.50] TP=122,784 FP=14,157 FN=15,460 TN=191,849 | precision=0.8966  recall=0.8882  FP_AvgModelA=1.5738  (V50 FP penalty per sample)
+
+  [Fold 1] L1 raw    : W1=0.9067  W2=0.9071  W3=0.9221  W4=0.9369  W5=0.9448
+  [Fold 1] Hurdle    : W1=0.3053  W2=0.3057  W3=0.3063  W4=0.3080  W5=0.3073
+  [Fold 1] Mean MAE  : 0.3065  (7591.8s)
+
+  ================================================================================
+  BINNED ERROR MATRIX  --  Fold 1  (OOF Hurdle-Gated)
+  ================================================================================
+  Interval                                              Count   AvgTrue   AvgPred       MAE
+  ------------------------------------------------------------------------------
+  Interval 0  [Absolute Zero       y == 0.0      ]    1,028,653    0.0000    0.1096    0.1096
+  Interval 1  [Mild Drought        0.0 < y <= 1.0]    295,029    1.0000    1.1296    0.5862
+  Interval 2  [Moderate Drought    1.0 < y <= 2.0]    183,844    2.0000    1.8609    0.4421
+  Interval 3  [Severe Drought      2.0 < y <= 3.0]    114,770    3.0000    2.5073    0.6353
+  Interval 4  [Extreme Drought     3.0 < y <= 4.0]     65,510    4.0000    3.2289    0.8602
+  Interval 5  [Exceptional Drought 4.0 < y <= 5.0]     33,444    5.0000    4.1054    0.9382
+  ================================================================================
+
+
+==========================================================================================
+FOLD 3 / 5
+  train_groups: 1,799  |  val_groups: 449
+==========================================================================================
+  [TE] train regions: 1,799  val regions: 449
+  feat_cols: 29 / 29
+  X_train: (1376235, 406)  |  y_train: (1376235, 5)
+  X_val  : (343485, 406)    |  y_val  : (343485, 5)
+  X_test : (2248, 406)
+
+  --- Week 1 ---
+    [Model A] best_iter=15000  val_MAE_full=0.9284
+    [SAVED-A] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_a_fold2_week0.pkl
+    [Model B] best_iter=14991
+    [SAVED-B] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_b_fold2_week0.pkl
+    [OOF] HurdleMAE=0.3134  zero-gated=59.41%
+    [Diag-A-on-zeros] mean=1.2029  median=1.1821  p10=0.7559  p90=1.6622
+    [Model B diag @0.50] TP=123,903 FP=15,529 FN=14,166 TN=189,887 | precision=0.8886  recall=0.8974  FP_AvgModelA=1.5853  (V50 FP penalty per sample)
+
+  --- Week 2 ---
+    [Model A] best_iter=15000  val_MAE_full=0.9368
+    [SAVED-A] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_a_fold2_week1.pkl
+    [Model B] best_iter=14999
+    [SAVED-B] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_b_fold2_week1.pkl
+    [OOF] HurdleMAE=0.3142  zero-gated=59.54%
+    [Diag-A-on-zeros] mean=1.2158  median=1.1854  p10=0.7812  p90=1.6756
+    [Model B diag @0.50] TP=123,522 FP=15,435 FN=14,435 TN=190,093 | precision=0.8889  recall=0.8954  FP_AvgModelA=1.5952  (V50 FP penalty per sample)
+
+  --- Week 3 ---
+    [Model A] best_iter=15000  val_MAE_full=0.9320
+    [SAVED-A] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_a_fold2_week2.pkl
+    [Model B] best_iter=15000
+    [SAVED-B] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_b_fold2_week2.pkl
+    [OOF] HurdleMAE=0.3112  zero-gated=59.55%
+    [Diag-A-on-zeros] mean=1.2109  median=1.1732  p10=0.7977  p90=1.6595
+    [Model B diag @0.50] TP=123,499 FP=15,441 FN=14,345 TN=190,200 | precision=0.8889  recall=0.8959  FP_AvgModelA=1.5756  (V50 FP penalty per sample)
+
+  --- Week 4 ---
+    [Model A] best_iter=15000  val_MAE_full=0.9571
+    [SAVED-A] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_a_fold2_week3.pkl
+    [Model B] best_iter=14983
+    [SAVED-B] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_b_fold2_week3.pkl
+    [OOF] HurdleMAE=0.3139  zero-gated=59.80%
+    [Diag-A-on-zeros] mean=1.2487  median=1.2176  p10=0.8145  p90=1.7030
+    [Model B diag @0.50] TP=122,905 FP=15,177 FN=14,817 TN=190,586 | precision=0.8901  recall=0.8924  FP_AvgModelA=1.6047  (V50 FP penalty per sample)
+
+  --- Week 5 ---
+    [Model A] best_iter=15000  val_MAE_full=0.9561
+    [SAVED-A] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_a_fold2_week4.pkl
+    [Model B] best_iter=14969
+    [SAVED-B] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_b_fold2_week4.pkl
+    [OOF] HurdleMAE=0.3115  zero-gated=59.97%
+    [Diag-A-on-zeros] mean=1.2488  median=1.2098  p10=0.8157  p90=1.7168
+    [Model B diag @0.50] TP=122,522 FP=14,961 FN=15,092 TN=190,910 | precision=0.8912  recall=0.8903  FP_AvgModelA=1.5957  (V50 FP penalty per sample)
+
+  [Fold 2] L1 raw    : W1=0.9284  W2=0.9368  W3=0.9320  W4=0.9571  W5=0.9561
+  [Fold 2] Hurdle    : W1=0.3134  W2=0.3142  W3=0.3112  W4=0.3139  W5=0.3115
+  [Fold 2] Mean MAE  : 0.3128  (7648.6s)
+
+  ================================================================================
+  BINNED ERROR MATRIX  --  Fold 2  (OOF Hurdle-Gated)
+  ================================================================================
+  Interval                                              Count   AvgTrue   AvgPred       MAE
+  ------------------------------------------------------------------------------
+  Interval 0  [Absolute Zero       y == 0.0      ]    1,028,219    0.0000    0.1185    0.1185
+  Interval 1  [Mild Drought        0.0 < y <= 1.0]    294,614    1.0000    1.1534    0.6003
+  Interval 2  [Moderate Drought    1.0 < y <= 2.0]    178,863    2.0000    1.8517    0.4416
+  Interval 3  [Severe Drought      2.0 < y <= 3.0]    113,722    3.0000    2.5368    0.6127
+  Interval 4  [Extreme Drought     3.0 < y <= 4.0]     66,943    4.0000    3.2372    0.8377
+  Interval 5  [Exceptional Drought 4.0 < y <= 5.0]     35,064    5.0000    4.1126    0.9658
+  ================================================================================
+
+
+==========================================================================================
+FOLD 4 / 5
+  train_groups: 1,799  |  val_groups: 449
+==========================================================================================
+  [TE] train regions: 1,799  val regions: 449
+  feat_cols: 29 / 29
+  X_train: (1376235, 406)  |  y_train: (1376235, 5)
+  X_val  : (343485, 406)    |  y_val  : (343485, 5)
+  X_test : (2248, 406)
+
+  --- Week 1 ---
+    [Model A] best_iter=15000  val_MAE_full=0.9240
+    [SAVED-A] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_a_fold3_week0.pkl
+    [Model B] best_iter=14993
+    [SAVED-B] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_b_fold3_week0.pkl
+    [OOF] HurdleMAE=0.3203  zero-gated=58.67%
+    [Diag-A-on-zeros] mean=1.1996  median=1.1632  p10=0.7661  p90=1.6648
+    [Model B diag @0.50] TP=126,517 FP=15,447 FN=14,164 TN=187,357 | precision=0.8912  recall=0.8993  FP_AvgModelA=1.6016  (V50 FP penalty per sample)
+
+  --- Week 2 ---
+    [Model A] best_iter=15000  val_MAE_full=0.9351
+    [SAVED-A] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_a_fold3_week1.pkl
+    [Model B] best_iter=14998
+    [SAVED-B] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_b_fold3_week1.pkl
+    [OOF] HurdleMAE=0.3208  zero-gated=58.90%
+    [Diag-A-on-zeros] mean=1.2176  median=1.1817  p10=0.7810  p90=1.6837
+    [Model B diag @0.50] TP=126,034 FP=15,131 FN=14,533 TN=187,787 | precision=0.8928  recall=0.8966  FP_AvgModelA=1.6217  (V50 FP penalty per sample)
+
+  --- Week 3 ---
+    [Model A] best_iter=15000  val_MAE_full=0.9447
+    [SAVED-A] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_a_fold3_week2.pkl
+    [Model B] best_iter=14989
+    [SAVED-B] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_b_fold3_week2.pkl
+    [OOF] HurdleMAE=0.3234  zero-gated=58.83%
+    [Diag-A-on-zeros] mean=1.2316  median=1.1928  p10=0.7968  p90=1.6992
+    [Model B diag @0.50] TP=125,896 FP=15,507 FN=14,550 TN=187,532 | precision=0.8903  recall=0.8964  FP_AvgModelA=1.6258  (V50 FP penalty per sample)
+
+  --- Week 4 ---
+    [Model A] best_iter=15000  val_MAE_full=0.9607
+    [SAVED-A] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_a_fold3_week3.pkl
+    [Model B] best_iter=15000
+    [SAVED-B] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_b_fold3_week3.pkl
+    [OOF] HurdleMAE=0.3236  zero-gated=59.02%
+    [Diag-A-on-zeros] mean=1.2571  median=1.2184  p10=0.8195  p90=1.7266
+    [Model B diag @0.50] TP=125,471 FP=15,295 FN=14,850 TN=187,869 | precision=0.8913  recall=0.8942  FP_AvgModelA=1.6357  (V50 FP penalty per sample)
+
+  --- Week 5 ---
+    [Model A] best_iter=15000  val_MAE_full=0.9733
+    [SAVED-A] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_a_fold3_week4.pkl
+    [Model B] best_iter=15000
+    [SAVED-B] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_b_fold3_week4.pkl
+    [OOF] HurdleMAE=0.3236  zero-gated=59.18%
+    [Diag-A-on-zeros] mean=1.2785  median=1.2368  p10=0.8394  p90=1.7588
+    [Model B diag @0.50] TP=125,094 FP=15,133 FN=15,110 TN=188,148 | precision=0.8921  recall=0.8922  FP_AvgModelA=1.6586  (V50 FP penalty per sample)
+
+  [Fold 3] L1 raw    : W1=0.9240  W2=0.9351  W3=0.9447  W4=0.9607  W5=0.9733
+  [Fold 3] Hurdle    : W1=0.3203  W2=0.3208  W3=0.3234  W4=0.3236  W5=0.3236
+  [Fold 3] Mean MAE  : 0.3224  (7682.3s)
+
+  ================================================================================
+  BINNED ERROR MATRIX  --  Fold 3  (OOF Hurdle-Gated)
+  ================================================================================
+  Interval                                              Count   AvgTrue   AvgPred       MAE
+  ------------------------------------------------------------------------------
+  Interval 0  [Absolute Zero       y == 0.0      ]    1,015,206    0.0000    0.1227    0.1227
+  Interval 1  [Mild Drought        0.0 < y <= 1.0]    299,782    1.0000    1.1945    0.6281
+  Interval 2  [Moderate Drought    1.0 < y <= 2.0]    185,520    2.0000    1.9261    0.4581
+  Interval 3  [Severe Drought      2.0 < y <= 3.0]    118,222    3.0000    2.5709    0.6011
+  Interval 4  [Extreme Drought     3.0 < y <= 4.0]     69,991    4.0000    3.2725    0.8300
+  Interval 5  [Exceptional Drought 4.0 < y <= 5.0]     28,704    5.0000    4.1420    0.9265
+  ================================================================================
+
+
+==========================================================================================
+FOLD 5 / 5
+  train_groups: 1,799  |  val_groups: 449
+==========================================================================================
+  [TE] train regions: 1,799  val regions: 449
+  feat_cols: 29 / 29
+  X_train: (1376235, 406)  |  y_train: (1376235, 5)
+  X_val  : (343485, 406)    |  y_val  : (343485, 5)
+  X_test : (2248, 406)
+
+  --- Week 1 ---
+    [Model A] best_iter=15000  val_MAE_full=0.9369
+    [SAVED-A] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_a_fold4_week0.pkl
+    [Model B] best_iter=14991
+    [SAVED-B] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_b_fold4_week0.pkl
+    [OOF] HurdleMAE=0.3142  zero-gated=59.71%
+    [Diag-A-on-zeros] mean=1.2200  median=1.1936  p10=0.7868  p90=1.6800
+    [Model B diag @0.50] TP=123,903 FP=14,494 FN=15,726 TN=189,362 | precision=0.8953  recall=0.8874  FP_AvgModelA=1.5511  (V50 FP penalty per sample)
+
+  --- Week 2 ---
+    [Model A] best_iter=15000  val_MAE_full=0.9299
+    [SAVED-A] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_a_fold4_week1.pkl
+    [Model B] best_iter=15000
+    [SAVED-B] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_b_fold4_week1.pkl
+    [OOF] HurdleMAE=0.3123  zero-gated=59.61%
+    [Diag-A-on-zeros] mean=1.2099  median=1.1742  p10=0.7766  p90=1.6840
+    [Model B diag @0.50] TP=124,131 FP=14,615 FN=15,384 TN=189,355 | precision=0.8947  recall=0.8897  FP_AvgModelA=1.5497  (V50 FP penalty per sample)
+
+  --- Week 3 ---
+    [Model A] best_iter=15000  val_MAE_full=0.9541
+    [SAVED-A] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_a_fold4_week2.pkl
+    [Model B] best_iter=15000
+    [SAVED-B] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_b_fold4_week2.pkl
+    [OOF] HurdleMAE=0.3160  zero-gated=59.43%
+    [Diag-A-on-zeros] mean=1.2503  median=1.2100  p10=0.8316  p90=1.7115
+    [Model B diag @0.50] TP=124,070 FP=15,295 FN=15,323 TN=188,797 | precision=0.8903  recall=0.8901  FP_AvgModelA=1.5707  (V50 FP penalty per sample)
+
+  --- Week 4 ---
+    [Model A] best_iter=15000  val_MAE_full=0.9503
+    [SAVED-A] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_a_fold4_week3.pkl
+    [Model B] best_iter=15000
+    [SAVED-B] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_b_fold4_week3.pkl
+    [OOF] HurdleMAE=0.3141  zero-gated=59.54%
+    [Diag-A-on-zeros] mean=1.2426  median=1.2113  p10=0.8099  p90=1.7107
+    [Model B diag @0.50] TP=123,930 FP=15,031 FN=15,328 TN=189,196 | precision=0.8918  recall=0.8899  FP_AvgModelA=1.5568  (V50 FP penalty per sample)
+
+  --- Week 5 ---
+    [Model A] best_iter=15000  val_MAE_full=0.9697
+    [SAVED-A] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_a_fold4_week4.pkl
+    [Model B] best_iter=14997
+    [SAVED-B] /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/models/lgbm_b_fold4_week4.pkl
+    [OOF] HurdleMAE=0.3145  zero-gated=59.92%
+    [Diag-A-on-zeros] mean=1.2750  median=1.2351  p10=0.8463  p90=1.7480
+    [Model B diag @0.50] TP=123,054 FP=14,606 FN=16,084 TN=189,741 | precision=0.8939  recall=0.8844  FP_AvgModelA=1.5800  (V50 FP penalty per sample)
+
+  [Fold 4] L1 raw    : W1=0.9369  W2=0.9299  W3=0.9541  W4=0.9503  W5=0.9697
+  [Fold 4] Hurdle    : W1=0.3142  W2=0.3123  W3=0.3160  W4=0.3141  W5=0.3145
+  [Fold 4] Mean MAE  : 0.3142  (7708.2s)
+
+  ================================================================================
+  BINNED ERROR MATRIX  --  Fold 4  (OOF Hurdle-Gated)
+  ================================================================================
+  Interval                                              Count   AvgTrue   AvgPred       MAE
+  ------------------------------------------------------------------------------
+  Interval 0  [Absolute Zero       y == 0.0      ]    1,020,492    0.0000    0.1133    0.1133
+  Interval 1  [Mild Drought        0.0 < y <= 1.0]    302,600    1.0000    1.1721    0.6286
+  Interval 2  [Moderate Drought    1.0 < y <= 2.0]    182,812    2.0000    1.9097    0.4478
+  Interval 3  [Severe Drought      2.0 < y <= 3.0]    115,356    3.0000    2.5775    0.5942
+  Interval 4  [Extreme Drought     3.0 < y <= 4.0]     67,336    4.0000    3.2701    0.8233
+  Interval 5  [Exceptional Drought 4.0 < y <= 5.0]     28,829    5.0000    4.1010    0.9689
+  ================================================================================
+
+
+==========================================================================================
+5-Fold CV Summary
+==========================================================================================
+  Fold 0: W1=0.3152  W2=0.3158  W3=0.3153  W4=0.3162  W5=0.3140  -> Mean=0.3153
+  Fold 1: W1=0.3053  W2=0.3057  W3=0.3063  W4=0.3080  W5=0.3073  -> Mean=0.3065
+  Fold 2: W1=0.3134  W2=0.3142  W3=0.3112  W4=0.3139  W5=0.3115  -> Mean=0.3128
+  Fold 3: W1=0.3203  W2=0.3208  W3=0.3234  W4=0.3236  W5=0.3236  -> Mean=0.3224
+  Fold 4: W1=0.3142  W2=0.3123  W3=0.3160  W4=0.3141  W5=0.3145  -> Mean=0.3142
+
+  Overall CV MAE: 0.3142  ±  0.0051
+  Best  Fold: 1 (MAE=0.3065)
+  Worst Fold: 3 (MAE=0.3224)
+
+  Per-week breakdown:
+    Week 1: mean=0.3137  std=0.0048
+    Week 2: mean=0.3138  std=0.0049
+    Week 3: mean=0.3144  std=0.0057
+    Week 4: mean=0.3152  std=0.0050
+    Week 5: mean=0.3142  std=0.0054
+
+==========================================================================================
+OOF Hurdle Threshold Optimisation  (v50: FP penalty amplified — Model A never sees y=0)
+==========================================================================================
+  Grid scan best: threshold=0.6500  OOF_MAE=0.306333
+  Optimised threshold : 0.653812  OOF_MAE=0.306328
+  Baseline (0.50)     : OOF_MAE=0.314247
+  Delta               : +0.007919
+
+==========================================================================================
+Asymmetric Ensemble  (5 folds)
+  Model A → np.median  (robust to fold outliers)
+  Model B → np.mean    (probability averaging)
+==========================================================================================
+  l1_median: mean=1.8958  std=0.7133
+  prob_mean: mean=0.6762  fraction<0.5=27.75%
+  Using optimised threshold: 0.6538  (was fixed 0.5)
+  Post-gate (continuous): mean=1.3495  std=1.2010  exact-zero=38.80%
+  Post-round (integer):   mean=1.3443  std=1.2191  exact-zero=38.80%
+
+Formatting submission.csv ...
+  submission.csv → /home/sean/KC3000/NYCU/114-2/Data Mining/FinalProject/submission.csv  (2248 rows)
+
+  Preview:
+region_id  pred_week1  pred_week2  pred_week3  pred_week4  pred_week5
+       R1         0.0         0.0         0.0         0.0         0.0
+    R1001         2.0         2.0         2.0         2.0         2.0
+    R1002         0.0         0.0         0.0         0.0         0.0
+    R1005         2.0         1.0         2.0         2.0         2.0
+    R1006         2.0         2.0         2.0         3.0         3.0
+
+Total elapsed: 38225.3s  (637.1 min)
