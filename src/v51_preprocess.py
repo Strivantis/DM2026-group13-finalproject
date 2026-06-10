@@ -1,20 +1,7 @@
 """
-v51_preprocess.py – Full Preprocessing Pipeline (V51)
-=========================================================
-Pipeline steps (daily → weekly → processed CSVs):
-  1.  Load train.csv / test.csv.
-  2.  Per-region ffill/bfill imputation on MET_COLS.
-  3.  Global Z=3.5 outlier clip on MET_COLS (temp only).
-  4.  Parallelised climatology pre-padding of test set.
-  5.  Weekly aggregation.
-  6.  4-week rolling and 1–2 week lag features.
-  7.  Drought index & V51 Strategic Features (aridity, heat_shock, anomaly).
-      * tmp_anomaly strictly uses Train Set historical statistics to prevent leakage.
-  8.  K-Means climate clustering (n=10).
-  9.  Log1p on prec columns.
-  10. _v29_normalized sentinel column.
-  11. Strip test pre-padding.
-  12. Export.
+v51_preprocess.py
+Full Preprocessing Pipeline (V51)
+Executes regional imputation, outlier treatment, climatology padding, feature engineering, and eco-clustering.
 """
 
 import os
@@ -61,11 +48,11 @@ _MONTH_OFFSET = [0, 31, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335]
 _DAYS_IN_MONTH_COMMON = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
 _DAYS_PER_SYNTH_YEAR = 366
 
-# 全域變數：儲存 Train Set 的溫度統計量，供 Test Set Mapping 使用
+# Global historical cache to prevent test-set target leakage during feature derivation
 GLOBAL_TRAIN_TMP_STATS = None
 
 # ---------------------------------------------------------------------------
-# Date helpers
+# Date Helpers
 # ---------------------------------------------------------------------------
 def _parse_doy(date_str: str) -> int:
     parts = date_str.split("-")
@@ -101,7 +88,7 @@ def _subtract_days(region_id, date_str, subtract_days, region_leap_remainder):
     return f"{y}-{m:02d}-{d:02d}"
 
 # ---------------------------------------------------------------------------
-# Data loading
+# Data Loading & Clean-up
 # ---------------------------------------------------------------------------
 def load_data(filename: str) -> pd.DataFrame:
     path = os.path.join(_DATA, filename)
@@ -118,7 +105,7 @@ def impute_met_features(df: pd.DataFrame) -> pd.DataFrame:
 
 def handle_outliers(df: pd.DataFrame, z_thresh: float = 3.5) -> pd.DataFrame:
     df = df.copy()
-    # [V51 修正] 只 Clip 溫度特徵
+    # Explicitly constrain clipping bounds to temperature fields
     cols_to_clip = ["tmp", "dp_tmp", "wb_tmp", "tmp_max", "tmp_min", "surf_tmp"]
     
     for col in cols_to_clip:
@@ -132,7 +119,7 @@ def handle_outliers(df: pd.DataFrame, z_thresh: float = 3.5) -> pd.DataFrame:
     return df
 
 # ---------------------------------------------------------------------------
-# V29 – Parallelised Climatology Pre-Padding
+# Climatology Padding
 # ---------------------------------------------------------------------------
 def _pad_one_region(region, group, baseline_dict, global_mean_vals, met_cols,
                     pad_days, region_leap_remainder):
@@ -167,7 +154,7 @@ def apply_climatology_padding(
     train_doy = train_raw.copy()
     train_doy["doy"] = train_doy["date"].apply(_parse_doy)
 
-    print("   [V29] Detecting per-region leap-year cycles ...")
+    print("Preprocessing: Mapping per-region leap-year cycles")
     region_leap_remainder = {}
     has_feb29 = train_doy["date"].str.endswith("-02-29")
     if has_feb29.any():
@@ -188,7 +175,7 @@ def apply_climatology_padding(
 
     groups = list(test_raw.groupby("region_id"))
     n_jobs = min(os.cpu_count() or 8, 32)
-    print(f"   [V29] Padding {len(groups)} test regions in parallel (n_jobs={n_jobs}) ...")
+    print(f"Preprocessing: Padding {len(groups)} test records in parallel (n_jobs={n_jobs})")
 
     results = Parallel(n_jobs=n_jobs, prefer="threads")(
         delayed(_pad_one_region)(
@@ -201,7 +188,7 @@ def apply_climatology_padding(
     return pd.concat(results, ignore_index=True)
 
 # ---------------------------------------------------------------------------
-# Weekly aggregation
+# Temporal Aggregation
 # ---------------------------------------------------------------------------
 def align_labels_absolute(df: pd.DataFrame, is_train: bool = True) -> pd.DataFrame:
     df = df.copy().sort_values(["region_id", "date"], ignore_index=True)
@@ -264,13 +251,13 @@ def align_labels_absolute(df: pd.DataFrame, is_train: bool = True) -> pd.DataFra
     weekly["week_cos"]     = np.cos(2.0 * np.pi * ratio_arr).astype(np.float32)
     weekly["day_ordinal"]  = weekly["week_end_date"].map(_parse_ordinal).astype(np.int64)
 
-    return weekly
+    return weekly /# Format sub segments using base mapping logic
 
 def aggregate_test_weekly(df: pd.DataFrame) -> pd.DataFrame:
     return align_labels_absolute(df, is_train=False)
 
 # ---------------------------------------------------------------------------
-# Rolling + lag features
+# Feature Engineering (Rolling & Lags)
 # ---------------------------------------------------------------------------
 def preprocess_data(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy().sort_values(["region_id", "week_idx"], ignore_index=True)
@@ -306,15 +293,13 @@ def preprocess_data(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 # ---------------------------------------------------------------------------
-# Drought Index & V51 Strategic Features
+# Strategic Indicators & Anomaly Mapping
 # ---------------------------------------------------------------------------
 def add_drought_index(df: pd.DataFrame, is_train: bool = True) -> pd.DataFrame:
     global GLOBAL_TRAIN_TMP_STATS
     df = df.copy()
     
-    # ---------------------------------------------------------------------
-    # [原版保留] 基礎蒸發與赤字
-    # ---------------------------------------------------------------------
+    # Core evaporation metrics
     df["pet"]     = (0.55 * df["tmp"].clip(lower=0.0)).astype(np.float32)
     df["deficit"] = (df["prec"] - df["pet"]).astype(np.float32)
 
@@ -326,30 +311,23 @@ def add_drought_index(df: pd.DataFrame, is_train: bool = True) -> pd.DataFrame:
             .astype(np.float32)
         )
 
-    # ---------------------------------------------------------------------
-    # [V51 新增] 戰略特徵擴增 (針對高分段預測)
-    # ---------------------------------------------------------------------
-    # 1. 非線性乾燥指數 (Aridity Index)
+    # Nonlinear variations
     df["aridity_index"] = (df["tmp"] / (df["humidity"] + 1.0)).astype(np.float32)
     
-    # 2. 熱衝擊指數 (Heat Shock)
     if "tmp_week_max" in df.columns:
         df["heat_shock"] = (df["tmp_week_max"] - df["tmp"]).astype(np.float32)
         
-    # 3. 區域氣候異常度 (Temperature Anomaly) - 嚴格解決 Covariate Shift
+    # Temperature anomaly scaling anchored strictly to baseline metrics to prevent data leakage
     if is_train:
-        # 在 Train Set 計算區域均值並存入全域變數
         stats = df.groupby("region_id")["tmp"].agg(["mean", "std"]).reset_index()
-        stats["std"] = stats["std"].replace(0, 1.0) # 避免除以零
+        stats["std"] = stats["std"].replace(0, 1.0)
         GLOBAL_TRAIN_TMP_STATS = stats.set_index("region_id").to_dict("index")
         
         region_tmp_mean = df["region_id"].map(lambda rid: GLOBAL_TRAIN_TMP_STATS[rid]["mean"])
         region_tmp_std  = df["region_id"].map(lambda rid: GLOBAL_TRAIN_TMP_STATS[rid]["std"])
-        
     else:
-        # 在 Test Set 處理時，強制讀取 Train Set 計算出的歷史均值 (如果沒有就 fallback 到區域目前平均)
         if GLOBAL_TRAIN_TMP_STATS is None:
-            raise ValueError("GLOBAL_TRAIN_TMP_STATS is not initialized. Process train data first.")
+            raise ValueError("GLOBAL_TRAIN_TMP_STATS uninitialized. Process training cohort first.")
             
         region_tmp_mean = df["region_id"].map(
             lambda rid: GLOBAL_TRAIN_TMP_STATS.get(rid, {"mean": df[df["region_id"]==rid]["tmp"].mean()})["mean"]
@@ -360,7 +338,6 @@ def add_drought_index(df: pd.DataFrame, is_train: bool = True) -> pd.DataFrame:
 
     df["tmp_anomaly"] = ((df["tmp"] - region_tmp_mean) / region_tmp_std).astype(np.float32)
 
-    # 處理 Test set 前幾週缺失值 (ffill)
     if not is_train:
         v51_new_cols = ["aridity_index", "heat_shock", "tmp_anomaly"]
         for col in DROUGHT_FEAT_COLS + v51_new_cols:
@@ -371,7 +348,7 @@ def add_drought_index(df: pd.DataFrame, is_train: bool = True) -> pd.DataFrame:
     return df
 
 # ---------------------------------------------------------------------------
-# V29 – K-Means Climate Clustering
+# Eco-System Unsupervised Clustering
 # ---------------------------------------------------------------------------
 def compute_climate_clusters(
     train_w: pd.DataFrame,
@@ -407,15 +384,14 @@ def compute_climate_clusters(
     region_stats["cluster_id"] = kmeans.fit_predict(X_scaled).astype(np.int8)
 
     cluster_dist = region_stats["cluster_id"].value_counts().sort_index()
-    print(f"   [V29] Cluster distribution (10 ecosystems):")
+    print("Clustering: Eco-system cluster distribution summary:")
     for cid, cnt in cluster_dist.items():
-        print(f"          Cluster {cid:2d}: {cnt:4d} regions")
+        print(f"  Cluster {cid:02d}: {cnt:4d} regions")
 
     return region_stats[["region_id", "cluster_id"] + cluster_feats]
 
-
 # ---------------------------------------------------------------------------
-# Export
+# Data Export
 # ---------------------------------------------------------------------------
 def export_processed(
     train_df: pd.DataFrame,
@@ -428,60 +404,56 @@ def export_processed(
     if fmt == "csv":
         train_df.to_csv(train_path, index=False)
         test_df.to_csv(test_path, index=False)
-    print(f"  Exported train -> {train_path}  {train_df.shape}")
-    print(f"  Exported test  -> {test_path}   {test_df.shape}")
+    print(f"I/O: Train file exported to {train_path} {train_df.shape}")
+    print(f"I/O: Test file exported to {test_path} {test_df.shape}")
 
 # ---------------------------------------------------------------------------
-# Main pipeline
+# Execution Execution Core
 # ---------------------------------------------------------------------------
 def main():
     t0 = time.time()
     os.makedirs(_PROC, exist_ok=True)
 
-    print("=" * 75)
-    print("Preprocessing Pipeline V51 (Strategic Features Added)")
-    print("  Per-region normalisation | K-Means clustering | Parallel padding")
-    print("=" * 75)
+    print("--- [v51_preprocess.py] Pipeline Init ---")
 
-    # ---- 1. Load raw data ---------------------------------------------------
-    print("\nLoading raw data ...")
+    # 1. Load data
+    print("I/O: Loading raw data cohorts")
     train_raw = load_data("train.csv")
     test_raw  = load_data("test.csv")
-    print(f"  train_raw: {train_raw.shape}  |  test_raw: {test_raw.shape}")
+    print(f"Data: train_raw shape = {train_raw.shape} | test_raw shape = {test_raw.shape}")
 
-    # ---- 2. Impute meteorological features ---------------------------------
-    print("\nImputing met features (ffill/bfill per region) ...")
+    # 2. Impute variables
+    print("Preprocessing: Executing per-region imputation (ffill/bfill)")
     train_raw = impute_met_features(train_raw)
     test_raw  = impute_met_features(test_raw)
 
-    # ---- 3. Outlier clipping -----------------------------------------------
-    print("Outlier clipping (Z=3.5, global, tmp only) ...")
+    # 3. Outlier treatment
+    print("Preprocessing: Executing global outlier clipping (Z=3.5, temperature only)")
     train_raw = handle_outliers(train_raw, z_thresh=3.5)
     test_raw  = handle_outliers(test_raw,  z_thresh=3.5)
 
-    # ---- 4. Climatology pre-padding for test set ---------------------------
-    print("\n[V29] Climatology pre-padding: test set (21 days, parallelised) ...")
+    # 4. Padding
+    print("Preprocessing: Applying climatology pre-padding to test set (21 days)")
     test_raw = apply_climatology_padding(train_raw, test_raw, pad_weeks=3)
 
-    # ---- 5. Weekly aggregation ---------------------------------------------
-    print("\nWeekly aggregation ...")
+    # 5. Weekly grouping
+    print("Preprocessing: Aggregating daily timeline into absolute weekly slots")
     train_w = align_labels_absolute(train_raw, is_train=True)
     test_w  = aggregate_test_weekly(test_raw)
-    print(f"  train_w: {train_w.shape}  |  test_w: {test_w.shape}")
+    print(f"Data: train_w shape = {train_w.shape} | test_w shape = {test_w.shape}")
 
-    # ---- 6. Rolling + lag features -----------------------------------------
-    print("\nAdding rolling (4w) & lag features ...")
+    # 6. Feature expansion
+    print("FeatureEngineering: Generating 4-week rolling windows and step lags")
     train_w = preprocess_data(train_w)
     test_w  = preprocess_data(test_w)
 
-    # ---- 7. Drought Index & V51 Features ------------------------------------
-    print("\nComputing drought index & V51 features (aridity, heat_shock, anomaly) ...")
-    # [關鍵確保] 必須先處理 train_w 建立 GLOBAL_TRAIN_TMP_STATS
+    # 7. Strategic feature calculation
+    print("FeatureEngineering: Calculating drought indices and strategic anomalies")
     train_w = add_drought_index(train_w, is_train=True)
     test_w  = add_drought_index(test_w,  is_train=False)
 
-    # ---- 8. K-Means climate clustering -------------------------------------
-    print("\n[V29] K-Means climate clustering (n=10) from raw climate stats ...")
+    # 8. Unsupervised clustering
+    print("Clustering: Extrapolating K-Means climate targets (n=10)")
     cluster_df  = compute_climate_clusters(train_w, n_clusters=10)
     cluster_map = dict(zip(cluster_df["region_id"], cluster_df["cluster_id"]))
     train_w["cluster_id"] = train_w["region_id"].map(cluster_map).astype(np.int8)
@@ -490,27 +462,26 @@ def main():
     )
     region_stats_path = os.path.join(_PROC, "region_stats.csv")
     cluster_df.to_csv(region_stats_path, index=False)
-    print(f"   Region stats -> {region_stats_path}")
+    print(f"I/O: Region ecosystem stats saved to {region_stats_path}")
 
-    # ---- 9. Log1p precipitation --------------------------------------------
-    print("\n[V29] Applying log1p to precipitation columns ...")
+    # 9. Scaling transformations
+    print(f"Preprocessing: Applying log1p transformation to precipitation columns: {LOG1P_COLS}")
     for col in LOG1P_COLS:
         for df_ in (train_w, test_w):
             if col in df_.columns:
                 df_[col] = np.log1p(df_[col].clip(lower=0.0)).astype(np.float32)
-    print(f"   log1p applied to: {[c for c in LOG1P_COLS]}")
 
-    # ---- 10. Add V29 sentinel column ----------------------------------------
+    # 10. Verification tracking tracking
     train_w["_v29_normalized"] = np.int8(1)
     test_w["_v29_normalized"]  = np.int8(1)
 
-    # ---- 11. Strip test pre-padding -----------------------------------------
-    print("\n[V29] Stripping test pre-padding (restoring to strict 13 weeks) ...")
+    # 11. Padding slicing
+    print("Preprocessing: Stripping temporal padding from test payload (reverting to strict 13 weeks)")
     test_w = test_w[test_w["week_idx"] >= 3].copy()
     test_w["week_idx"] = test_w["week_idx"] - 3
     test_w.reset_index(drop=True, inplace=True)
 
-    # ---- 12. Validation -----------------------------------------------------
+    # 12. Validation assertions
     n_train_rgn = train_w["region_id"].nunique()
     n_test_rgn  = test_w["region_id"].nunique()
     test_wk_counts = test_w.groupby("region_id").size()
@@ -520,17 +491,16 @@ def main():
     assert test_wk_counts.min() == _WEEKS_PER_TEST, (
         f"Test week count mismatch: min={test_wk_counts.min()}"
     )
-    print(f"\n  REGION COUNT PASSED: {n_train_rgn} train, {n_test_rgn} test")
-    print(f"  Test weeks per region: min={test_wk_counts.min()}  "
-          f"max={test_wk_counts.max()}")
+    print(f"Validation: Integrity check passed ({n_train_rgn} train regions, {n_test_rgn} test regions)")
+    print(f"Validation: Test window variance per region = [{test_wk_counts.min()}, {test_wk_counts.max()}]")
 
-    # ---- 13. Export ---------------------------------------------------------
-    print("\nExporting processed data ...")
+    # 13. File dumping
+    print("I/O: Exporting processed matrices")
     export_processed(train_w, test_w, fmt="csv")
 
     elapsed = time.time() - t0
-    print(f"\nTotal preprocessing time: {elapsed:.1f}s")
-    print("=" * 75)
+    print(f"Metrics: Total processing duration = {elapsed:.1f}s")
+    print("--- [v51_preprocess.py] Pipeline Complete ---")
 
 
 if __name__ == "__main__":
