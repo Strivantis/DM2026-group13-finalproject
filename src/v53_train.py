@@ -1,7 +1,7 @@
 """
-v52_train.py
-Cross-Seasonal Time CV (v52) + Decoupled Dual-Tree Hurdle
-Lightweight Exploration Version (Fast Training)
+v53_train.py
+Cross-Seasonal Time CV (v53) + Decoupled Dual-Tree Hurdle
+[MAJOR UPGRADE] Huber Regression + Enhanced Boundary Classifier + OOF Auto-Tuner
 """
 
 import os
@@ -21,11 +21,10 @@ import gc
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-# [V52 修正] 引用 v52_dataset
-from src.v52_dataset import (
+from src.v53_dataset import (
     refine_features,
-    build_time_seasonal_cv_folds,    # <-- 使用新的時間滾動 CV
-    extract_training_targets_for_te, # <-- 使用新的 TE 防漏函數
+    build_time_seasonal_cv_folds,
+    extract_training_targets_for_te,
     build_tabular_dataset,
     build_tabular_test,
     FEATURE_COLS,
@@ -45,11 +44,11 @@ set_seed(42)
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-PROCESSED_DIR = os.path.join(ROOT, "data", "v51_processed") # 資料依然讀 v51 的
-MODELS_DIR    = os.path.join(ROOT, "models","v52_2_models")
+PROCESSED_DIR = os.path.join(ROOT, "data", "v53_processed")
+MODELS_DIR    = os.path.join(ROOT, "models","v53_models")
 os.makedirs(MODELS_DIR, exist_ok=True)
 
-N_FOLDS         = 4  # [V52 修正] 配合 4 個季節間隔
+N_FOLDS         = 4  
 N_FLAT_FEATURES = WINDOW_SIZE * len(FEATURE_COLS) + len(FEATURE_COLS) 
 
 # ---------------------------------------------------------------------------
@@ -118,7 +117,7 @@ def _interval_mask(y_true: np.ndarray, idx: int) -> np.ndarray:
 def print_binned_error_matrix(y_true: np.ndarray, y_pred: np.ndarray, fold_k: int, log_fn) -> None:
     log_fn("")
     log_fn("  " + "=" * 80)
-    log_fn(f"  BINNED ERROR MATRIX  --  Fold {fold_k}  (OOF Hurdle-Gated)")
+    log_fn(f"  BINNED ERROR MATRIX  --  Fold {fold_k}")
     log_fn("  " + "=" * 80)
     log_fn(f"  {'Interval':<50}  {'Count':>7}  {'AvgTrue':>8}  {'AvgPred':>8}  {'MAE':>8}")
     log_fn("  " + "-" * 78)
@@ -147,9 +146,8 @@ def main():
         log_lines.append(str(msg))
 
     log("=" * 90)
-    log("Drought Forecasting Pipeline v52 (Cross-Seasonal Time CV | Lightweight)")
-    log("Model A: LGBMRegressor regression_l1  |  Model B: LGBMClassifier binary")
-    log("Test gate: np.median(A, axis=folds)  |  np.mean(B, axis=folds)")
+    log("Drought Forecasting Pipeline v53 (Time CV | Huber + Enhanced Boundary)")
+    log("Model A: LGBMRegressor (Huber)  |  Model B: LGBMClassifier (Binary)")
     log(f"CV: {N_FOLDS}-Fold Time Seasonal CV (Strict no future leakage)")
     log("=" * 90)
 
@@ -159,7 +157,7 @@ def main():
         train_raw = pd.read_csv(os.path.join(PROCESSED_DIR, "train_processed.csv"))
         test_raw  = pd.read_csv(os.path.join(PROCESSED_DIR, "test_processed.csv"))
     except FileNotFoundError as e:
-        raise FileNotFoundError(f"{e}\n  --> Run `python src/preprocess.py` first.")
+        raise FileNotFoundError(f"{e}\n  --> Run `python src/v53_preprocess.py` first.")
 
     log(f"  train: {train_raw.shape}  |  test: {test_raw.shape}")
 
@@ -180,18 +178,22 @@ def main():
     log(f"Building {N_FOLDS}-Fold Cross-Seasonal CV")
     log(f"{'='*90}")
 
-    # [V52 修正] 使用嚴格的時間切分
     folds = build_time_seasonal_cv_folds(train_df, n_splits=N_FOLDS, season_step=13)
     log(f"  Folds built: {len(folds)}")
 
     # -- 5. Dual-Tree Hurdle Training Loop ------------------------------------
     log(f"\n{'='*90}")
-    log("Dual-Tree Hurdle Training (LIGHTWEIGHT EXPLORATION)")
+    log("Dual-Tree Hurdle Training (V53 HEAVYWEIGHT)")
     log(f"{'='*90}")
 
     fold_results      = []
     fold_test_preds_a = []
     fold_test_preds_b = []
+    
+    # [V53 新增] 儲存全局 OOF 陣列，用於稍後的 Threshold 最佳化
+    oof_val_probs_all = []
+    oof_val_preds_a_all = []
+    y_val_all = []
 
     for fold_k, (raw_train_groups, raw_val_groups) in enumerate(folds):
         log(f"\n{'='*90}")
@@ -201,7 +203,6 @@ def main():
 
         fold_t0 = time.time()
 
-        # [V52 修正] 嚴格防漏的 Target Encoding 計算
         safe_train_df_for_te = extract_training_targets_for_te(raw_train_groups)
         te_map_fold, gm_fold, gzp_fold = _compute_te_stats(safe_train_df_for_te)
         log(f"  [TE] Computed from {len(safe_train_df_for_te):,} historical records.")
@@ -222,7 +223,7 @@ def main():
 
         fold_val_preds_l1 = np.zeros_like(y_val_np)
         fold_val_probs    = np.zeros_like(y_val_np)
-        fold_val_final    = np.zeros_like(y_val_np)
+        fold_val_final    = np.zeros_like(y_val_np) # 預設以 0.5 切割供觀察
         fold_test_pred_l1 = np.zeros((X_test_np.shape[0], HORIZON), dtype=np.float32)
         fold_test_prob    = np.zeros((X_test_np.shape[0], HORIZON), dtype=np.float32)
 
@@ -237,53 +238,56 @@ def main():
 
             log(f"\n  --- Fold {fold_k} | Week {week_idx + 1} ---")
 
-            # --- Model A  ---
-            model_a = LGBMRegressor(
-                objective        = "regression",  # [關鍵修改] 拿掉 _l1，改用預設的 L2/MSE！強迫它重視極端值
-                max_depth        = 7,
-                num_leaves       = 63,
-                colsample_bytree = 0.5,         
-                learning_rate    = 0.02,          # [配合 MSE] 降回 0.02，因為 MSE 梯度變化較大，需要小步慢走
-                subsample        = 0.8,
-                min_child_samples= 100,  #v52_2 150         
-                reg_alpha        = 0.0,         
-                reg_lambda       = 1.0,         
-                n_estimators     = 10000,       
-                device           = "gpu",
-                random_state     = 42,
-                n_jobs           = -1,
-                verbose          = -1,
-            )
-            model_a.fit(
-                X_train_np, y_train_w,
-                eval_set    = [(X_val_np, y_val_w)],
-                eval_metric = "mae",              # [注意] Evaluation 依然用 MAE，因為這是 Leaderboard 指標
-                callbacks   = [lightgbm.early_stopping(stopping_rounds=300, verbose=False)], 
-            )
-            val_l1_w  = model_a.predict(X_val_np)
-            test_l1_w = model_a.predict(X_test_np)
-            log(f"    [Model A] best_iter={model_a.best_iteration_} | val_MAE={float(np.mean(np.abs(val_l1_w - y_val_w))):.4f}")
-            with open(ckpt_a, "wb") as fh: pickle.dump(model_a, fh)
+            # --- Model A [終極覺醒版] True Hurdle Regression ---
+            # 1. 建立遮罩：只取真實分數 > 0 的資料來訓練 Model A
+            pos_mask = y_train_w > 0.0
+            
+            # 2. 確保有足夠的乾旱樣本才訓練
+            if pos_mask.sum() > 100:
+                model_a = LGBMRegressor(
+                    objective        = "regression", # [修正] 放棄 Huber，用 MSE 狠狠懲罰誤差
+                    max_depth        = 7,           
+                    num_leaves       = 63,          
+                    colsample_bytree = 0.5,         
+                    learning_rate    = 0.03,        
+                    subsample        = 0.8,
+                    min_child_samples= 100,          # 降低約束，讓它能捕捉極端值
+                    reg_alpha        = 0.0,         
+                    reg_lambda       = 1.0,         
+                    n_estimators     = 10000,       
+                    device           = "gpu",
+                    random_state     = 42,
+                    n_jobs           = -1,
+                    verbose          = -1,
+                )
+                
+                # 3. 訓練時，X 和 y 都只餵入 >0 的資料！
+                model_a.fit(
+                    X_train_np[pos_mask], y_train_w[pos_mask],
+                    # Evaluation 依然看全部的 Val Set，這樣 MAE 才是真實的
+                    eval_set    = [(X_val_np, y_val_w)], 
+                    eval_metric = "mae",
+                    callbacks   = [lightgbm.early_stopping(stopping_rounds=300, verbose=False)], 
+                )
+            else:
+                # 萬一該週完全沒有乾旱資料 (極罕見防呆)
+                model_a = None
+                
+            # 4. 預測時，對全部的 Validation 和 Test 進行預測
+            if model_a is not None:
+                val_l1_w  = model_a.predict(X_val_np)
+                test_l1_w = model_a.predict(X_test_np)
+                log(f"    [Model A] best_iter={model_a.best_iteration_} | val_MAE={float(np.mean(np.abs(val_l1_w - y_val_w))):.4f}")
+                with open(ckpt_a, "wb") as fh: pickle.dump(model_a, fh)
+            else:
+                val_l1_w  = np.zeros_like(y_val_w)
+                test_l1_w = np.zeros(X_test_np.shape[0], dtype=np.float32)
+                log(f"    [Model A] SKIPPED (No positive samples)")
+
             fold_val_preds_l1[:, week_idx] = val_l1_w
             fold_test_pred_l1[:, week_idx] = test_l1_w.astype(np.float32)
 
-            # --- Model B  ---
-            # model_b = LGBMClassifier(        #v52_2
-            #     objective        = "binary",
-            #     max_depth        = 7,           # 加深
-            #     num_leaves       = 85,          # 增廣
-            #     colsample_bytree = 0.5,         # 增加特徵隨機性
-            #     learning_rate    = 0.02,        # 放慢學習速度
-            #     subsample        = 0.8,
-            #     min_child_samples= 500,         # 增強葉子節點約束
-            #     reg_alpha        = 0.5,         # 新增 L1 正則化
-            #     reg_lambda       = 2.0,         # 新增 L2 正則化
-            #     n_estimators     = 20000,       # 重裝上陣
-            #     device           = "gpu",
-            #     random_state     = 42,
-            #     n_jobs           = -1,
-            #     verbose          = -1,
-            # )
+            # --- Model B [V53 升級] Enhanced Boundary Classifier ---
             model_b = LGBMClassifier(
                 objective        = "binary",
                 max_depth        = 8,           # 加深，切出微弱降雨的細微邊界
@@ -313,7 +317,7 @@ def main():
             fold_val_probs[:, week_idx]    = val_prob_w
             fold_test_prob[:, week_idx]    = test_prob_w.astype(np.float32)
 
-            # OOF hurdle gate
+            # 預設觀察閘門 (後續由 Auto-Tuner 決定最佳值)
             oof_final_w = np.where(val_prob_w < 0.5, 0.0, val_l1_w)
             fold_val_final[:, week_idx] = oof_final_w
 
@@ -321,53 +325,84 @@ def main():
         week_maes_final = [float(np.mean(np.abs(fold_val_final[:, w] - y_val_np[:, w]))) for w in range(HORIZON)]
         mean_fold_mae_final = float(np.mean(week_maes_final))
 
-        log(f"\n  [Fold {fold_k}] Mean MAE : {mean_fold_mae_final:.4f} ({fold_elapsed:.1f}s)")
+        log(f"\n  [Fold {fold_k}] Mean MAE (Thresh=0.5): {mean_fold_mae_final:.4f} ({fold_elapsed:.1f}s)")
         print_binned_error_matrix(y_val_np.ravel(), fold_val_final.ravel(), fold_k, log)
 
-        # [新增診斷] 記錄該 Fold 的 Model A 極端預測與 Model B 機率分佈
         log(f"  [Diagnostics Fold {fold_k}] Model B Probability range: Min={fold_val_probs.min():.4f}, Max={fold_val_probs.max():.4f}")
         log(f"  [Diagnostics Fold {fold_k}] Model A Score       range: Min={fold_val_preds_l1.min():.4f}, Max={fold_val_preds_l1.max():.4f}")
 
         fold_results.append((fold_k, week_maes_final, mean_fold_mae_final))
         fold_test_preds_a.append({"preds": fold_test_pred_l1, "region_ids": test_region_ids})
         fold_test_preds_b.append({"probs": fold_test_prob,    "region_ids": test_region_ids})
+        
+        # 收集 OOF 資料以供自動尋優
+        oof_val_probs_all.append(fold_val_probs.ravel())
+        oof_val_preds_a_all.append(fold_val_preds_l1.ravel())
+        y_val_all.append(y_val_np.ravel())
 
         del X_train_np, y_train_np, X_val_np, y_val_np, model_a, model_b
         gc.collect()
 
-    # -- 6. Summary and Asymmetric Ensemble -----------------------------------
+    # -- 6. OOF Threshold Auto-Tuning [V53 終極進化] ---------------------------
     log(f"\n{'='*90}")
-    mean_cv_maes = [r[2] for r in fold_results]
-    log(f"  Overall CV MAE: {np.mean(mean_cv_maes):.4f}  +/-  {np.std(mean_cv_maes):.4f}")
+    log("V53 Auto-Tuning: Optimizing Hurdle Threshold based on Global OOF MAE")
+    log(f"{'='*90}")
+    
+    global_probs = np.concatenate(oof_val_probs_all)
+    global_preds = np.concatenate(oof_val_preds_a_all)
+    global_y     = np.concatenate(y_val_all)
+    
+    best_thresh = 0.5
+    best_global_mae = 999.0
+    
+    log(f"  {'Threshold':<10} | {'Global OOF MAE':<15} | {'Zero Fraction':<15}")
+    log("-" * 50)
+    
+    for thresh in np.arange(0.30, 0.96, 0.02):
+        gated_preds = np.where(global_probs < thresh, 0.0, global_preds)
+        current_mae = np.mean(np.abs(gated_preds - global_y))
+        zero_frac   = (gated_preds == 0.0).mean()
+        
+        log(f"  {thresh:<10.2f} | {current_mae:<15.4f} | {zero_frac:<15.2%}")
+        
+        if current_mae < best_global_mae:
+            best_global_mae = current_mae
+            best_thresh = thresh
+
+    log("-" * 50)
+    log(f"🔥 BEST THRESHOLD DETERMINED: {best_thresh:.2f} (Global MAE: {best_global_mae:.4f})")
+
+    # -- 7. Summary and Asymmetric Ensemble -----------------------------------
+    log(f"\n{'='*90}")
+    log(f"Asymmetric Ensemble (applying Best Threshold = {best_thresh:.2f})")
+    log(f"{'='*90}")
 
     preds_a_stack = np.stack([fp["preds"] for fp in fold_test_preds_a], axis=0)
     probs_b_stack = np.stack([fp["probs"] for fp in fold_test_preds_b], axis=0)
-    
-    # test_region_ids 在迴圈裡是最後一個 Fold 的，我們確認它跟所有 Fold 一致
     test_region_ids = fold_test_preds_a[0]["region_ids"]
 
-    # [新增診斷] 檢視 4 個 Fold 對 Test Set 第一筆資料的歧異度
     sample_a_preds = preds_a_stack[:, 0, 0]
     sample_b_probs = probs_b_stack[:, 0, 0]
     log(f"\n[Test Set Sample 0, Week 1 Diagnostic]")
     log(f"  4 Folds Model A preds: {np.round(sample_a_preds, 3)}")
     log(f"  4 Folds Model B probs: {np.round(sample_b_probs, 3)}")
 
-    # 儲存推論需要的 raw preds (讓 infer.py 可以自由調 Threshold)
-    raw_preds_path = os.path.join(MODELS_DIR, "v52_2_raw_test_preds.pkl")
+    # 儲存推論需要的 raw preds 與 自動尋找出的最佳 Threshold
+    raw_preds_path = os.path.join(MODELS_DIR, "v53_raw_test_preds.pkl")
     with open(raw_preds_path, "wb") as f:
         pickle.dump({
             "preds_a_stack": preds_a_stack,
             "probs_b_stack": probs_b_stack,
-            "region_ids": test_region_ids
+            "region_ids": test_region_ids,
+            "best_threshold": float(best_thresh) # 供 v53_infer.py 讀取
         }, f)
-    log(f"\nSaved raw test predictions to {raw_preds_path}")
+    log(f"\nSaved raw test predictions & Best Threshold to {raw_preds_path}")
 
-    log_path = os.path.join(ROOT, "_training_log_52nd.txt")
+    log_path = os.path.join(ROOT, "_training_log_53rd.txt")
     with open(log_path, "w") as fh: fh.write("\n".join(log_lines))
     print(f"Training log -> {log_path}")
 
-    return {"overall_cv_mae": np.mean(mean_cv_maes)}
+    return {"best_global_mae": best_global_mae}
 
 if __name__ == "__main__":
     results = main()

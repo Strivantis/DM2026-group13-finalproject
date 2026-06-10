@@ -20,17 +20,20 @@ FILES = {
     "V45.1 Raw Rounded": os.path.join(ROOT, "submission_45th_30k_ABraw_rounded.csv"),
     # "V45.1 30k Naked": os.path.join(ROOT, "submission_45th_30k_naked.csv"),
     # "V45.1 30k 25% Zero": os.path.join(ROOT, "submission_45th_30k_25perzero.csv"),
-    "V45.1 30k ShiftStretch": os.path.join(ROOT, "submission_45th_30k_ShiftStretch.csv"),
+    # "V45.1 30k ShiftStretch": os.path.join(ROOT, "submission_45th_30k_ShiftStretch.csv"),
     # "V47 30k Pruned": os.path.join(ROOT, "submission_47th.csv"),
     # "V48 Tweedie": os.path.join(ROOT, "submission_48th.csv"),
     # "V48 Tweedie Snapped": os.path.join(ROOT, "submission_48th_snap.csv"),
-    "V49 Multi": os.path.join(ROOT, "submission_49th.csv"),
-    
+    # "V49 Multi": os.path.join(ROOT, "submission_49th.csv"),    
     # "V49 Post-Argmax": os.path.join(ROOT, "submission_49th_A_arg.csv"),
     # "V49 Post-Optimized": os.path.join(ROOT, "submission_49th_B_opt.csv"),
     # "V49 Post-Stacked": os.path.join(ROOT, "submission_49th_C_stack.csv"),
-    "V49 Multi Post-Meta": os.path.join(ROOT, "submission_49th_meta.csv"),
-    "V50 (A w/o 0)": os.path.join(ROOT, "submission_50th.csv")
+    # "V49 Multi Post-Meta": os.path.join(ROOT, "submission_49th_meta.csv"),
+    # "V50 (A w/o 0)": os.path.join(ROOT, "submission_50th.csv")
+    "V52 0.5": os.path.join(ROOT, "submission_52th.csv"),
+    "V52 0.5_unrounded": os.path.join(ROOT, "submission_v52_MANUAL_0.50.csv"),
+    "V53 OOF-Adjusted": os.path.join(ROOT, "submission_53rd_AUTO.csv")
+    
 }
 
 def get_interval_bins(vals):
