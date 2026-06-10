@@ -1,7 +1,7 @@
 """
 v52_train.py
-Cross-Seasonal Time CV (v52) + Decoupled Dual-Tree Hurdle
-Lightweight Exploration Version (Fast Training)
+Cross-Seasonal Time CV (v52) + Decoupled Dual-Tree Hurdle Execution Pipeline.
+Optimized for multi-horizon drought forecasting.
 """
 
 import os
@@ -21,11 +21,10 @@ import gc
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-# [V52 修正] 引用 v52_dataset
 from src.v52_dataset import (
     refine_features,
-    build_time_seasonal_cv_folds,    # <-- 使用新的時間滾動 CV
-    extract_training_targets_for_te, # <-- 使用新的 TE 防漏函數
+    build_time_seasonal_cv_folds,    
+    extract_training_targets_for_te, 
     build_tabular_dataset,
     build_tabular_test,
     FEATURE_COLS,
@@ -43,17 +42,17 @@ def set_seed(seed: int = 42) -> None:
 set_seed(42)
 
 # ---------------------------------------------------------------------------
-# Config
+# Configuration
 # ---------------------------------------------------------------------------
-PROCESSED_DIR = os.path.join(ROOT, "data", "v51_processed") # 資料依然讀 v51 的
-MODELS_DIR    = os.path.join(ROOT, "models","v52_models")
+PROCESSED_DIR = os.path.join(ROOT, "data", "v51_processed") 
+MODELS_DIR    = os.path.join(ROOT, "models", "v52_models")
 os.makedirs(MODELS_DIR, exist_ok=True)
 
-N_FOLDS         = 4  # [V52 修正] 配合 4 個季節間隔
+N_FOLDS         = 4  
 N_FLAT_FEATURES = WINDOW_SIZE * len(FEATURE_COLS) + len(FEATURE_COLS) 
 
 # ---------------------------------------------------------------------------
-# Per-fold leakage-free target encoding
+# Target Encoding (Leakage-Free Per-Fold Execution)
 # ---------------------------------------------------------------------------
 def _zero_prob(x):
     return (x == 0.0).mean()
@@ -95,7 +94,7 @@ def _merge_te_to_df(df, te_map, global_mean, global_zero_prob):
     return df
 
 # ---------------------------------------------------------------------------
-# Binned error diagnostics
+# Diagnostics & Matrix Logging
 # ---------------------------------------------------------------------------
 INTERVAL_LABELS = [
     "Interval 0  [Absolute Zero       y == 0.0      ]",
@@ -113,15 +112,11 @@ def _interval_mask(y_true: np.ndarray, idx: int) -> np.ndarray:
     if idx == 3: return (y_true > 2.0) & (y_true <= 3.0)
     if idx == 4: return (y_true > 3.0) & (y_true <= 4.0)
     if idx == 5: return (y_true > 4.0) & (y_true <= 5.0)
-    raise ValueError(f"Unknown idx: {idx}")
+    raise ValueError(f"Unknown index bounds: {idx}")
 
 def print_binned_error_matrix(y_true: np.ndarray, y_pred: np.ndarray, fold_k: int, log_fn) -> None:
-    log_fn("")
-    log_fn("  " + "=" * 80)
-    log_fn(f"  BINNED ERROR MATRIX  --  Fold {fold_k}  (OOF Hurdle-Gated)")
-    log_fn("  " + "=" * 80)
-    log_fn(f"  {'Interval':<50}  {'Count':>7}  {'AvgTrue':>8}  {'AvgPred':>8}  {'MAE':>8}")
-    log_fn("  " + "-" * 78)
+    log_fn(f"Diagnostics: Binned Error Analysis Matrix -- Fold {fold_k} (OOF Evaluated)")
+    log_fn(f"  {'Interval Class':<50}  {'Count':>7}  {'AvgTrue':>8}  {'AvgPred':>8}  {'MAE':>8}")
     for idx, label in enumerate(INTERVAL_LABELS):
         mask = _interval_mask(y_true, idx)
         n    = int(mask.sum())
@@ -132,11 +127,9 @@ def print_binned_error_matrix(y_true: np.ndarray, y_pred: np.ndarray, fold_k: in
         avg_pred = float(y_pred[mask].mean())
         mae      = float(np.mean(np.abs(y_pred[mask] - y_true[mask])))
         log_fn(f"  {label:<50}  {n:>7,}  {avg_true:>8.4f}  {avg_pred:>8.4f}  {mae:>8.4f}")
-    log_fn("  " + "=" * 80)
-    log_fn("")
 
 # ---------------------------------------------------------------------------
-# Main pipeline
+# Training Pipeline Core
 # ---------------------------------------------------------------------------
 def main():
     t0 = time.time()
@@ -146,65 +139,53 @@ def main():
         print(msg)
         log_lines.append(str(msg))
 
-    log("=" * 90)
-    log("Drought Forecasting Pipeline v52 (Cross-Seasonal Time CV | Lightweight)")
-    log("Model A: LGBMRegressor regression_l1  |  Model B: LGBMClassifier binary")
-    log("Test gate: np.median(A, axis=folds)  |  np.mean(B, axis=folds)")
-    log(f"CV: {N_FOLDS}-Fold Time Seasonal CV (Strict no future leakage)")
-    log("=" * 90)
+    log("--- [v52_train.py] Pipeline Init ---")
+    log(f"Configuration: Cross-Seasonal Time CV Setup | Folds = {N_FOLDS} | Target Horizon = {HORIZON}")
+    log("Architecture: Dual-Tree Hurdle (Model A: L1 Regressor | Model B: Binary Classifier)")
 
-    # -- 1. Load processed data -----------------------------------------------
-    log("\nLoading processed data ...")
+    # 1. Load Data
+    log("I/O: Loading processed datasets")
     try:
         train_raw = pd.read_csv(os.path.join(PROCESSED_DIR, "train_processed.csv"))
         test_raw  = pd.read_csv(os.path.join(PROCESSED_DIR, "test_processed.csv"))
     except FileNotFoundError as e:
-        raise FileNotFoundError(f"{e}\n  --> Run `python src/preprocess.py` first.")
+        raise FileNotFoundError(f"{e}\nVerify preprocessing pipeline output matrices exist.")
 
-    log(f"  train: {train_raw.shape}  |  test: {test_raw.shape}")
+    log(f"Data: train_raw={train_raw.shape} | test_raw={test_raw.shape}")
 
-    # -- 2. Feature refinement ------------------------------------------------
-    log("\nRefining features ...")
+    # 2. Feature Refinement
+    log("Preprocessing: Refining structural feature matrices")
     train_df = refine_features(train_raw, is_train=True)
     test_df  = refine_features(test_raw,  is_train=False)
-    log(f"  train: {train_df.shape}  |  test: {test_df.shape}")
+    log(f"Data: train_df features configuration={train_df.shape} | test_df={test_df.shape}")
 
-    # -- 3. Drop NaN score rows -----------------------------------------------
+    # 3. Handle Missing Target Scores
     before    = len(train_df)
     train_df  = train_df.dropna(subset=["score"]).reset_index(drop=True)
     dropped   = before - len(train_df)
-    if dropped: log(f"  Dropped {dropped:,} NaN-score rows.")
+    if dropped: 
+        log(f"Data: Filtered out {dropped:,} records missing validation scores")
 
-    # -- 4. Build CV folds ----------------------------------------------------
-    log(f"\n{'='*90}")
-    log(f"Building {N_FOLDS}-Fold Cross-Seasonal CV")
-    log(f"{'='*90}")
-
-    # [V52 修正] 使用嚴格的時間切分
+    # 4. Generate CV splits
+    log(f"CV: Generating {N_FOLDS}-Fold Cross-Seasonal chronological matrix blocks")
     folds = build_time_seasonal_cv_folds(train_df, n_splits=N_FOLDS, season_step=13)
-    log(f"  Folds built: {len(folds)}")
+    log(f"CV: Chronological block partitioning sequence array complete (folds={len(folds)})")
 
-    # -- 5. Dual-Tree Hurdle Training Loop ------------------------------------
-    log(f"\n{'='*90}")
-    log("Dual-Tree Hurdle Training (LIGHTWEIGHT EXPLORATION)")
-    log(f"{'='*90}")
-
+    # 5. Iterative Execution Loop
+    log("Training: Executing dual model configuration training routine")
     fold_results      = []
     fold_test_preds_a = []
     fold_test_preds_b = []
 
     for fold_k, (raw_train_groups, raw_val_groups) in enumerate(folds):
-        log(f"\n{'='*90}")
-        log(f"FOLD {fold_k + 1} / {N_FOLDS}")
-        log(f"  train_groups: {len(raw_train_groups):,}  |  val_groups: {len(raw_val_groups):,}")
-        log(f"{'='*90}")
-
+        log(f"--- Fold {fold_k + 1}/{N_FOLDS} ---")
+        log(f"Data: Active processing split details: train_groups={len(raw_train_groups):,} | val_groups={len(raw_val_groups):,}")
         fold_t0 = time.time()
 
-        # [V52 修正] 嚴格防漏的 Target Encoding 計算
+        # Isolate target metrics cleanly to preserve validation envelope bounds
         safe_train_df_for_te = extract_training_targets_for_te(raw_train_groups)
         te_map_fold, gm_fold, gzp_fold = _compute_te_stats(safe_train_df_for_te)
-        log(f"  [TE] Computed from {len(safe_train_df_for_te):,} historical records.")
+        log(f"TargetEncoding: Matrix maps updated from {len(safe_train_df_for_te):,} data units")
 
         aug_train_groups = _augment_groups_with_te(raw_train_groups, te_map_fold, gm_fold, gzp_fold)
         aug_val_groups   = _augment_groups_with_te(raw_val_groups, te_map_fold, gm_fold, gzp_fold)
@@ -235,20 +216,18 @@ def main():
             ckpt_a = os.path.join(MODELS_DIR, f"lgbm_a_fold{fold_k}_week{week_idx}.pkl")
             ckpt_b = os.path.join(MODELS_DIR, f"lgbm_b_fold{fold_k}_week{week_idx}.pkl")
 
-            log(f"\n  --- Fold {fold_k} | Week {week_idx + 1} ---")
-
-            # --- Model A (LIGHTWEIGHT) ---
+            # --- Model A Optimization Execution ---
             model_a = LGBMRegressor(
                 objective        = "regression_l1",
-                max_depth        = 7,           # 加深
-                num_leaves       = 63,          # 增廣
-                colsample_bytree = 0.5,         # 增加特徵隨機性
-                learning_rate    = 0.05,        # 放慢學習速度
+                max_depth        = 7,           
+                num_leaves       = 63,          
+                colsample_bytree = 0.5,         
+                learning_rate    = 0.05,        
                 subsample        = 0.8,
-                min_child_samples= 150,         # 增強葉子節點約束
-                reg_alpha        = 0,         # 新增 L1 正則化
-                reg_lambda       = 1.0,         # 新增 L2 正則化
-                n_estimators     = 10000,       # 重裝上陣
+                min_child_samples= 150,         
+                reg_alpha        = 0,         
+                reg_lambda       = 1.0,         
+                n_estimators     = 10000,       
                 device           = "gpu",
                 random_state     = 42,
                 n_jobs           = -1,
@@ -262,23 +241,23 @@ def main():
             )
             val_l1_w  = model_a.predict(X_val_np)
             test_l1_w = model_a.predict(X_test_np)
-            log(f"    [Model A] best_iter={model_a.best_iteration_} | val_MAE={float(np.mean(np.abs(val_l1_w - y_val_w))):.4f}")
+            log(f"Model A: Horizon Step={week_idx+1} | best_iteration={model_a.best_iteration_} | Val MAE={float(np.mean(np.abs(val_l1_w - y_val_w))):.4f}")
             with open(ckpt_a, "wb") as fh: pickle.dump(model_a, fh)
             fold_val_preds_l1[:, week_idx] = val_l1_w
             fold_test_pred_l1[:, week_idx] = test_l1_w.astype(np.float32)
 
-            # --- Model B (LIGHTWEIGHT) ---
+            # --- Model B Optimization Execution ---
             model_b = LGBMClassifier(
                 objective        = "binary",
-                max_depth        = 7,           # 加深
-                num_leaves       = 85,          # 增廣
-                colsample_bytree = 0.5,         # 增加特徵隨機性
-                learning_rate    = 0.02,        # 放慢學習速度
+                max_depth        = 7,           
+                num_leaves       = 85,          
+                colsample_bytree = 0.5,         
+                learning_rate    = 0.02,        
                 subsample        = 0.8,
-                min_child_samples= 500,         # 增強葉子節點約束
-                reg_alpha        = 0.5,         # 新增 L1 正則化
-                reg_lambda       = 2.0,         # 新增 L2 正則化
-                n_estimators     = 20000,       # 重裝上陣
+                min_child_samples= 500,         
+                reg_alpha        = 0.5,         
+                reg_lambda       = 2.0,         
+                n_estimators     = 20000,       
                 device           = "gpu",
                 random_state     = 42,
                 n_jobs           = -1,
@@ -292,12 +271,12 @@ def main():
             )
             val_prob_w  = model_b.predict_proba(X_val_np)[:, 1]
             test_prob_w = model_b.predict_proba(X_test_np)[:, 1]
-            log(f"    [Model B] best_iter={model_b.best_iteration_}")
+            log(f"Model B: Horizon Step={week_idx+1} | best_iteration={model_b.best_iteration_}")
             with open(ckpt_b, "wb") as fh: pickle.dump(model_b, fh)
             fold_val_probs[:, week_idx]    = val_prob_w
             fold_test_prob[:, week_idx]    = test_prob_w.astype(np.float32)
 
-            # OOF hurdle gate
+            # Apply hard threshold to out-of-fold predictions
             oof_final_w = np.where(val_prob_w < 0.5, 0.0, val_l1_w)
             fold_val_final[:, week_idx] = oof_final_w
 
@@ -305,12 +284,11 @@ def main():
         week_maes_final = [float(np.mean(np.abs(fold_val_final[:, w] - y_val_np[:, w]))) for w in range(HORIZON)]
         mean_fold_mae_final = float(np.mean(week_maes_final))
 
-        log(f"\n  [Fold {fold_k}] Mean MAE : {mean_fold_mae_final:.4f} ({fold_elapsed:.1f}s)")
+        log(f"Metrics: Fold {fold_k} Mean OOF MAE = {mean_fold_mae_final:.4f} | Execution time = {fold_elapsed:.1f}s")
         print_binned_error_matrix(y_val_np.ravel(), fold_val_final.ravel(), fold_k, log)
 
-        # [新增診斷] 記錄該 Fold 的 Model A 極端預測與 Model B 機率分佈
-        log(f"  [Diagnostics Fold {fold_k}] Model B Probability range: Min={fold_val_probs.min():.4f}, Max={fold_val_probs.max():.4f}")
-        log(f"  [Diagnostics Fold {fold_k}] Model A Score       range: Min={fold_val_preds_l1.min():.4f}, Max={fold_val_preds_l1.max():.4f}")
+        log(f"Diagnostics: Fold {fold_k} Model B Prob Range = [{fold_val_probs.min():.4f}, {fold_val_probs.max():.4f}]")
+        log(f"Diagnostics: Fold {fold_k} Model A Score Range = [{fold_val_preds_l1.min():.4f}, {fold_val_preds_l1.max():.4f}]")
 
         fold_results.append((fold_k, week_maes_final, mean_fold_mae_final))
         fold_test_preds_a.append({"preds": fold_test_pred_l1, "region_ids": test_region_ids})
@@ -319,25 +297,21 @@ def main():
         del X_train_np, y_train_np, X_val_np, y_val_np, model_a, model_b
         gc.collect()
 
-    # -- 6. Summary and Asymmetric Ensemble -----------------------------------
-    log(f"\n{'='*90}")
+    # 6. Global Consolidation & Out-of-Sample Diagnostics
     mean_cv_maes = [r[2] for r in fold_results]
-    log(f"  Overall CV MAE: {np.mean(mean_cv_maes):.4f}  +/-  {np.std(mean_cv_maes):.4f}")
+    log(f"Metrics: Overall Engine CV MAE = {np.mean(mean_cv_maes):.4f} +/- {np.std(mean_cv_maes):.4f}")
 
     preds_a_stack = np.stack([fp["preds"] for fp in fold_test_preds_a], axis=0)
     probs_b_stack = np.stack([fp["probs"] for fp in fold_test_preds_b], axis=0)
-    
-    # test_region_ids 在迴圈裡是最後一個 Fold 的，我們確認它跟所有 Fold 一致
     test_region_ids = fold_test_preds_a[0]["region_ids"]
 
-    # [新增診斷] 檢視 4 個 Fold 對 Test Set 第一筆資料的歧異度
     sample_a_preds = preds_a_stack[:, 0, 0]
     sample_b_probs = probs_b_stack[:, 0, 0]
-    log(f"\n[Test Set Sample 0, Week 1 Diagnostic]")
-    log(f"  4 Folds Model A preds: {np.round(sample_a_preds, 3)}")
-    log(f"  4 Folds Model B probs: {np.round(sample_b_probs, 3)}")
+    log("Diagnostics: Cross-fold variance tracking (Index=0 Horizon=0)")
+    log(f"  Model A outputs across folds: {np.round(sample_a_preds, 3)}")
+    log(f"  Model B outputs across folds: {np.round(sample_b_probs, 3)}")
 
-    # 儲存推論需要的 raw preds (讓 infer.py 可以自由調 Threshold)
+    # Export matrices to binary frames for post-processing and gating
     raw_preds_path = os.path.join(MODELS_DIR, "v52_raw_test_preds.pkl")
     with open(raw_preds_path, "wb") as f:
         pickle.dump({
@@ -345,11 +319,12 @@ def main():
             "probs_b_stack": probs_b_stack,
             "region_ids": test_region_ids
         }, f)
-    log(f"\nSaved raw test predictions to {raw_preds_path}")
+    log(f"I/O: Raw validation frames saved to {raw_preds_path}")
 
     log_path = os.path.join(ROOT, "_training_log_52nd.txt")
     with open(log_path, "w") as fh: fh.write("\n".join(log_lines))
-    print(f"Training log -> {log_path}")
+    print(f"I/O: Operational activity log structured -> {log_path}")
+    print("--- [v52_train.py] Pipeline Complete ---")
 
     return {"overall_cv_mae": np.mean(mean_cv_maes)}
 
