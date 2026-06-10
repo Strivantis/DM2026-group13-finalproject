@@ -77,7 +77,7 @@ warnings.filterwarnings("ignore")
 # ---------------------------------------------------------------------------
 BASE_DIR    = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PLOTS_DIR   = os.path.join(BASE_DIR, "plots")
-PROC_DIR    = os.path.join(BASE_DIR, "data", "processed")
+PROC_DIR    = os.path.join(BASE_DIR, "data", "v54_processed")
 os.makedirs(PLOTS_DIR, exist_ok=True)
 
 # RNG seed for reproducibility

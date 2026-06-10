@@ -31,8 +31,19 @@ FILES = {
     # "V49 Multi Post-Meta": os.path.join(ROOT, "submission_49th_meta.csv"),
     # "V50 (A w/o 0)": os.path.join(ROOT, "submission_50th.csv")
     "V52 0.5": os.path.join(ROOT, "submission_52th.csv"),
-    "V52 0.5_unrounded": os.path.join(ROOT, "submission_v52_MANUAL_0.50.csv"),
-    "V53 OOF-Adjusted": os.path.join(ROOT, "submission_53rd_AUTO.csv")
+    # "V52 0.5_unrounded": os.path.join(ROOT, "submission_v52_MANUAL_0.50.csv"),
+    # "V53 OOF-Adjusted": os.path.join(ROOT, "submission_53rd_AUTO.csv"),
+    "V54 0.5": os.path.join(ROOT, "submission_v54_AUTO.csv"),
+    # "V54 MANUAL_0.62": os.path.join(ROOT, "submission_v54_MANUAL_0.62.csv"),
+    "V54 SOFT": os.path.join(ROOT, "submission_v54_SOFT.csv"),
+    # "V54-2 OOF-Adjusted(0.5)": os.path.join(ROOT, "submission_v54_2_MANUAL_0.50.csv"),
+    # "v54-2 MANUAL_0.65": os.path.join(ROOT, "submission_v54_2_MANUAL_0.65.csv"),
+    "v54-2 SOFT": os.path.join(ROOT, "submission_v54_2_SOFT.csv"),
+    "v54-3 0.5": os.path.join(ROOT, "submission_v54_3_MANUAL_0.50.csv"),
+    "v54-3 auto 0.58": os.path.join(ROOT, "submission_v54_3_MANUAL_0.58.csv"),
+    "v54-3 SOFT": os.path.join(ROOT, "submission_v54_3_SOFT.csv"),
+    "V55 0.5": os.path.join(ROOT, "submission_v55_AUTO.csv"),
+    "V55 SOFT": os.path.join(ROOT, "submission_v55_SOFT.csv"),
     
 }
 

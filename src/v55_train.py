@@ -1,7 +1,8 @@
 """
-v54_train.py
-Cross-Seasonal Time CV (v54) + Decoupled Dual-Tree Hurdle
-[CLEANUP] Removed Target Encoding, Leveraging Data-Driven Nuclear Features.
+v55_train.py
+Cross-Seasonal Time CV (v55) + Decoupled Dual-Tree Hurdle
+[V55] V54 nuclear features + restored Target Encoding (per-fold leak-free).
+      Model A: MSE + exp sample weights (alpha=0.3).
 """
 
 import os
@@ -21,12 +22,12 @@ import gc
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-# [V54 修正] 確保引入的是 v54_dataset，這才包含核彈特徵且不包含 TE
-from src.v54_dataset import (
+from src.v55_dataset import (
     refine_features,
-    build_time_seasonal_cv_folds,    
+    build_time_seasonal_cv_folds,
     build_tabular_dataset,
     build_tabular_test,
+    extract_training_targets_for_te,
     FEATURE_COLS,
     WINDOW_SIZE,
     HORIZON,
@@ -44,15 +45,53 @@ set_seed(42)
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-PROCESSED_DIR = os.path.join(ROOT, "data", "v54_processed") 
-MODELS_DIR    = os.path.join(ROOT, "models","v54_3_models")
+PROCESSED_DIR = os.path.join(ROOT, "data", "v54_processed")
+MODELS_DIR    = os.path.join(ROOT, "models", "v55_models")
 os.makedirs(MODELS_DIR, exist_ok=True)
 
-N_FOLDS         = 4  
-N_FLAT_FEATURES = WINDOW_SIZE * len(FEATURE_COLS) + len(FEATURE_COLS) 
+N_FOLDS         = 4
+N_FLAT_FEATURES = WINDOW_SIZE * len(FEATURE_COLS) + len(FEATURE_COLS)
 
-# [V54 淨化] 徹底移除了 _compute_te_stats 等所有 Target Encoding 相關的輔助函數。
-# 因為在 Time-Fold 且面對 Test Set 嚴重 Temporal Shift 時，依賴歷史平均分是致命的毒藥。
+# ---------------------------------------------------------------------------
+# Per-fold leakage-free Target Encoding helpers
+# ---------------------------------------------------------------------------
+def _zero_prob(x: pd.Series) -> float:
+    return float((x == 0.0).mean())
+
+def _compute_te_stats(df: pd.DataFrame) -> tuple:
+    te_stats = (
+        df.groupby("region_id")["score"]
+        .agg(region_mean_score="mean", region_zero_prob=_zero_prob)
+        .reset_index()
+    )
+    global_mean      = float(te_stats["region_mean_score"].mean())
+    global_zero_prob = float(te_stats["region_zero_prob"].mean())
+    te_map = {
+        row["region_id"]: (float(row["region_mean_score"]), float(row["region_zero_prob"]))
+        for _, row in te_stats.iterrows()
+    }
+    return te_map, global_mean, global_zero_prob
+
+def _augment_groups_with_te(groups: list, te_map: dict, global_mean: float, global_zero_prob: float) -> list:
+    result = []
+    for group, i_min, i_max in groups:
+        g   = group.copy()
+        rid = g["region_id"].iloc[0]
+        mean_s, zero_p = te_map.get(rid, (global_mean, global_zero_prob))
+        g["region_mean_score"] = np.float32(mean_s)
+        g["region_zero_prob"]  = np.float32(zero_p)
+        result.append((g, i_min, i_max))
+    return result
+
+def _merge_te_to_df(df: pd.DataFrame, te_map: dict, global_mean: float, global_zero_prob: float) -> pd.DataFrame:
+    df = df.copy()
+    df["region_mean_score"] = df["region_id"].map(
+        lambda rid: te_map.get(rid, (global_mean, global_zero_prob))[0]
+    ).astype(np.float32)
+    df["region_zero_prob"] = df["region_id"].map(
+        lambda rid: te_map.get(rid, (global_mean, global_zero_prob))[1]
+    ).astype(np.float32)
+    return df
 
 # ---------------------------------------------------------------------------
 # Binned error diagnostics
@@ -160,15 +199,24 @@ def main():
 
         fold_t0 = time.time()
 
-        # [V54 淨化] 不再進行任何 TE 特徵的計算與綁定
-        feat_cols = [c for c in FEATURE_COLS if c in raw_train_groups[0][0].columns]
-        
-        X_train_np, y_train_np, _ = build_tabular_dataset(raw_train_groups, feat_cols)
-        X_val_np,   y_val_np,   _ = build_tabular_dataset(raw_val_groups,   feat_cols)
+        # [V55] Per-fold leakage-free Target Encoding
+        safe_train_df  = extract_training_targets_for_te(raw_train_groups)
+        te_map, gm, gzp = _compute_te_stats(safe_train_df)
+        log(f"  [TE] Computed from {len(safe_train_df):,} training records "
+            f"| global mean={gm:.4f}, zero_prob={gzp:.4f}")
+
+        aug_train_groups = _augment_groups_with_te(raw_train_groups, te_map, gm, gzp)
+        aug_val_groups   = _augment_groups_with_te(raw_val_groups,   te_map, gm, gzp)
+        test_df_fold     = _merge_te_to_df(test_df, te_map, gm, gzp)
+
+        feat_cols = [c for c in FEATURE_COLS if c in aug_train_groups[0][0].columns]
+
+        X_train_np, y_train_np, _ = build_tabular_dataset(aug_train_groups, feat_cols)
+        X_val_np,   y_val_np,   _ = build_tabular_dataset(aug_val_groups,   feat_cols)
         X_train_np = np.asfortranarray(X_train_np)
         X_val_np   = np.asfortranarray(X_val_np)
 
-        X_test_np, test_region_ids = build_tabular_test(test_df, feat_cols)
+        X_test_np, test_region_ids = build_tabular_test(test_df_fold, feat_cols)
         X_test_np = np.asfortranarray(X_test_np)
 
         fold_val_preds_l1 = np.zeros_like(y_val_np)
@@ -300,7 +348,7 @@ def main():
     log(f"  4 Folds Model B probs: {np.round(sample_b_probs, 3)}")
 
     # 儲存推論需要的 raw preds
-    raw_preds_path = os.path.join(MODELS_DIR, "v54_3_raw_test_preds.pkl")
+    raw_preds_path = os.path.join(MODELS_DIR, "v55_raw_test_preds.pkl")
     with open(raw_preds_path, "wb") as f:
         pickle.dump({
             "preds_a_stack": preds_a_stack,
@@ -309,7 +357,7 @@ def main():
         }, f)
     log(f"\nSaved raw test predictions to {raw_preds_path}")
 
-    log_path = os.path.join(ROOT, "_training_log_54th_3.txt")
+    log_path = os.path.join(ROOT, "_training_log_55th.txt")
     with open(log_path, "w") as fh: fh.write("\n".join(log_lines))
     print(f"Training log -> {log_path}")
 
