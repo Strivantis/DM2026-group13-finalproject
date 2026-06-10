@@ -13,7 +13,7 @@ CV Strategy (v52):
 
 import numpy as np
 import pandas as pd
-from old_src.preprocess import add_drought_index
+from src.v51_preprocess import add_drought_index
 
 # ---------------------------------------------------------------------------
 # Constants
